@@ -4,11 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-VacuumTiger is an open-source robotic vacuum firmware project for the CRL-200S hardware platform. The project consists of three main components:
+VacuumTiger is an open-source robotic vacuum firmware project for the CRL-200S hardware platform. The project consists of the following components:
 
 1. **SangamIO**: A daemon providing hardware abstraction and real-time control via TCP/UDP streaming
-2. **VastuSLAM**: A high-performance 2D SLAM library for robot vacuum cleaners
+2. **DhruvaSLAM**: A 2D SLAM daemon (Rust) that consumes SangamIO streams and serves maps/pose to clients
 3. **Drishti**: Python visualization and control client for monitoring and commanding the robot
+4. **DhruvaNav**: Autonomous navigation/exploration (frontier exploration, path planning) consuming DhruvaSLAM
+5. **VastuSLAM**: An older high-performance 2D SLAM library kept in-repo for reference
 
 **Target Platform**: Embedded Linux (ARM) - Allwinner A33 running Tina Linux
 **Primary Language**: Rust (edition 2024) for SangamIO, Python 3.8+ for Drishti
@@ -273,14 +275,41 @@ VacuumTiger/
 │   ├── benches/              # Performance benchmarks
 │   └── tests/                # Integration tests
 │
-└── drishti/                  # Python visualization client
-    ├── drishti.py           # Console client
-    ├── drishti_ui.py        # GUI application
-    └── ui/                  # PyQt widgets
-        ├── main_window.py
-        ├── processors/       # Data processing
-        ├── threads/          # Background workers
-        └── widgets/          # UI components
+├── dhruva-slam/              # 2D SLAM daemon (Rust) — consumes SangamIO, serves DhruvaStream protocol
+│   ├── src/
+│   │   ├── core/             # Pose2D, lattice, sensor types
+│   │   ├── sensors/          # Odometry fusion, lidar preprocessing
+│   │   ├── algorithms/       # Scan matching, mapping, loop closure
+│   │   ├── engine/           # SLAM orchestration, pose graph
+│   │   ├── navigation/       # Path following, goal handling
+│   │   ├── exploration/      # Frontier exploration
+│   │   ├── threads/          # Worker threads (sensor, slam, cmds)
+│   │   ├── io/               # SangamIO client, TCP streaming, map save/load
+│   │   └── bin/              # Extra binaries (close_loop, etc.)
+│   └── proto/                # dhruva.proto (DhruvaStream/DhruvaCommand)
+│
+├── dhruva-nav/               # Navigation & exploration daemon (Rust)
+│   ├── src/
+│   │   ├── client.rs         # SangamIO command client
+│   │   ├── odometry.rs       # Pose tracking
+│   │   ├── planning/         # Cost map, theta*, smoother
+│   │   ├── exploration/      # Frontier explorer / follower
+│   │   └── threads/          # sensor/mapping/exploration loops
+│   └── proto/                # sangamio.proto copy
+│
+├── drishti/                  # Python visualization client
+│   ├── drishti.py           # Console client (legacy msgpack demo)
+│   ├── drishti_ui.py        # GUI application (subcommands: sensor | slam)
+│   ├── proto/               # Generated protobuf bindings (sangamio_pb2, dhruva_pb2)
+│   └── ui/                  # PyQt widgets
+│       ├── main_window.py
+│       ├── slam_main_window.py
+│       ├── processors/       # Data processing
+│       ├── threads/          # Background workers
+│       └── widgets/          # UI components
+│
+├── slam-test/                # SLAM integration test framework (scripts)
+└── protocol-mitm/            # Reverse engineering tools
 ```
 
 ## Critical Hardware Constraints
@@ -379,9 +408,14 @@ ssh root@vacuum "top -p $(pgrep sangamio)"
 
 ```bash
 cd drishti
-source venv/bin/activate
-python drishti_ui.py --robot 192.168.68.101
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+python drishti_ui.py sensor --robot 192.168.68.101
 ```
+
+Modes:
+- `sensor`: raw sensor visualization from SangamIO
+- `slam`: map + navigation from DhruvaSLAM (`python drishti_ui.py slam --host localhost`)
 
 Features:
 - Full-screen robot diagram with physically-correct layout

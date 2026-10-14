@@ -167,6 +167,8 @@ VacuumTiger/
 │   │   ├── engine/         # SLAM orchestration, pose graph
 │   │   └── io/             # SangamIO client, TCP streaming
 │   └── proto/              # SLAM message definitions
+├── dhruva-nav/             # Autonomous navigation / exploration daemon (Rust)
+├── vastu-slam/             # 2D SLAM library (earlier iteration, kept for reference)
 ├── drishti/                # Diagnostic visualization (Python)
 │   ├── drishti_ui.py       # PyQt GUI with sensor overlays
 │   ├── drishti.py          # Console client
