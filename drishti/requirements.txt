@@ -15,3 +15,6 @@ PyOpenGL>=3.1.6
 
 # Numerical computations
 numpy>=1.21.0
+
+# Legacy console client (drishti.py) — msgpack packb/unpackb
+msgpack>=1.0
