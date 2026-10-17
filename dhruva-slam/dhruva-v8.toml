@@ -53,7 +53,11 @@ max_theta_deviation = 0.35
 max_translation_deviation = 0.5
 
 [matcher]
-algorithm = "hybrid_p2l"
+# multi_res: ATE 0.09/0.17 m on the mock benches, zero drift on a real static v8
+# recording, 84 ms/scan on the R16 (budget 166 ms at 6 Hz). p2l is 10x cheaper and
+# best on the mock, but drifts 0.5 m on the real static data (hybrid_p2l too): see
+# docs/SLAM_BENCH.md before switching.
+algorithm = "multi_res"
 always_correlative = true
 encoder_weight = 1.0
 search_window_x = 0.3
@@ -84,7 +88,8 @@ overlap_scans = 10
 max_active_submaps = 2
 
 [map]
-resolution = 0.02
+# 5 cm: same ATE as 2 cm on the mock bench, 4x cheaper on the R16 (docs/SLAM_BENCH.md)
+resolution = 0.05
 initial_width = 20.0
 initial_height = 20.0
 log_odds_occupied = 0.9
@@ -95,7 +100,8 @@ occupied_threshold = 0.5
 free_threshold = -0.5
 
 [loop_closure]
-enabled = true
+# Off: accepted false closures on the mock bench (ATE 1.46 m with, 0.08 m without).
+enabled = false
 detection_interval = 5
 min_keyframe_gap = 20
 optimization_threshold = 3

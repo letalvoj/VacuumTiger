@@ -94,9 +94,10 @@ fn main() -> Result<()> {
         .unwrap_or(false);
     if safe_start {
         let sd = Arc::clone(&driver);
-        let _ = thread::Builder::new()
-            .name("safe-start".to_string())
-            .spawn(move || {
+        // Runs to completion BEFORE the TCP server accepts clients (~6 s). As a
+        // background thread its later rounds could queue behind a client's first
+        // command (lidar enable blocks ~30 s) and then switch the lidar back off.
+        (move || {
                 // Retry across the GD32's ~5s wake window so the commands land
                 // even if issued early. Re-stopping is idempotent.
                 for attempt in 1..=3 {
@@ -123,7 +124,7 @@ fn main() -> Result<()> {
                         );
                     }
                 }
-            });
+        })();
     }
 
     // Set up shutdown signal handler

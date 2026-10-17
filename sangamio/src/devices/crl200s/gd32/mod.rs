@@ -157,6 +157,23 @@ impl GD32Driver {
         self.component_state.attach_lidar_scan_counter(counter);
     }
 
+    /// Close the lidar speed loop on the lidar driver's speed samples.
+    /// `target_rps <= 0` keeps the fixed `lidar_pwm`.
+    pub fn attach_lidar_speed(
+        &self,
+        speed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        target_rps: f32,
+    ) {
+        self.component_state.attach_lidar_speed(speed);
+        let mrps = (target_rps.max(0.0) * 1000.0) as u32;
+        self.component_state
+            .lidar_speed_target_mrps
+            .store(mrps, std::sync::atomic::Ordering::Relaxed);
+        if mrps > 0 {
+            log::info!("Lidar speed loop: target {:.2} rev/s (vendor PID)", target_rps);
+        }
+    }
+
     /// Initialize the GD32 device by sending init commands
     ///
     /// Version is requested by reader thread after first packet received.

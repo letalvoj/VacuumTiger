@@ -378,6 +378,13 @@ pub struct HardwareConfig {
     #[serde(default = "default_lidar_rail_off_settle_ms")]
     pub lidar_rail_off_settle_ms: u64,
 
+    /// Closed-loop lidar speed target (rev/s). When > 0, the heartbeat runs the
+    /// vendor PID (AuxCtrl `lidarSpeedControl`, target 6.0) on the measured speed
+    /// instead of a fixed `lidar_pwm`, which then only applies until the first
+    /// speed sample. **Default**: 0.0 (fixed PWM, upstream behaviour).
+    #[serde(default)]
+    pub lidar_speed_target_rps: f32,
+
     /// Lidar mounting configuration for robot-center transformation
     ///
     /// Defines the physical mounting position of the lidar relative to

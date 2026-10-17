@@ -86,6 +86,44 @@ const DRIVE_BRUSH_KEEPALIVE_SPEED: u8 = 30;
 /// without being asked. Re-enable only to test the wheel-cut theory on blocks.
 const DRIVE_BRUSH_KEEPALIVE_ENABLED: bool = false;
 
+/// Lidar motor speed loop, a port of the vendor's AuxCtrl `lidarSpeedControl`
+/// (@0x40bbc): every 20 ms, `e = target - avg(speed)`, `I += e` clamped to ±20,
+/// `pwm = 60 + I + 10e + 10(e - e_prev)` clamped to 0..100. The vendor target is
+/// 6.0 rev/s (`C3iroboticsLidar::getLidarReferenceSpeed` returns 6.0). The LDS3 only
+/// measures inside a speed window: a fixed PWM 73 spun the v8's unit to 8 rev/s
+/// where it sent only "error speed" (0xAE) packets.
+#[derive(Debug, Default)]
+pub(crate) struct LidarSpeedPid {
+    window: std::collections::VecDeque<f32>,
+    last_seq: u64,
+    integral: f32,
+    prev_err: f32,
+}
+
+impl LidarSpeedPid {
+    const WINDOW: usize = 10;
+
+    /// Feed the latest speed sample (`seq` changes when a new one arrived) and get the PWM.
+    pub(crate) fn update(&mut self, target_rps: f32, seq: u64, rps: f32) -> u8 {
+        if seq != self.last_seq {
+            self.last_seq = seq;
+            if self.window.len() == Self::WINDOW {
+                self.window.pop_front();
+            }
+            self.window.push_back(rps);
+        }
+        if self.window.is_empty() {
+            return 60;
+        }
+        let avg = self.window.iter().sum::<f32>() / self.window.len() as f32;
+        let e = target_rps - avg;
+        self.integral = (self.integral + e).clamp(-20.0, 20.0);
+        let pwm = 60.0 + self.integral + 10.0 * e + 10.0 * (e - self.prev_err);
+        self.prev_err = e;
+        pwm.clamp(0.0, 100.0) as u8
+    }
+}
+
 /// Heartbeat loop - sends appropriate commands at configured interval
 ///
 /// This loop runs continuously on a dedicated OS thread to maintain the GD32 watchdog timer.
@@ -154,6 +192,7 @@ pub(super) fn heartbeat_loop<W: std::io::Write + Send + 'static>(
     // wheel motors alive. With a deadline we drift back to the correct rate even
     // if a cycle runs late.
     let mut next_tick = std::time::Instant::now() + std::time::Duration::from_millis(interval_ms);
+    let mut lidar_pid = LidarSpeedPid::default();
 
     while !shutdown.load(Ordering::Relaxed) {
         // Use blocking lock to ensure commands are always sent
@@ -318,9 +357,21 @@ pub(super) fn heartbeat_loop<W: std::io::Write + Send + 'static>(
                 let _ = pkt.send_to(&mut *port);
             }
 
-            // Send lidar PWM if enabled (static value)
+            // Send lidar PWM if enabled: closed loop on the measured speed when a
+            // target is configured (vendor AuxCtrl lidarSpeedControl), else static.
             if lidar_enabled {
-                let pwm = component_state.get_lidar_pwm();
+                let target = component_state.lidar_speed_target_mrps.load(Ordering::Relaxed);
+                let pwm = match (target, component_state.lidar_speed()) {
+                    (t, Some((seq, rps))) if t > 0 => {
+                        let pwm = lidar_pid.update(t as f32 / 1000.0, seq, rps);
+                        component_state.lidar_pwm.store(pwm, Ordering::Relaxed);
+                        if seq % 400 == 0 {
+                            log::info!("Lidar speed loop: {:.2} rev/s -> PWM {}", rps, pwm);
+                        }
+                        pwm
+                    }
+                    _ => component_state.get_lidar_pwm(),
+                };
                 pkt.set_lidar_pwm(pwm);
                 if let Err(e) = pkt.send_to(&mut *port) {
                     log::error!("Lidar PWM send failed: {}", e);
@@ -413,6 +464,32 @@ mod tests {
     use super::*;
     use crate::devices::crl200s::constants::CMD_MAIN_BRUSH;
     use std::io::Write;
+
+    #[test]
+    fn lidar_pid_converges_to_target() {
+        // First-order plant fitted to the v8 unit: PWM 73 -> ~8.1 rev/s, so
+        // ~0.111 rev/s per %, time constant ~0.5 s; one new sample per 20 ms tick.
+        let mut pid = LidarSpeedPid::default();
+        let (mut speed, mut pwm) = (0.0f32, 100u8);
+        for tick in 1..=1500u64 {
+            let target = pwm as f32 * 0.111;
+            speed += (target - speed) * 0.04;
+            // the sensor reports in 0.05 rev/s steps
+            let reported = (speed / 0.05).round() * 0.05;
+            pwm = pid.update(6.0, tick, reported);
+        }
+        assert!((speed - 6.0).abs() < 0.15, "speed {speed}, pwm {pwm}");
+        assert!((50..=60).contains(&pwm), "pwm {pwm}");
+    }
+
+    #[test]
+    fn lidar_pid_holds_without_new_samples() {
+        let mut pid = LidarSpeedPid::default();
+        let a = pid.update(6.0, 1, 6.0);
+        // Same seq: no new sample, error unchanged, output stays put.
+        let b = pid.update(6.0, 1, 9.0);
+        assert_eq!(a, b);
+    }
 
     /// Write sink that records every byte the heartbeat loop emits, so a test
     /// can parse the exact frame stream that would go to `/dev/ttyS3`. Stands in

@@ -78,9 +78,16 @@ pub struct Delta2DPacketReader {
     crc_failures: u64,
     /// Angle transform to apply to all lidar angles
     angle_transform: AffineTransform1D,
+    /// Last rotation speed byte seen (0.05 rev/s units), taken by the reader thread.
+    last_speed_raw: Option<u8>,
 }
 
 impl Delta2DPacketReader {
+    /// Latest rotation speed byte (0.05 rev/s units) since the last call.
+    pub fn take_speed_raw(&mut self) -> Option<u8> {
+        self.last_speed_raw.take()
+    }
+
     /// Create a new reader with custom angle transform
     ///
     /// The transform is applied to all lidar angles: output = scale * input + offset
@@ -91,6 +98,7 @@ impl Delta2DPacketReader {
             bytes_discarded: 0,
             crc_failures: 0,
             angle_transform,
+            last_speed_raw: None,
         }
     }
 
@@ -257,6 +265,14 @@ impl Delta2DPacketReader {
 
             // Extract payload
             let payload = &self.buffer[8..8 + payload_len as usize];
+
+            // Rotation speed, 0.05 rev/s per LSB: byte 0 of both 0xAD (measuring) and
+            // 0xAE ("error speed", sent instead of data when out of the speed window).
+            if matches!(cmd_type, CommandType::Measurement | CommandType::Health)
+                && !payload.is_empty()
+            {
+                self.last_speed_raw = Some(payload[0]);
+            }
 
             // Parse based on command type
             let result = if cmd_type == CommandType::Measurement && payload_len > 5 {

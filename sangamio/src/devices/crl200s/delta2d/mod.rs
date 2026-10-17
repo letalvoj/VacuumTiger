@@ -94,6 +94,8 @@ pub struct Delta2DDriver {
     reader_handle: Option<JoinHandle<()>>,
     scan_count: Arc<AtomicU64>,
     error_count: Arc<AtomicU64>,
+    /// Latest rotation speed: `(sample_seq << 8) | raw` with raw in 0.05 rev/s.
+    speed: Arc<AtomicU64>,
     /// Angle transform for coordinate frame conversion
     angle_transform: AffineTransform1D,
     /// Lidar mounting configuration for robot-center transformation
@@ -118,9 +120,16 @@ impl Delta2DDriver {
             reader_handle: None,
             scan_count: Arc::new(AtomicU64::new(0)),
             error_count: Arc::new(AtomicU64::new(0)),
+            speed: Arc::new(AtomicU64::new(0)),
             angle_transform,
             lidar_mounting,
         }
+    }
+
+    /// Rotation speed published by the reader thread, `(seq << 8) | raw` with raw in
+    /// 0.05 rev/s. The GD32 heartbeat closes the speed loop on it (vendor-style PID).
+    pub fn speed_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.speed)
     }
 
     /// Scan counter published by the reader thread (one per parsed scan).
@@ -150,6 +159,7 @@ impl Delta2DDriver {
         let shutdown = Arc::clone(&self.shutdown);
         let scan_count = Arc::clone(&self.scan_count);
         let error_count = Arc::clone(&self.error_count);
+        let speed = Arc::clone(&self.speed);
         let angle_transform = self.angle_transform;
         let lidar_mounting = self.lidar_mounting.clone();
 
@@ -163,6 +173,7 @@ impl Delta2DDriver {
                         sensor_data,
                         scan_count,
                         error_count,
+                        speed,
                         angle_transform,
                         lidar_mounting,
                     );
@@ -181,9 +192,11 @@ impl Delta2DDriver {
         sensor_data: Arc<Mutex<SensorGroupData>>,
         scan_count: Arc<AtomicU64>,
         error_count: Arc<AtomicU64>,
+        speed: Arc<AtomicU64>,
         angle_transform: AffineTransform1D,
         lidar_mounting: LidarMountingConfig,
     ) {
+        let mut speed_seq: u64 = 0;
         let mut reader = Delta2DPacketReader::with_transform(angle_transform);
         let mut accumulated_points: Vec<(f32, f32, u8)> = Vec::with_capacity(400);
         let mut last_angle: f32 = 0.0;
@@ -199,7 +212,12 @@ impl Delta2DDriver {
                 Ok(_bytes_read) => {
                     // Step 2: Drain ALL complete packets from buffer
                     loop {
-                        match reader.parse_next() {
+                        let parsed = reader.parse_next();
+                        if let Some(raw) = reader.take_speed_raw() {
+                            speed_seq += 1;
+                            speed.store((speed_seq << 8) | raw as u64, Ordering::Relaxed);
+                        }
+                        match parsed {
                             Ok(ParseResult::Scan(scan)) => {
                                 let count = scan_count.fetch_add(1, Ordering::Relaxed) + 1;
 

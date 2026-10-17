@@ -18,9 +18,14 @@ lidar_port = "/dev/ttyS1"
 # 20 ms = 50 Hz, the rate the vendor AuxCtrl sends 0x66 (measured docked).
 heartbeat_interval_ms = 20
 
-# Regime PWM after the 100% spin-up. Vendor runs a PID around ~60-75; the forks
-# measured 73-75 gives ~6.3 Hz. 100% for >30 s causes a lidar thermal stop.
-lidar_pwm = 73
+# Regime PWM after the 100% spin-up, used until the speed loop has samples.
+# A FIXED 73 (forks' value) spun this unit to 8 rev/s, outside the LDS3's measuring
+# window (only 0xAE "error speed" packets). 60 measured fine at 5.2 rev/s.
+# 100% for >30 s causes a lidar thermal stop.
+lidar_pwm = 60
+
+# Closed-loop speed like the vendor (AuxCtrl lidarSpeedControl, target 6.0 rev/s).
+lidar_speed_target_rps = 6.0
 
 # Lidar rail-off settle before rail-on (oangelo issue #14). 10 s is the value that
 # recovered cold starts on their unit. Lower it to iterate faster once proven.

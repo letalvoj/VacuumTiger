@@ -3,7 +3,7 @@
 //! This module defines the shared state used by the heartbeat thread to refresh
 //! component commands every 20ms. All fields use atomic types to allow lockless reads.
 
-use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU16, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -175,6 +175,10 @@ pub struct ComponentState {
     /// instead of trusting the frame sequence (measured 2026-10-03: a cold enable can
     /// log "spin-up concluido" and deliver zero scans — a silent failure).
     lidar_scan_counter: OnceLock<Arc<AtomicU64>>,
+    /// Lidar rotation speed from the lidar driver, `(seq << 8) | raw` (0.05 rev/s).
+    lidar_speed: OnceLock<Arc<AtomicU64>>,
+    /// Closed-loop lidar speed target in milli-rev/s; 0 = fixed PWM (`lidar_pwm`).
+    pub lidar_speed_target_mrps: AtomicU32,
 }
 
 /// Default velocity scale (reference robot): device units per m/s and per rad/s.
@@ -212,7 +216,20 @@ impl ComponentState {
             prev_wheel_left: AtomicU16::new(0),
             prev_wheel_right: AtomicU16::new(0),
             lidar_scan_counter: OnceLock::new(),
+            lidar_speed: OnceLock::new(),
+            lidar_speed_target_mrps: AtomicU32::new(0),
         }
+    }
+
+    /// Attach the lidar driver's speed handle (see `Delta2DDriver::speed_handle`).
+    pub fn attach_lidar_speed(&self, speed: Arc<AtomicU64>) -> bool {
+        self.lidar_speed.set(speed).is_ok()
+    }
+
+    /// Latest lidar speed sample as `(seq, rev/s)`, if the driver is attached.
+    pub fn lidar_speed(&self) -> Option<(u64, f32)> {
+        let v = self.lidar_speed.get()?.load(Ordering::Relaxed);
+        (v != 0).then(|| (v >> 8, (v & 0xFF) as f32 * 0.05))
     }
 
     /// Set the velocity calibration scales (device units per m/s and per rad/s).

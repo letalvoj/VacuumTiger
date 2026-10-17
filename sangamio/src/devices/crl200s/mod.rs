@@ -164,6 +164,7 @@ impl DeviceDriver for CRL200SDriver {
         // agora falha explicitamente e refaz o ciclo, em vez de logar "OK" em silêncio.
         if let Some(gd32) = &self.gd32 {
             gd32.attach_lidar_scan_counter(lidar.scan_counter());
+            gd32.attach_lidar_speed(lidar.speed_handle(), hardware.lidar_speed_target_rps);
         }
         self.lidar = Some(lidar);
         log::info!("Lidar driver started (motor OFF - enable via command)");
