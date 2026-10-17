@@ -116,6 +116,29 @@ pub struct SensorStatusData {
 /// A single LiDAR point: (angle_rad, distance_m, quality).
 pub type LidarPoint = (f32, f32, u8);
 
+/// Decode SangamIO's compact `scan_packed` blob (kaiaai format):
+/// `u16 num_bins` then per bin `u16 distance (0.25 mm units, 0 = no return), u8 quality`,
+/// all little-endian; bin i is at angle `i * 2pi / num_bins`. Empty bins are dropped.
+pub fn unpack_scan(blob: &[u8]) -> Option<Vec<LidarPoint>> {
+    if blob.len() < 2 {
+        return None;
+    }
+    let n = u16::from_le_bytes([blob[0], blob[1]]) as usize;
+    if n == 0 || blob.len() < 2 + 3 * n {
+        return None;
+    }
+    let step = std::f32::consts::TAU / n as f32;
+    Some(
+        (0..n)
+            .filter_map(|i| {
+                let o = 2 + 3 * i;
+                let raw = u16::from_le_bytes([blob[o], blob[o + 1]]);
+                (raw > 0).then(|| (i as f32 * step, raw as f32 * 0.00025, blob[o + 2]))
+            })
+            .collect(),
+    )
+}
+
 /// LiDAR scan message.
 #[derive(Debug, Clone)]
 pub struct LidarData {
@@ -286,7 +309,7 @@ impl SangamUdpReceiver {
     }
 
     /// Parse sensor_status group into SensorStatusData.
-    fn parse_sensor_status(sg: &sangamio::SensorGroup) -> Option<SensorStatusData> {
+    pub fn parse_sensor_status(sg: &sangamio::SensorGroup) -> Option<SensorStatusData> {
         let values = &sg.values;
 
         let left_encoder = Self::get_u32(values, "wheel_left")? as u16;
@@ -308,18 +331,22 @@ impl SangamUdpReceiver {
     }
 
     /// Parse lidar group into LidarData.
-    fn parse_lidar(sg: &sangamio::SensorGroup) -> Option<LidarData> {
-        let scan = sg.values.get("scan")?;
-        let pointcloud = match &scan.value {
-            Some(sangamio::sensor_value::Value::PointcloudVal(pc)) => pc,
-            _ => return None,
+    pub fn parse_lidar(sg: &sangamio::SensorGroup) -> Option<LidarData> {
+        let points: Vec<LidarPoint> = if let Some(scan) = sg.values.get("scan") {
+            match &scan.value {
+                Some(sangamio::sensor_value::Value::PointcloudVal(pc)) => pc
+                    .points
+                    .iter()
+                    .map(|p| (p.angle_rad, p.distance_m, p.quality as u8))
+                    .collect(),
+                _ => return None,
+            }
+        } else {
+            match &sg.values.get("scan_packed")?.value {
+                Some(sangamio::sensor_value::Value::BytesVal(b)) => unpack_scan(b)?,
+                _ => return None,
+            }
         };
-
-        let points: Vec<LidarPoint> = pointcloud
-            .points
-            .iter()
-            .map(|p| (p.angle_rad, p.distance_m, p.quality as u8))
-            .collect();
 
         Some(LidarData {
             timestamp_us: sg.timestamp_us,

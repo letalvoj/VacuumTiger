@@ -671,11 +671,19 @@ impl Default for NavigationConfig {
 
 struct Args {
     config_path: Option<String>,
+    /// Offline replay of an SGIO1 recording instead of running the daemon.
+    replay: Option<String>,
+    /// Output directory for `--replay` (timing.csv, map.pgm, map.yaml).
+    out: Option<String>,
 }
 
 fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().collect();
-    let mut result = Args { config_path: None };
+    let mut result = Args {
+        config_path: None,
+        replay: None,
+        out: None,
+    };
 
     let mut i = 1;
     while i < args.len() {
@@ -683,6 +691,18 @@ fn parse_args() -> Args {
             "--config" | "-c" => {
                 if i + 1 < args.len() {
                     result.config_path = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            "--replay" => {
+                if i + 1 < args.len() {
+                    result.replay = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            "--out" => {
+                if i + 1 < args.len() {
+                    result.out = Some(args[i + 1].clone());
                     i += 1;
                 }
             }
@@ -710,6 +730,8 @@ fn print_help() {
     println!();
     println!("OPTIONS:");
     println!("    -c, --config <FILE>     Configuration file (default: dhruva-slam.toml)");
+    println!("        --replay <FILE>     Offline: run SLAM over an SGIO1 recording and exit");
+    println!("        --out <DIR>         Output dir for --replay (default: replay_out)");
     println!("    -h, --help              Print help information");
     println!();
     println!("CONFIGURATION:");
@@ -922,6 +944,40 @@ fn main() {
     let args = parse_args();
     let config = load_config(&args);
 
+    if let Some(input) = &args.replay {
+        let out = args.out.clone().unwrap_or_else(|| "replay_out".to_string());
+        let cfg = build_slam_thread_config(&config);
+        match threads::run_replay(cfg, Path::new(input), Path::new(&out)) {
+            Ok(r) => {
+                let mut ms = r.scan_ms.clone();
+                ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let pct = |p: f64| ms.get(((ms.len() as f64 - 1.0) * p) as usize).copied().unwrap_or(0.0);
+                let mean = ms.iter().sum::<f64>() / ms.len().max(1) as f64;
+                println!(
+                    "replay: {} scans, {} sensor msgs, data {:.1} s, wall {:.2} s ({:.1}x realtime)",
+                    r.scans,
+                    r.sensor_msgs,
+                    r.data_span_s,
+                    r.wall_s,
+                    r.data_span_s / r.wall_s.max(1e-9)
+                );
+                println!(
+                    "per-scan ms: mean {:.2} p50 {:.2} p95 {:.2} max {:.2}  -> {}/",
+                    mean,
+                    pct(0.5),
+                    pct(0.95),
+                    pct(1.0),
+                    out
+                );
+            }
+            Err(e) => {
+                eprintln!("replay failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     log::info!("dhruva-slam starting");
     log::info!(
         "  SangamIO: {} (TCP commands + UDP sensors)",
@@ -1011,6 +1067,29 @@ fn run_threaded_mode(
     }
 
     // 5. Build SLAM thread config
+    let slam_thread_config = build_slam_thread_config(config);
+
+    // 6. Build stream config
+    let stream_config = ThreadStreamConfig {
+        robot_status_hz: config.stream.robot_status_hz,
+        sensor_status_hz: config.stream.sensor_status_hz,
+        map_hz: config.stream.map_hz,
+        navigation_hz: config.stream.navigation_hz,
+    };
+    run_threaded_mode_rest(
+        config,
+        running,
+        shared_state,
+        command_tx,
+        command_rx,
+        map_manager,
+        slam_thread_config,
+        stream_config,
+    )
+}
+
+/// SLAM thread config from the TOML config (shared by the daemon and `--replay`).
+fn build_slam_thread_config(config: &Config) -> SlamThreadConfig {
     let slam_config = build_slam_config(config);
     let odometry_config = DynOdometryConfig {
         wheel: WheelOdometryConfig {
@@ -1038,23 +1117,27 @@ fn run_threaded_mode(
         ),
     };
 
-    let slam_thread_config = SlamThreadConfig {
+    SlamThreadConfig {
         sangam_address: config.source.sangam_address.clone(),
         udp_port: config.source.udp_port,
         slam_config,
         odometry_type: config.odometry.algorithm_type(),
         odometry_config,
         preprocessor_config,
-    };
+    }
+}
 
-    // 6. Build stream config
-    let stream_config = ThreadStreamConfig {
-        robot_status_hz: config.stream.robot_status_hz,
-        sensor_status_hz: config.stream.sensor_status_hz,
-        map_hz: config.stream.map_hz,
-        navigation_hz: config.stream.navigation_hz,
-    };
-
+#[allow(clippy::too_many_arguments)]
+fn run_threaded_mode_rest(
+    config: &Config,
+    running: Arc<AtomicBool>,
+    shared_state: crate::state::SharedStateHandle,
+    command_tx: crate::state::CommandSender,
+    command_rx: crate::state::CommandReceiver,
+    map_manager: Arc<Mutex<MapManager>>,
+    slam_thread_config: SlamThreadConfig,
+    stream_config: ThreadStreamConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     // 7. Create navigation channel
     let (nav_tx, nav_rx) = create_nav_channel();
     log::info!("  Navigation channel created");

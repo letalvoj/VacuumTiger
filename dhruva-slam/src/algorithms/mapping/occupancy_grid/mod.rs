@@ -27,6 +27,11 @@ pub use config::{CellState, OccupancyGridConfig};
 
 use super::MapRegion;
 
+/// Minimum growth step when the grid has to expand (meters).
+const GROW_MARGIN_M: f32 = 2.0;
+/// Hard cap on the grid side (meters); a home is far smaller.
+const MAX_EXTENT_M: f32 = 100.0;
+
 /// 2D occupancy grid map.
 ///
 /// Stores log-odds values for each cell. Supports dynamic growth
@@ -247,7 +252,17 @@ impl OccupancyGrid {
     ///
     /// Grows the grid if necessary, preserving existing data.
     pub fn ensure_contains(&mut self, x: f32, y: f32) {
+        if !x.is_finite() || !y.is_finite() {
+            return;
+        }
         let (cx, cy) = self.world_to_cell_signed(x, y);
+
+        // Grow in chunks (at least GROW_MARGIN_M, or half the current size) so a
+        // map that expands point by point does not copy the whole grid each time:
+        // exact-size growth made scan integration quadratic.
+        let res = self.config.resolution;
+        let margin = |cur: usize| ((GROW_MARGIN_M / res) as usize).max(cur / 2);
+        let max_cells = (MAX_EXTENT_M / res) as usize;
 
         let mut needs_resize = false;
         let mut new_origin_x = self.origin_x;
@@ -255,35 +270,44 @@ impl OccupancyGrid {
         let mut new_width = self.width;
         let mut new_height = self.height;
 
-        // Check if we need to expand in negative X direction
         if cx < 0 {
-            let expand = (-cx) as usize + 1;
-            new_origin_x -= expand as f32 * self.config.resolution;
+            let expand = (-cx) as usize + margin(self.width);
+            new_origin_x -= expand as f32 * res;
             new_width += expand;
             needs_resize = true;
         }
-
-        // Check if we need to expand in positive X direction
         if cx >= self.width as i32 {
-            new_width = (cx as usize) + 1;
+            new_width = (cx as usize) + margin(self.width);
             needs_resize = true;
         }
-
-        // Check if we need to expand in negative Y direction
         if cy < 0 {
-            let expand = (-cy) as usize + 1;
-            new_origin_y -= expand as f32 * self.config.resolution;
+            let expand = (-cy) as usize + margin(self.height);
+            new_origin_y -= expand as f32 * res;
             new_height += expand;
             needs_resize = true;
         }
-
-        // Check if we need to expand in positive Y direction
         if cy >= self.height as i32 {
-            new_height = (cy as usize) + 1;
+            new_height = (cy as usize) + margin(self.height);
             needs_resize = true;
         }
 
         if needs_resize {
+            if new_width > max_cells || new_height > max_cells {
+                // A diverged pose would otherwise allocate gigabytes (seen in replay).
+                static WARNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = WARNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n.is_power_of_two() || n == 0 {
+                    log::warn!(
+                        "OccupancyGrid: refusing to grow to {}x{} cells for point ({:.1}, {:.1}) [{} times]",
+                        new_width,
+                        new_height,
+                        x,
+                        y,
+                        n + 1
+                    );
+                }
+                return;
+            }
             self.resize(new_width, new_height, new_origin_x, new_origin_y);
         }
     }

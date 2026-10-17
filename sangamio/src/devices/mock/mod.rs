@@ -616,6 +616,10 @@ fn simulation_loop(
                         physics.theta().to_degrees()
                     );
                     lidar.set("scan", SensorValue::PointCloud2D(scan));
+                    // Simulator ground truth at scan time, for offline SLAM scoring.
+                    lidar.set("gt_x", SensorValue::F32(physics.x()));
+                    lidar.set("gt_y", SensorValue::F32(physics.y()));
+                    lidar.set("gt_theta", SensorValue::F32(physics.theta()));
                     lidar.touch();
                 }
             }

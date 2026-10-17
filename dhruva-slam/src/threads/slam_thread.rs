@@ -207,8 +207,8 @@ struct SlamContext {
     distance_traveled: f32,
     /// Last pose for distance computation.
     last_pose_for_distance: Pose2D,
-    /// Last map update time.
-    last_map_update: Instant,
+    /// Data timestamp (us) of the last shared-state map update.
+    last_map_update_us: u64,
     /// Previous bumper state for edge detection (left, right).
     prev_bumper_state: (bool, bool),
 }
@@ -233,7 +233,7 @@ impl SlamContext {
             is_localizing: false,
             distance_traveled: 0.0,
             last_pose_for_distance: Pose2D::identity(),
-            last_map_update: Instant::now(),
+            last_map_update_us: 0,
             prev_bumper_state: (false, false),
         }
     }
@@ -446,12 +446,12 @@ impl SlamContext {
                     left, right, gyro_yaw, odom_pose.x, odom_pose.y, odom_pose.theta.to_degrees()
                 );
             }
-            // odom_pose e' o DELTA incremental desta amostra (ex: ~0.001m a 323Hz).
-            // O PoseTracker acumula via update() (compose); set() SUBSTITUIRIA a
-            // pose acumulada pelo delta isolado -> odom_tracker.pose() ~0 sempre
-            // -> process_lidar calcula odom_delta ~0 -> o SLAM nunca ve a rotacao
-            // medido: odom_delta=(0,0,0) com o robo girando 100° em 10s.
-            self.odom_tracker.update(&odom_pose);
+            // Every DynOdometry variant returns the CUMULATIVE odometry pose (the
+            // wrappers compose encoder deltas internally), so set(), not update().
+            // Composing it again (oangelo b81eee3) turns any motion into a spiral:
+            // replay of a mock 3-lap rectangle (18 m) drifted to 200 m. The zero
+            // odom_delta that commit chased was the dropped sensor channel (9753ae7).
+            self.odom_tracker.set(odom_pose);
 
             // Interpolated pose: SLAM pose (do ultimo scan) + odometria acumulada
             // desde esse scan. odom_pose aqui e o delta de UMA amostra (local);
@@ -580,14 +580,15 @@ impl SlamContext {
             }
 
             // Update map periodically (not every scan - expensive)
-            if self.last_map_update.elapsed().as_secs_f32() > 0.5 {
+            // Data time, not wall time: same cadence live, deterministic on replay.
+            if timestamp_us.saturating_sub(self.last_map_update_us) > 500_000 {
                 if let Ok(mut state) = shared_state.write() {
                     let map = self.slam.global_map();
                     let (w, h) = map.dimensions();
                     log::debug!("Updating map in shared state: {}x{}", w, h);
                     state.update_map(map);
                 }
-                self.last_map_update = Instant::now();
+                self.last_map_update_us = timestamp_us;
             }
         }
 
@@ -694,4 +695,144 @@ impl SlamContext {
 
         self.process_lidar(&lidar_scan, timestamp_us, shared_state);
     }
+}
+
+// ============================================================================
+// Offline replay (deterministic benchmark)
+// ============================================================================
+
+/// Summary of an offline replay run.
+pub struct ReplayReport {
+    pub scans: usize,
+    pub sensor_msgs: usize,
+    pub data_span_s: f64,
+    pub wall_s: f64,
+    pub scan_ms: Vec<f64>,
+}
+
+/// Replay a recorded SangamIO stream (`SGIO1` file from tools/py/sangam_client.py)
+/// through the same SLAM pipeline the daemon runs, synchronously, as fast as possible.
+///
+/// Writes into `out_dir`: `timing.csv` (per scan: data time, processing ms, pose,
+/// score, keyframes), `map.pgm` + `map.yaml` (ROS map_server format).
+pub fn run_replay(
+    config: SlamThreadConfig,
+    input: &std::path::Path,
+    out_dir: &std::path::Path,
+) -> std::io::Result<ReplayReport> {
+    use crate::io::sangam_client::proto::sangamio;
+    use prost::Message as _;
+    use std::io::{BufRead, BufReader, Read, Write};
+
+    std::fs::create_dir_all(out_dir)?;
+    let mut rd = BufReader::new(std::fs::File::open(input)?);
+    let mut magic = Vec::new();
+    rd.read_until(b'\n', &mut magic)?;
+    if magic != b"SGIO1\n" {
+        return Err(std::io::Error::other("not an SGIO1 recording"));
+    }
+
+    let shared_state = crate::state::create_shared_state();
+    let mut ctx = SlamContext::new(&config);
+    ctx.slam.reset();
+    ctx.slam.set_mode(SlamMode::Mapping);
+    ctx.is_mapping = true;
+
+    let mut csv = std::io::BufWriter::new(std::fs::File::create(out_dir.join("timing.csv"))?);
+    writeln!(csv, "t_us,ms,x,y,theta,score,keyframes,points")?;
+
+    let mut report = ReplayReport {
+        scans: 0,
+        sensor_msgs: 0,
+        data_span_s: 0.0,
+        wall_s: 0.0,
+        scan_ms: Vec::new(),
+    };
+    let (mut t_first, mut t_last) = (0u64, 0u64);
+    let wall = Instant::now();
+    let mut hdr = [0u8; 12];
+    let mut body = Vec::new();
+    loop {
+        if rd.read_exact(&mut hdr).is_err() {
+            break;
+        }
+        let n = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]) as usize;
+        body.resize(n, 0);
+        if rd.read_exact(&mut body).is_err() {
+            break;
+        }
+        let Ok(msg) = sangamio::Message::decode(&body[..]) else {
+            continue;
+        };
+        let Some(sangamio::message::Payload::SensorGroup(sg)) = msg.payload else {
+            continue;
+        };
+        if t_first == 0 {
+            t_first = sg.timestamp_us;
+        }
+        t_last = t_last.max(sg.timestamp_us);
+        match sg.group_id.as_str() {
+            "sensor_status" => {
+                if let Some(d) = SangamUdpReceiver::parse_sensor_status(&sg) {
+                    ctx.process_udp_sensor_status(&d, &shared_state);
+                    report.sensor_msgs += 1;
+                }
+            }
+            "lidar" => {
+                if let Some(d) = SangamUdpReceiver::parse_lidar(&sg) {
+                    let t0 = Instant::now();
+                    ctx.process_udp_lidar(&d, &shared_state);
+                    let ms = t0.elapsed().as_secs_f64() * 1e3;
+                    let p = ctx.slam.current_pose();
+                    let st = ctx.slam.status();
+                    let score = shared_state
+                        .read()
+                        .map(|s| s.robot_status.localization_confidence)
+                        .unwrap_or(0.0);
+                    writeln!(
+                        csv,
+                        "{},{:.3},{:.4},{:.4},{:.5},{:.3},{},{}",
+                        d.timestamp_us,
+                        ms,
+                        p.x,
+                        p.y,
+                        p.theta,
+                        score,
+                        st.num_keyframes,
+                        d.points.len()
+                    )?;
+                    report.scan_ms.push(ms);
+                    report.scans += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    report.wall_s = wall.elapsed().as_secs_f64();
+    report.data_span_s = t_last.saturating_sub(t_first) as f64 / 1e6;
+    csv.flush()?;
+
+    // Map in ROS map_server format (0 occupied, 254 free, 205 unknown).
+    let map = crate::state::CurrentMapData::from_occupancy_grid(ctx.slam.global_map(), "replay", "replay");
+    let (w, h) = (map.width as usize, map.height as usize);
+    let mut pgm = std::io::BufWriter::new(std::fs::File::create(out_dir.join("map.pgm"))?);
+    write!(pgm, "P5\n{} {}\n255\n", w, h)?;
+    for cy in (0..h).rev() {
+        let row: Vec<u8> = (0..w)
+            .map(|cx| match map.cells[cy * w + cx] {
+                0..=49 => 254,
+                50..=150 => 0,
+                _ => 205,
+            })
+            .collect();
+        pgm.write_all(&row)?;
+    }
+    std::fs::write(
+        out_dir.join("map.yaml"),
+        format!(
+            "image: map.pgm\nresolution: {}\norigin: [{}, {}, 0.0]\nnegate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.196\n",
+            map.resolution, map.origin_x, map.origin_y
+        ),
+    )?;
+    Ok(report)
 }
