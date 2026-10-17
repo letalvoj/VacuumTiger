@@ -109,6 +109,8 @@ impl GD32Driver {
         lidar_pwm: u8,
         linear_velocity_scale: f32,
         angular_velocity_scale: f32,
+        deadman_timeout_ms: u64,
+        lidar_rail_off_settle_ms: u64,
     ) -> Result<Self> {
         let port = serialport::new(port_path, 115200)
             .timeout(Duration::from_millis(SERIAL_READ_TIMEOUT_MS))
@@ -121,6 +123,20 @@ impl GD32Driver {
         }
 
         log::debug!("GD32 driver: lidar PWM configured to {}%", lidar_pwm);
+        log::debug!(
+            "GD32 driver: dead-man timeout {} ms",
+            deadman_timeout_ms.max(100)
+        );
+        log::debug!(
+            "GD32 driver: lidar rail-off settle {} ms",
+            lidar_rail_off_settle_ms
+        );
+
+        let component_state = Arc::new(
+            ComponentState::new(lidar_pwm, deadman_timeout_ms)
+                .with_velocity_scales(linear_velocity_scale, angular_velocity_scale),
+        );
+        component_state.set_lidar_rail_off_settle_ms(lidar_rail_off_settle_ms);
 
         Ok(Self {
             port: Arc::new(Mutex::new(port)),
@@ -128,12 +144,17 @@ impl GD32Driver {
             shutdown: Arc::new(AtomicBool::new(false)),
             heartbeat_handle: None,
             reader_handle: None,
-            component_state: Arc::new(ComponentState::new(
-                lidar_pwm,
-                linear_velocity_scale,
-                angular_velocity_scale,
-            )),
+            component_state,
         })
+    }
+
+    /// Attach the lidar driver's scan counter, so `lidar enable` can verify that the
+    /// sensor really entered streaming (see `ComponentState::attach_lidar_scan_counter`).
+    pub fn attach_lidar_scan_counter(
+        &self,
+        counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        self.component_state.attach_lidar_scan_counter(counter);
     }
 
     /// Initialize the GD32 device by sending init commands
@@ -205,6 +226,7 @@ impl GD32Driver {
         // Start reader thread
         let reader_shutdown = Arc::clone(&shutdown);
         let reader_port = Arc::clone(&port);
+        let reader_components = Arc::clone(&component_state);
         self.reader_handle = Some(
             thread::Builder::new()
                 .name("gd32-reader".to_string())
@@ -217,6 +239,7 @@ impl GD32Driver {
                         stream_tx,
                         gyro_transform,
                         accel_transform,
+                        &reader_components,
                     );
                 })
                 .map_err(|e| Error::Other(format!("Failed to spawn reader thread: {}", e)))?,

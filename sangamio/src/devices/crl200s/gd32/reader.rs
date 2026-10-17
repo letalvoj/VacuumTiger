@@ -11,6 +11,7 @@
 
 use super::packet::version_request_packet;
 use super::protocol::{PacketReader, RxPacket};
+use super::state::{bumper_press_masked, monotonic_now_ms, ComponentState};
 use crate::config::AxisTransform3D;
 use crate::core::types::{SensorGroupData, SensorValue, StreamSender};
 use crate::devices::crl200s::constants::{
@@ -66,6 +67,7 @@ pub(super) fn reader_loop(
     stream_tx: Option<StreamSender>,
     gyro_transform: AxisTransform3D,
     accel_transform: AxisTransform3D,
+    component_state: &Arc<ComponentState>,
 ) {
     let mut reader = PacketReader::new();
     let mut version_requested = false;
@@ -129,6 +131,7 @@ pub(super) fn reader_loop(
                         &sensor_data,
                         &gyro_transform,
                         &accel_transform,
+                        component_state,
                     )
                 {
                     // Push to streaming channel if available (for 110Hz TCP streaming)
@@ -214,6 +217,7 @@ fn handle_status_packet(
     sensor_data: &Arc<Mutex<SensorGroupData>>,
     gyro_transform: &AxisTransform3D,
     accel_transform: &AxisTransform3D,
+    component_state: &Arc<ComponentState>,
 ) -> Option<SensorGroupData> {
     // Update shared data directly (no allocations)
     let Ok(mut data) = sensor_data.lock() else {
@@ -265,29 +269,91 @@ fn handle_status_packet(
     );
 
     // Bumpers
-    data.set(
-        "bumper_left",
-        SensorValue::Bool((payload[OFFSET_BUMPER_FLAGS] & FLAG_BUMPER_LEFT) != 0),
-    );
-    data.set(
-        "bumper_right",
-        SensorValue::Bool((payload[OFFSET_BUMPER_FLAGS] & FLAG_BUMPER_RIGHT) != 0),
-    );
+    let bump_l = (payload[OFFSET_BUMPER_FLAGS] & FLAG_BUMPER_LEFT) != 0;
+    let bump_r = (payload[OFFSET_BUMPER_FLAGS] & FLAG_BUMPER_RIGHT) != 0;
+    data.set("bumper_left", SensorValue::Bool(bump_l));
+    data.set("bumper_right", SensorValue::Bool(bump_r));
+
+    // Charging/dock state (read out of the same status packet for the bumper mask).
+    let charging = (payload[OFFSET_CHARGING_FLAGS] & FLAG_CHARGING) != 0;
+    let docked = (payload[OFFSET_CHARGING_FLAGS] & FLAG_DOCK_CONNECTED) != 0;
+
+    // Bumper interlock state for the heartbeat (issue #18, R2): o que vai para o
+    // hard-stop e' o mascarado; os crus ficam para o log.
+    //
+    // Mascara (medida 05/10/2026): na base o contato de carga marca os DOIS
+    // bumpers (0x06 em OFFSET_BUMPER_FLAGS) e o byte de flags de carga OSCILA a
+    // ~50 Hz, com janelas de ate ~0,9 s em que docked E charging ficam False.
+    // Uma mascara instantanea vira corrida e mata o primeiro comando de tracao
+    // (BUMPER-STOP L=true R=true medido saindo da base). Entao:
+    //   - `dock_signal_ms` e' latch (a mascara segura o sinal por DOCK_SIGNAL_HOLD_MS);
+    //   - `press_since_ms` guarda quando a pressao atual comecou (pressao estatica
+    //     com as rodas paradas = base, nao colisao).
+    // O `bumper_pressed` final e' calculado depois dos encoders, porque a
+    // assinatura de "pressao estatica" depende de as rodas estarem paradas.
+    let now_ms = monotonic_now_ms();
+    let pressed_raw = bump_l || bump_r;
+
+    component_state
+        .is_dock_connected
+        .store(docked, Ordering::Relaxed);
+    component_state
+        .is_charging
+        .store(charging, Ordering::Relaxed);
+    component_state.bumper_left.store(bump_l, Ordering::Relaxed);
+    component_state
+        .bumper_right
+        .store(bump_r, Ordering::Relaxed);
+
+    if docked || charging {
+        component_state
+            .dock_signal_ms
+            .store(now_ms, Ordering::Relaxed);
+    }
+    if pressed_raw {
+        if component_state.press_since_ms.load(Ordering::Relaxed) == 0 {
+            component_state
+                .press_since_ms
+                .store(now_ms, Ordering::Relaxed);
+        }
+    } else {
+        component_state.press_since_ms.store(0, Ordering::Relaxed);
+    }
 
     // Wheel encoders
-    data.set(
-        "wheel_left",
-        SensorValue::U16(u16::from_le_bytes([
-            payload[OFFSET_WHEEL_LEFT_ENCODER],
-            payload[OFFSET_WHEEL_LEFT_ENCODER + 1],
-        ])),
-    );
-    data.set(
-        "wheel_right",
-        SensorValue::U16(u16::from_le_bytes([
-            payload[OFFSET_WHEEL_RIGHT_ENCODER],
-            payload[OFFSET_WHEEL_RIGHT_ENCODER + 1],
-        ])),
+    let wheel_left = u16::from_le_bytes([
+        payload[OFFSET_WHEEL_LEFT_ENCODER],
+        payload[OFFSET_WHEEL_LEFT_ENCODER + 1],
+    ]);
+    let wheel_right = u16::from_le_bytes([
+        payload[OFFSET_WHEEL_RIGHT_ENCODER],
+        payload[OFFSET_WHEEL_RIGHT_ENCODER + 1],
+    ]);
+    data.set("wheel_left", SensorValue::U16(wheel_left));
+    data.set("wheel_right", SensorValue::U16(wheel_right));
+
+    // Movimento real (pelos encoders): e' isso que separa colisao de base.
+    if wheel_left != component_state.prev_wheel_left.load(Ordering::Relaxed)
+        || wheel_right != component_state.prev_wheel_right.load(Ordering::Relaxed)
+    {
+        component_state.last_motion_ms.store(now_ms, Ordering::Relaxed);
+    }
+    component_state
+        .prev_wheel_left
+        .store(wheel_left, Ordering::Relaxed);
+    component_state
+        .prev_wheel_right
+        .store(wheel_right, Ordering::Relaxed);
+
+    component_state.bumper_pressed.store(
+        bumper_press_masked(
+            pressed_raw,
+            now_ms,
+            component_state.dock_signal_ms.load(Ordering::Relaxed),
+            component_state.press_since_ms.load(Ordering::Relaxed),
+            component_state.last_motion_ms.load(Ordering::Relaxed),
+        ),
+        Ordering::Relaxed,
     );
 
     // Cliff sensors

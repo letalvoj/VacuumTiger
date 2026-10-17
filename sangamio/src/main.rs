@@ -284,6 +284,7 @@ fn main() -> Result<()> {
 
                 // Clone resources for receiver thread
                 let driver_clone = Arc::clone(&driver);
+                let deadman_driver = Arc::clone(&driver);
                 let recv_serializer = create_serializer();
                 let recv_running = Arc::clone(&running);
                 let registry_clone = Arc::clone(&udp_client_registry);
@@ -323,6 +324,18 @@ fn main() -> Result<()> {
                             }
                         };
                         if still_current {
+                            // Dead-man (deterministic): the controlling client is gone,
+                            // so zero and disable the drive now. The GD32 holds the last
+                            // velocity forever; the heartbeat dead-man stays as a backstop
+                            // for half-open connections.
+                            {
+                                let mut drv =
+                                    deadman_driver.lock().unwrap_or_else(|e| e.into_inner());
+                                let _ = drv.send_command(Command::ComponentControl {
+                                    id: "drive".to_string(),
+                                    action: ComponentAction::Disable { config: None },
+                                });
+                            }
                             if let Ok(mut guard) = registry_clone.lock() {
                                 *guard = None;
                             }

@@ -41,7 +41,6 @@
 
 use super::packet::{TxPacket, heartbeat_packet, motor_mode_nav_packet, request_stm32_packet};
 use super::state::ComponentState;
-use serialport::SerialPort;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -66,6 +65,26 @@ const MODE_SWITCH_DELAY_MS: u64 = 100;
 /// as observed in MITM captures (see [`../COMMANDS.md`](../COMMANDS.md) "Request STM32 Data" entry).
 /// This appears to be a keep-alive/diagnostic query.
 const STM32_REQUEST_INTERVAL_MS: u64 = 1500;
+
+/// Intervalo do keep-alive de componente "escova principal" (0x6A) durante a
+/// tração contínua, em ms.
+///
+/// O firmware original mantém 0x6A periódico ~1,1s MESMO em tração continua
+/// (medido: 458x 0x6A junto de movimento, gap mediano ~1103ms). O GD32 corta
+/// as rodas quando o único "componente ativo" é a proprio tração — a escova
+/// (0x6A) conta como componente de fundo que mantém as rodas vivas; o LiDAR
+/// (0x71) isolado não basta (ver `CORTE_RODAS.md`). Usamos ~1s para
+/// replicar o gap original.
+const DRIVE_BRUSH_KEEPALIVE_INTERVAL_MS: u64 = 1000;
+
+/// Velocidade da escova de keep-alive (0-100%). Valor baixo: apenas sinaliza
+/// "componente ativo" ao GD32, sem estraçalhar o chão/consumir.
+const DRIVE_BRUSH_KEEPALIVE_SPEED: u8 = 30;
+
+/// Brush keep-alive gate. Off on the viomi v8: the author marks the keep-alive as an
+/// unvalidated hypothesis (oangelo 274a691/309f347), and it spins the main brush
+/// without being asked. Re-enable only to test the wheel-cut theory on blocks.
+const DRIVE_BRUSH_KEEPALIVE_ENABLED: bool = false;
 
 /// Heartbeat loop - sends appropriate commands at configured interval
 ///
@@ -94,8 +113,8 @@ const STM32_REQUEST_INTERVAL_MS: u64 = 1500;
 ///
 /// The blocking mutex acquisition is intentional: we prioritize heartbeat delivery
 /// over other operations to maintain safety guarantees.
-pub(super) fn heartbeat_loop(
-    port: Arc<Mutex<Box<dyn SerialPort>>>,
+pub(super) fn heartbeat_loop<W: std::io::Write + Send + 'static>(
+    port: Arc<Mutex<W>>,
     shutdown: Arc<AtomicBool>,
     interval_ms: u64,
     component_state: Arc<ComponentState>,
@@ -113,6 +132,29 @@ pub(super) fn heartbeat_loop(
     let stm32_request_interval = STM32_REQUEST_INTERVAL_MS / interval_ms;
     let mut stm32_request_counter: u64 = 0;
 
+    // Keep-alive do componente "escova principal" (0x6A) durante a tracao.
+    //
+    // O firmware original, no meio da limpeza (tração contínua), mantém enviando
+    // 0x6A (escova) periódico ~1/s MESMO quando só as rodas estão tracionando —
+    // o GD32 para as rodas se NÃO houver outro componente ativo além da roda/dt.
+    // Medido (03/10 vs 01/10): original tinha 458x 0x6A junto de movimento (gap
+    // ~1.1s); o nosso sangam envia 0x6A NAO - zerado -> rodas cortam ~5s.
+    // Ver `CORTE_RODAS.md`.
+    let brush_keepalive_interval = DRIVE_BRUSH_KEEPALIVE_INTERVAL_MS / interval_ms;
+    let mut brush_keepalive_counter: u64 = 0;
+    // O keep-alive segurou a escova num ciclo anterior (0x6A=30). Quando o robô
+    // PARAR de dirigir e o cliente NAO pediu escova, precisamos mandar 0x6A=0
+    // para desligar — senao o GD32 segura o ultimo 0x6A (escova fica girando).
+    let mut brush_keepalive_active = false;
+
+    // Deadline-based heartbeating: sleep until the *next* tick boundary instead of
+    // a fixed sleep *after* the work. A fixed `sleep(interval_ms)` after sending
+    // compounds any lock/send time into the cadence — measured on the CRL-200S at
+    // ~40ms (target 20ms), which the GD32 reads as a rate too low to keep the
+    // wheel motors alive. With a deadline we drift back to the correct rate even
+    // if a cycle runs late.
+    let mut next_tick = std::time::Instant::now() + std::time::Duration::from_millis(interval_ms);
+
     while !shutdown.load(Ordering::Relaxed) {
         // Use blocking lock to ensure commands are always sent
         let Ok(mut port) = port.lock() else {
@@ -123,7 +165,7 @@ pub(super) fn heartbeat_loop(
         // Check component states
         let (vacuum, main_brush, side_brush, water_pump) = component_state.get_component_speeds();
         let lidar_enabled = component_state.lidar_enabled.load(Ordering::Relaxed);
-        let (linear, angular) = component_state.get_velocities();
+        let (mut linear, mut angular) = component_state.get_velocities();
 
         // Motor mode is needed if any component is active OR wheel motor is explicitly enabled
         let any_component_active = component_state.any_active();
@@ -149,8 +191,99 @@ pub(super) fn heartbeat_loop(
         }
 
         if component_state.motor_mode_set.load(Ordering::Relaxed) {
-            // Send motor mode 0x02 periodically to keep GD32 in navigation mode
-            let _ = motor_mode_nav.send_to(&mut *port);
+            // NAO reenviar 0x65 02 a cada ciclo ... (comentario acima)
+
+            // =========================================================
+            // DEAD-MAN SWITCH
+            // =========================================================
+            // O GD32 mantem a ultima velocidade sem heartbeat (medido em
+            // 01/10/2026: `kill -9` no daemon e o robo andou ~1,03 m). O TCP
+            // cair (cliente morto/rede) NAO `p por si so` - o daemon continua
+            // reenviando a ultima velocidade. Aqui, se ha velocidade != 0 e
+            // nenhum comando de drive chegou em `deadman_timeout_ms`, fazemos
+            // a parada explicita (0,0), como manda a seguranca.
+            //
+            // FIX (dead-man flap): sair para o modo 0x00 aqui e o que produzia
+            // o flap `0x02 -> 0x00 -> 0x02` com o LiDAR ligado. Ao soltar o modo
+            // navegacao limpavamos `motor_mode_set`; no ciclo seguinte
+            // `any_component_active` (o LiDAR) re-seta `0x65 02`. Reenviar
+            // `0x65 02` para o motor do LiDAR (item 1 de docs/lidar-delta2d.md).
+            // Agora, se algum componente que NAO e a roda ainda estiver ativo,
+            // MANTEMOS o modo navegacao e so zeramos a velocidade (rodas
+            // freadas). Se nada mais estiver ativo, caimos para 0x00 como antes.
+            if component_state.deadman_expired() {
+                if !component_state.deadman_tripped.load(Ordering::Relaxed) {
+                    log::warn!(
+                        "DEAD-MAN: sem comando de drive por >={}ms - parando motor (velocidade estava {:?})",
+                        component_state.deadman_timeout_ms.load(Ordering::Relaxed),
+                        component_state.get_velocities()
+                    );
+                    component_state.deadman_tripped.store(true, Ordering::Relaxed);
+                }
+                // Parada explicita das rodas: zera o estado e envia 0,0. O
+                // pedido de tracao e descartado (nao ha mais cliente).
+                component_state.linear_velocity.store(0, Ordering::Relaxed);
+                component_state.angular_velocity.store(0, Ordering::Relaxed);
+                component_state.wheel_motor_enabled.store(false, Ordering::Relaxed);
+                pkt.set_velocity(0, 0);
+                if let Err(e) = pkt.send_to(&mut *port) {
+                    log::error!("Dead-man stop velocity send failed: {}", e);
+                }
+                if component_state.other_component_active() {
+                    // Mantem 0x65 02 (ja latcheado) -> rodas freadas, LiDAR
+                    // segue girando. NAO limpar `motor_mode_set`.
+                    log::warn!(
+                        "DEAD-MAN: componente ativo presente - modo navegacao MANTIDO, rodas paradas (0x66 0,0)"
+                    );
+                } else {
+                    // Nada mais ativo: pode sair do modo (roda livre), como antes.
+                    pkt.set_motor_mode(0x00);
+                    if let Err(e) = pkt.send_to(&mut *port) {
+                        log::error!("Dead-man stop mode send failed: {}", e);
+                    }
+                    component_state
+                        .motor_mode_set
+                        .store(false, Ordering::Relaxed);
+                }
+                // Dorme e volta ao topo. O proximo comando de drive de um
+                // cliente novo rearma (`note_drive_command`); com um componente
+                // ativo o modo 0x02 permanece latcheado sem flap.
+                drop(port);
+                thread::sleep(Duration::from_millis(interval_ms));
+                continue;
+            }
+
+            // =========================================================
+            // BUMPER HARD-STOP (issue #18, R2)
+            // =========================================================
+            // Colisão durante a marcha -> parada imediata (<200ms), sem passar
+            // pelo DEAD-MAN. O reader publica `bumper_pressed` já mascarado
+            // (criterio D: sem falso-positivo na base — o contato de carga marca
+            // os dois bumpers e o byte de dock oscila; ver `bumper_press_masked`
+            // em state.rs, que segura o sinal de base por 1,5 s e ignora pressão
+            // estática com as rodas paradas). Só freia se o robo estiver de fato
+            // se movendo (senão o bumper pressionado não infla a distância nem
+            // gera log repetido).
+            if component_state.bumper_pressed.load(Ordering::Relaxed)
+                && (linear != 0 || angular != 0)
+            {
+                log::warn!(
+                    "BUMPER-STOP L={} R={}: parando rodas (velocidade estava {:?})",
+                    component_state.bumper_left.load(Ordering::Relaxed),
+                    component_state.bumper_right.load(Ordering::Relaxed),
+                    component_state.get_velocities()
+                );
+                component_state.linear_velocity.store(0, Ordering::Relaxed);
+                component_state.angular_velocity.store(0, Ordering::Relaxed);
+                component_state.wheel_motor_enabled.store(false, Ordering::Relaxed);
+                pkt.set_velocity(0, 0);
+                if let Err(e) = pkt.send_to(&mut *port) {
+                    log::error!("BUMPER-STOP velocity send failed: {}", e);
+                }
+                // Recompute the locals for the rest of this cycle (0,0).
+                linear = 0;
+                angular = 0;
+            }
 
             // Motor mode 0x02 active - send velocity command as heartbeat
             pkt.set_velocity(linear, angular);
@@ -193,6 +326,45 @@ pub(super) fn heartbeat_loop(
                     log::error!("Lidar PWM send failed: {}", e);
                 }
             }
+
+            // Keep-alive de componente durante a tração continua: o GD32 corta as
+            // rodas quando o único componente ativo é a própria tração (ver const
+            // DRIVE_BRUSH_KEEPALIVE_*). Se a escova NAO foi pedida pelo cliente
+            // (main_brush == 0), nós a emitimos periodicamente (~1s) como o firmware
+            // original fazia, para manter um "componente de fundo" ativo. Se o
+            // cliente pediu escova (main_brush > 0), o bloco acima já a envia a cada
+            // ciclo e este keep-alive é redundante (não dispara).
+            let driving = linear != 0 || angular != 0;
+            if DRIVE_BRUSH_KEEPALIVE_ENABLED && driving && main_brush == 0 {
+                brush_keepalive_counter += 1;
+                if brush_keepalive_counter >= brush_keepalive_interval {
+                    brush_keepalive_counter = 0;
+                    pkt.set_main_brush(DRIVE_BRUSH_KEEPALIVE_SPEED);
+                    if let Err(e) = pkt.send_to(&mut *port) {
+                        log::error!("Drive brush keep-alive (0x6A) send failed: {}", e);
+                    } else {
+                        log::debug!(
+                            "Drive brush keep-alive 0x6A={} (componente de fundo durante tração)",
+                            DRIVE_BRUSH_KEEPALIVE_SPEED
+                        );
+                    }
+                    brush_keepalive_active = true;
+                }
+            } else if brush_keepalive_active && main_brush == 0 {
+                // Parou de dirigir e o keep-alive era o único dono da escova:
+                // desligar explicitamente (0x6A=0). Fix do achado 04/10 — sem isso o
+                // GD32 segura o último 0x6A=30 e a escova fica girando com o robô
+                // parado.
+                brush_keepalive_active = false;
+                pkt.set_main_brush(0);
+                if let Err(e) = pkt.send_to(&mut *port) {
+                    log::error!("Drive brush keep-alive OFF (0x6A=0) send failed: {}", e);
+                } else {
+                    log::info!(
+                        "Drive brush keep-alive OFF (0x6A=0) - fim da tração"
+                    );
+                }
+            }
         } else {
             // No components active - send regular heartbeat
             if let Err(e) = heartbeat.send_to(&mut *port) {
@@ -216,8 +388,280 @@ pub(super) fn heartbeat_loop(
         // Explicitly release port mutex before sleeping to allow other threads
         // (reader, command handler) to access the serial port during our sleep period
         drop(port);
-        thread::sleep(Duration::from_millis(interval_ms));
+        // Sleep until the next tick boundary (drift-correcting), not a fixed sleep.
+        let now = std::time::Instant::now();
+        if now < next_tick {
+            thread::sleep(next_tick - now);
+        } else {
+            // We missed the window (lock contention / slow send); don't spiral —
+            // recompute against "now" so we don't busy-spin into the past.
+            log::trace!("heartbeat tick missed deadline by {:?}", now.duration_since(next_tick));
+        }
+        next_tick += std::time::Duration::from_millis(interval_ms);
+        // If we fell far behind (e.g. long block in the send path), keep the next
+        // deadline ahead of the current time rather than compounding catch-up.
+        if next_tick < std::time::Instant::now() {
+            next_tick = std::time::Instant::now() + std::time::Duration::from_millis(interval_ms);
+        }
     }
 
     log::info!("Heartbeat thread exiting");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::devices::crl200s::constants::CMD_MAIN_BRUSH;
+    use std::io::Write;
+
+    /// Write sink that records every byte the heartbeat loop emits, so a test
+    /// can parse the exact frame stream that would go to `/dev/ttyS3`. Stands in
+    /// for the serial port: the heartbeat thread only ever *writes*, so a full
+    /// `SerialPort` mock would add nothing.
+    #[derive(Clone, Default)]
+    struct RecordingWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Parse a raw GD32 frame stream (`FA FB | LEN | CMD PAYLOAD CRC`) into
+    /// `(CMD, PAYLOAD)` pairs, resyncing on junk.
+    fn parse_frames(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 3 < bytes.len() {
+            if bytes[i] == 0xFA && bytes[i + 1] == 0xFB {
+                let len = bytes[i + 2] as usize;
+                let total = len + 3;
+                if i + total <= bytes.len() {
+                    out.push((bytes[i + 3], bytes[i + 4..i + total - 2].to_vec()));
+                    i += total;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Ordered sequence of motor-mode values (CMD 0x65) seen in the stream.
+    fn mode_sequence(frames: &[(u8, Vec<u8>)]) -> Vec<u8> {
+        frames
+            .iter()
+            .filter(|(cmd, _)| *cmd == 0x65)
+            .map(|(_, p)| p[0])
+            .collect()
+    }
+
+    /// Run the real heartbeat loop against a recording sink for `ms`, then stop
+    /// and return the parsed frame stream.
+    fn run_heartbeat(state: Arc<ComponentState>, ms: u64) -> Vec<(u8, Vec<u8>)> {
+        let rec = RecordingWriter::default();
+        let bytes = Arc::clone(&rec.bytes);
+        let port = Arc::new(Mutex::new(rec));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let port = Arc::clone(&port);
+            let shutdown = Arc::clone(&shutdown);
+            thread::spawn(move || heartbeat_loop(port, shutdown, 20, state))
+        };
+        thread::sleep(Duration::from_millis(ms));
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        let out = bytes.lock().unwrap().clone();
+        parse_frames(&out)
+    }
+
+    /// REPRODUCER determinístico do flap de modo no dead-man.
+    ///
+    /// Caminho real do heartbeat, LiDAR ligado, velocidade != 0 e dead-man
+    /// vencido (sem `note_drive_command`). Codifica o comportamento SEGURO: as
+    /// rodas param com `0x66 0,0`, mas o modo navegação NÃO é solto — logo não
+    /// há `0x00` nem reenvio de `0x65 02`.
+    ///
+    /// No código ANTES do fix este teste FALHA com `modes == [0x02, 0x00, 0x02]`
+    /// (o flap); depois do fix passa com `modes == [0x02]`.
+    #[test]
+    fn deadman_with_lidar_keeps_nav_mode_no_flap() {
+        let state = Arc::new(ComponentState::new(73, 100));
+        state.lidar_enabled.store(true, Ordering::Relaxed);
+        state.linear_velocity.store(4483, Ordering::Relaxed); // ~1 m/s
+
+        let frames = run_heartbeat(state, 500);
+        let modes = mode_sequence(&frames);
+
+        let stopped = frames.iter().any(|(cmd, p)| {
+            *cmd == 0x66
+                && p.len() == 8
+                && i32::from_le_bytes([p[0], p[1], p[2], p[3]]) == 0
+                && i32::from_le_bytes([p[4], p[5], p[6], p[7]]) == 0
+        });
+        assert!(
+            stopped,
+            "dead-man deve enviar 0x66 0,0 (rodas paradas). modos={:?}",
+            modes
+        );
+        assert_eq!(
+            modes,
+            vec![0x02],
+            "com LiDAR ativo o modo navegação deve permanecer latcheado \
+             (0x65 02 enviado uma única vez, LiDAR segue girando). \
+             Modos observados = {:?}; um 0x00 intermediário é o FLAP 0x02 -> 0x00 -> 0x02.",
+            modes
+        );
+    }
+
+    /// Guarda de regressão: sem nenhum outro componente ativo, o dead-man
+    /// continua saindo para 0x00 (roda livre) como antes — o fix não pode
+    /// engolir esse caminho.
+    #[test]
+    fn deadman_without_other_components_still_exits_nav_mode() {
+        let state = Arc::new(ComponentState::new(73, 100));
+        state.linear_velocity.store(4483, Ordering::Relaxed);
+        state.wheel_motor_enabled.store(true, Ordering::Relaxed);
+
+        let frames = run_heartbeat(state, 500);
+        let modes = mode_sequence(&frames);
+
+        assert!(
+            modes.iter().filter(|m| **m == 0x00).count() == 1,
+            "sem outro componente ativo o dead-man deve sair para 0x00 uma vez. modos={:?}",
+            modes
+        );
+        assert_ne!(
+            modes.last(),
+            Some(&0x02),
+            "após sair para 0x00 não pode voltar para 0x02. modos={:?}",
+            modes
+        );
+    }
+
+    /// BUMPER HARD-STOP (issue #18, R2): com o robô se movendo e o bumper
+    /// pressionado, o heartbeat para as rodas (`0x66 0,0`) SEM depender do
+    /// dead-man. Dead-man com timeout longo (não expira neste janela) prova que
+    /// a parada veio do bumper, não do dead-man.
+    #[test]
+    fn bumper_pressed_while_moving_zeroes_wheels() {
+        let state = Arc::new(ComponentState::new(73, 100_000)); // dead-man so expira em 100s
+        state.lidar_enabled.store(true, Ordering::Relaxed);
+        state.linear_velocity.store(4483, Ordering::Relaxed); // ~1 m/s
+        state.note_drive_command(); // re-arma o dead-man -> nao expira
+        state.bumper_left.store(true, Ordering::Relaxed); // colisao L
+        state
+            .bumper_pressed
+            .store(true, Ordering::Relaxed); // reader mascarou dock -> ativo
+
+        let frames = run_heartbeat(state, 300);
+
+        let stopped = frames.iter().any(|(cmd, p)| {
+            *cmd == 0x66
+                && p.len() == 8
+                && i32::from_le_bytes([p[0], p[1], p[2], p[3]]) == 0
+                && i32::from_le_bytes([p[4], p[5], p[6], p[7]]) == 0
+        });
+        assert!(stopped, "bumper pressionado com marcha deve parar as rodas via 0x66 0,0");
+    }
+
+    /// O bumper pressão com o robô PARADO não gera comando de parada extra que
+    /// inflaria o passo — a velocidade já é 0 e o bounce do bumper não se
+    /// transforma em movimento.
+    #[test]
+    fn bumper_pressed_while_idle_keeps_wheels_stopped() {
+        let state = Arc::new(ComponentState::new(73, 100_000));
+        state.lidar_enabled.store(true, Ordering::Relaxed);
+        state.bumper_right.store(true, Ordering::Relaxed);
+        state
+            .bumper_pressed
+            .store(true, Ordering::Relaxed);
+
+        let frames = run_heartbeat(state, 200);
+        // Robo parado: nao deve haver frame de velocidade != 0 (nada para as
+        // rodas a mover). Qualquer 0x66 presente deve ser 0,0.
+        let nonzero = frames.iter().any(|(cmd, p)| {
+            *cmd == 0x66
+                && (i32::from_le_bytes([p[0], p[1], p[2], p[3]]) != 0
+                    || i32::from_le_bytes([p[4], p[5], p[6], p[7]]) != 0)
+        });
+        assert!(
+            !nonzero,
+            "bumper com robô parado nao deve gerar velocidade != 0 (nao infla passo)"
+        );
+    }
+
+    /// Fix do achado 04/10 (issue #18): durante a tração contínua o keep-alive
+    /// manda 0x6A=30 (escova de fundo) para o GD32 não cortar as rodas; quando o
+    /// robô PARA e o cliente não pediu escova, precisa mandar 0x6A=0 para
+    /// desligar — senão o GD32 segura o último 0x6A e a escova fica girando com o
+    /// robô parado. Este teste roda o heartbeat dirigindo (~1.1s, dispara o
+    /// keep-alive), depois zera a velocidade e verifica que um frame 0x6A=0 é
+    /// emitido após o 0x6A=30.
+    #[test]
+    #[ignore = "brush keep-alive disabled on v8 (DRIVE_BRUSH_KEEPALIVE_ENABLED)"]
+    fn brush_keepalive_off_sent_when_driving_stops() {
+        let state = Arc::new(ComponentState::new(73, 100_000)); // deadman longo: nao interfere
+        state.lidar_enabled.store(true, Ordering::Relaxed);
+        state.linear_velocity.store(2242, Ordering::Relaxed); // ~0.5 m/s
+        state.note_drive_command();
+
+        let rec = RecordingWriter::default();
+        let bytes = Arc::clone(&rec.bytes);
+        let port = Arc::new(Mutex::new(rec));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let h = {
+            let port = Arc::clone(&port);
+            let shutdown = Arc::clone(&shutdown);
+            let st = Arc::clone(&state);
+            thread::spawn(move || heartbeat_loop(port, shutdown, 20, st))
+        };
+
+        // Deixa o keep-alive disparar (intervalo ~1s; margem p/ um ciclo).
+        thread::sleep(Duration::from_millis(1150));
+
+        // Para o robô (0,0): o keep-alive deve mandar 0x6A=0 ao sair de driving.
+        state.linear_velocity.store(0, Ordering::Relaxed);
+        state.angular_velocity.store(0, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(150));
+
+        shutdown.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+
+        let bytes = bytes.lock().unwrap().clone();
+        let frames = parse_frames(&bytes);
+        let brush_frames: Vec<u8> = frames
+            .iter()
+            .filter(|(cmd, _)| *cmd == CMD_MAIN_BRUSH)
+            .map(|(_, p)| p[0])
+            .collect();
+
+        assert!(
+            brush_frames.iter().any(|&s| s == DRIVE_BRUSH_KEEPALIVE_SPEED),
+            "durante a tracao deve ter 0x6A={} (keep-alive). frames 0x6A={:?}",
+            DRIVE_BRUSH_KEEPALIVE_SPEED,
+            brush_frames
+        );
+        assert!(
+            brush_frames.iter().any(|&s| s == 0),
+            "ao parar o robô deve vir 0x6A=0 (desligar escova colada). frames 0x6A={:?}",
+            brush_frames
+        );
+        // Garante que o 0 vem DEPOIS do keep-alive (nao antes).
+        let last_ka = brush_frames
+            .iter()
+            .rposition(|&s| s == DRIVE_BRUSH_KEEPALIVE_SPEED);
+        let last_zero = brush_frames.iter().rposition(|&s| s == 0);
+        assert!(
+            last_zero.unwrap_or(0) > last_ka.unwrap_or(usize::MAX),
+            "o 0x6A=0 deve ser emitido depois do ultimo 0x6A=30. frames 0x6A={:?}",
+            brush_frames
+        );
+    }
 }

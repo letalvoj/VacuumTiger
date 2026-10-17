@@ -63,6 +63,7 @@ use std::io::Read;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// TCP receiver that handles commands from connected client
 pub struct TcpReceiver {
@@ -80,6 +81,23 @@ pub struct TcpReceiver {
 
 /// Initial capacity for command read buffer (typical command size)
 const INITIAL_BUFFER_CAPACITY: usize = 256;
+
+/// A partir de quanto tempo uma chamada de handle_command e considerada um BLOQUEIO do
+/// canal de comando (o `lidar enable` leva 17-25 s: rail-off 10 s + boot 12 s + spin-up).
+const BUSY_WARN_MS: u128 = 1000;
+
+// NOTA (05/10/2026, medido no metal): existiu aqui um guard "STALE-DRIVE" que DESCARTAVA
+// comando de drive que chegava logo apos um bloqueio do canal. Ele foi REMOVIDO porque
+// descartou o `drive enable` de um cliente LEGITIMO: o driver de LiDAR publica **scan
+// PARCIAL** no timeout do sensor, o cliente ve "chegou scan", manda a tracao — e o comando
+// cai dentro da janela. O conserto e do lado do cliente: criterio de prontidao = TAXA de
+// scan COMPLETO (ver `map-odom.py --lidar-rate/--lidar-min-points`). O daemon so LOGA.
+
+/// Ha byte esperando no socket? (peek nao consome)
+pub fn has_pending(stream: &TcpStream) -> bool {
+    let mut probe = [0u8; 1];
+    matches!(stream.peek(&mut probe), Ok(n) if n > 0)
+}
 
 impl TcpReceiver {
     /// Create a new TCP receiver
@@ -126,7 +144,31 @@ impl TcpReceiver {
             match self.read_command(&mut stream) {
                 Ok(Some(cmd)) => {
                     log::debug!("Received command: {:?}", cmd);
-                    if let Err(e) = self.handle_command(cmd) {
+                    let label = describe(&cmd);
+                    let t0 = Instant::now();
+                    let result = self.handle_command(cmd);
+                    let busy_ms = t0.elapsed().as_millis();
+                    if busy_ms >= BUSY_WARN_MS {
+                        let pending = has_pending(&stream);
+                        log::warn!(
+                            "canal de comando BLOQUEADO {} ms por '{}' — {}",
+                            busy_ms,
+                            label,
+                            if pending {
+                                "havia comando do cliente JA no buffer ao fim do bloqueio: ele \
+                                 sera executado AGORA, em ordem. Se era comando de drive, pode nao \
+                                 engatar (foi mandado pensando que o LiDAR ja estava pronto). \
+                                 ATENCAO: o driver publica scan PARCIAL no timeout do sensor, entao \
+                                 o cliente pode ter sido ENGANADO por um scan parcial — o criterio \
+                                 de prontidao tem que ser TAXA de scan COMPLETO, nao 'chegou scan' \
+                                 (medido no metal 05/10). NAO descartamos o comando de proposito: \
+                                 um guard que descartava matou um cliente legitimo nessa mesma data."
+                            } else {
+                                "nada pendente no socket (cliente esperou — ok)"
+                            }
+                        );
+                    }
+                    if let Err(e) = result {
                         log::warn!("Failed to handle command: {}", e);
                     }
                 }
@@ -224,5 +266,29 @@ impl TcpReceiver {
             log::warn!("Command execution failed: {:?}", result);
         }
         result
+    }
+}
+
+/// Rotulo curto do comando para o log ("drive/enable", "lidar/Disable", ...).
+pub fn describe(cmd: &Command) -> String {
+    match cmd {
+        Command::ComponentControl { id, action } => format!("{}/{:?}", id, action),
+        other => format!("{:?}", other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn describe_traz_componente_e_acao() {
+        let cmd = Command::ComponentControl {
+            id: "drive".to_string(),
+            action: crate::core::types::ComponentAction::Disable { config: None },
+        };
+        let s = describe(&cmd);
+        assert!(s.starts_with("drive/"), "rotulo inesperado: {}", s);
+        assert!(describe(&Command::ProtocolSync).contains("ProtocolSync"));
     }
 }

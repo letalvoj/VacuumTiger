@@ -334,6 +334,20 @@ pub struct HardwareConfig {
     /// **CRITICAL**: Values outside 20-50ms will cause motors to stop!
     pub heartbeat_interval_ms: u64,
 
+    /// Dead-man switch timeout for the wheel motors, in milliseconds.
+    ///
+    /// The GD32 holds the last commanded velocity indefinitely (no hardware
+    /// watchdog — measured 01/10/2026). If a drive (velocity/enable) command
+    /// is not received within this window while the robot is moving, the
+    /// heartbeat zeroes the motors and exits navigation mode.
+    ///
+    /// **Default**: 3000ms — safe for clients that re-issue velocity every
+    /// segment (e.g. `map-drive.py` refreshes every 1.2-2s). A closed-loop
+    /// controller streaming at 20-50Hz may lower this to ~500ms; raise it only
+    /// if a legitimate client legitimately holds a velocity for longer.
+    #[serde(default = "default_deadman_timeout_ms")]
+    pub deadman_timeout_ms: u64,
+
     /// Coordinate frame transforms for sensor data
     ///
     /// Transforms raw sensor data to ROS REP-103 robot frame.
@@ -353,6 +367,16 @@ pub struct HardwareConfig {
     /// Lower values = slower motor = lower scan rate
     #[serde(default = "default_lidar_pwm")]
     pub lidar_pwm: u8,
+
+    /// Lidar rail-off settle (ms) that `lidar enable` holds `0x97 00` (rail OFF)
+    /// before `0x97 01` (rail ON), on each start attempt.
+    ///
+    /// Issue #14 (04/10/2026): o cold-start da 1ª partida a frio da sessão é
+    /// intermitente; a hipótese em aberto é que um OFF curto demais (2 s) não
+    /// descarrega o sensor depois de horas parado — a recuperação medida (03/10)
+    /// usou ~10 s. Padrão: 10000 (10 s).
+    #[serde(default = "default_lidar_rail_off_settle_ms")]
+    pub lidar_rail_off_settle_ms: u64,
 
     /// Lidar mounting configuration for robot-center transformation
     ///
@@ -422,6 +446,17 @@ fn default_linear_velocity_scale() -> f32 {
 
 fn default_angular_velocity_scale() -> f32 {
     523.0
+}
+
+/// Default lidar rail-off settle (ms) — 10 s, o valor que destravou a recuperação
+/// medida em 03/10/2026 (a const anterior era 2000 ms, ambos os valores no protocolo).
+fn default_lidar_rail_off_settle_ms() -> u64 {
+    10000
+}
+
+/// Default dead-man switch timeout for wheel motors (see `deadman_timeout_ms`).
+fn default_deadman_timeout_ms() -> u64 {
+    3000
 }
 
 /// Roborock S5 Max hardware configuration.
