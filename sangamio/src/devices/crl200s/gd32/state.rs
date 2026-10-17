@@ -110,6 +110,8 @@ pub struct ComponentState {
     pub motor_mode_set: AtomicBool,
     pub lidar_enabled: AtomicBool,
     pub lidar_pwm: AtomicU8,
+    /// Lidar PWM from config; `clear_all` restores this, not the built-in default.
+    lidar_pwm_config: u8,
     pub linear_velocity: AtomicI16,
     pub angular_velocity: AtomicI16,
     pub wheel_motor_enabled: AtomicBool,
@@ -189,6 +191,7 @@ impl ComponentState {
             motor_mode_set: AtomicBool::new(false),
             lidar_enabled: AtomicBool::new(false),
             lidar_pwm: AtomicU8::new(lidar_pwm.min(100)),
+            lidar_pwm_config: lidar_pwm.min(100),
             linear_velocity: AtomicI16::new(0),
             angular_velocity: AtomicI16::new(0),
             wheel_motor_enabled: AtomicBool::new(false),
@@ -262,7 +265,7 @@ impl ComponentState {
         self.side_brush.store(0, Ordering::Relaxed);
         self.water_pump.store(0, Ordering::Relaxed);
         self.lidar_enabled.store(false, Ordering::Relaxed);
-        self.lidar_pwm.store(DEFAULT_LIDAR_PWM, Ordering::Relaxed);
+        self.lidar_pwm.store(self.lidar_pwm_config, Ordering::Relaxed);
         self.linear_velocity.store(0, Ordering::Relaxed);
         self.angular_velocity.store(0, Ordering::Relaxed);
         self.wheel_motor_enabled.store(false, Ordering::Relaxed);

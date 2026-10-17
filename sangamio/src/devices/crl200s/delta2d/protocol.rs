@@ -234,28 +234,14 @@ impl Delta2DPacketReader {
                 return Ok(ParseResult::None);
             }
 
-            // NOTE: CRC validation disabled - the Delta-2D protocol's checksum algorithm
-            // is not confirmed. Header validation provides robustness against false sync bytes.
-            // WARNING: Without CRC, corrupted packets may be accepted silently.
-            // The diagnostics() method reports crc_failures count for monitoring.
-            //
-            // To re-enable when CRC algorithm is determined, uncomment:
-            // if !self.validate_crc(total_len) {
-            //     self.crc_failures += 1;
-            //     self.bytes_discarded += 1;
-            //     self.buffer.drain(0..1);
-            //     log::trace!("Lidar: CRC failed, draining 1 byte and retrying");
-            //     continue;
-            // }
-
-            // Log warning periodically if we've processed many packets without CRC
-            static WARN_INTERVAL: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let count = WARN_INTERVAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if count == 0 {
-                log::warn!(
-                    "Lidar CRC validation disabled - packets accepted without checksum verification"
-                );
+            // Checksum (vendor AuxCtrl decompile, confirmed on 3292/3292 v8 frames):
+            // ADDR byte (buffer[3]) == 1 -> 16-bit byte sum, otherwise CRC-16/MODBUS.
+            if !self.validate_crc(total_len) {
+                self.crc_failures += 1;
+                self.bytes_discarded += 1;
+                self.buffer.drain(0..1);
+                log::trace!("Lidar: checksum failed, draining 1 byte and retrying");
+                continue;
             }
 
             // Valid packet! Parse it
@@ -314,10 +300,22 @@ impl Delta2DPacketReader {
         true
     }
 
-    /// Validate packet CRC (test-only, algorithm not confirmed for production use)
-    /// Delta-2D uses a simple checksum: sum of all bytes from header to payload
-    #[cfg(test)]
+    /// Validate the packet checksum. ADDR (byte 3) == 1: 16-bit sum of all bytes
+    /// before the checksum (the v8 LDS3 uses this). Otherwise CRC-16/MODBUS.
     fn validate_crc(&self, total_len: usize) -> bool {
+        if total_len >= 10 && self.buffer[3] != 1 {
+            let crc_offset = total_len - 2;
+            let received =
+                ((self.buffer[crc_offset] as u16) << 8) | (self.buffer[crc_offset + 1] as u16);
+            let mut crc: u16 = 0xFFFF;
+            for &b in &self.buffer[..crc_offset] {
+                crc ^= b as u16;
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 { (crc >> 1) ^ 0xA001 } else { crc >> 1 };
+                }
+            }
+            return crc == received;
+        }
         if total_len < 10 {
             // Minimum: 8 header + 2 CRC
             return false;
