@@ -109,7 +109,9 @@ occupied_threshold = 0.5
 free_threshold = -0.5
 
 [loop_closure]
-# Off: accepted false closures on the mock bench (ATE 1.46 m with, 0.08 m without).
+# Off for the first PoC. The false closures seen on the mock bench came from a
+# lidar-frame mismatch (fixed), not from loop closure; re-evaluate on a real
+# multi-room recording before enabling (docs/SLAM_BENCH.md).
 enabled = false
 detection_interval = 5
 min_keyframe_gap = 20
