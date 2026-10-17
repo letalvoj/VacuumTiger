@@ -1,0 +1,53 @@
+[package]
+name = "sangamio"
+version = "0.3.0"
+edition = "2024"
+description = "Hardware abstraction daemon for robot vacuum"
+authors = ["CodeTiger"]
+
+[features]
+default = []
+mock = ["dep:image", "dep:serde_yaml", "dep:rand", "dep:rand_distr"]
+
+[dependencies]
+# Serialization
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
+basic-toml = "0.1"  # Minimal TOML parser (no toml_edit/winnow)
+prost = { version = "0.13", default-features = false, features = ["std", "derive"] }
+
+# Serial port (libudev not needed on embedded Linux)
+serialport = { version = "4.8", default-features = false }
+
+# Logging
+log = "0.4"
+env_logger = { version = "0.10", default-features = false, features = ["humantime"] }
+
+# Concurrency
+crossbeam-queue = { version = "0.3", default-features = false, features = ["std"] }
+crossbeam-channel = { version = "0.5", default-features = false, features = ["std"] }
+
+# Error handling
+thiserror = "1.0"
+
+# Mock device simulation (optional)
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "pnm"] }
+serde_yaml = { version = "0.9", optional = true }
+rand = { version = "0.8", optional = true, default-features = false, features = ["std", "std_rng", "small_rng"] }
+rand_distr = { version = "0.4", optional = true, default-features = false, features = ["std"] }
+
+# Signal handling
+ctrlc = "3.5"
+
+# Unix socket operations (socket buffer configuration)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+prost-build = "0.13"
+
+[profile.release]
+opt-level = 3          # Optimize for speed
+lto = true              # Link-time optimization
+codegen-units = 1       # Single codegen unit for better optimization
+panic = "abort"         # Abort on panic (smaller than unwinding)
+strip = true            # Strip symbols from binary
