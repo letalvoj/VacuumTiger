@@ -71,6 +71,9 @@ icp_min_correspondences = 10
 icp_outlier_ratio = 0.1
 icp_robust_kernel = "welsch"
 icp_kernel_scale = 0.1
+multires_window_xy = 0.5
+multires_window_theta = 0.5
+multires_levels = 3
 
 [keyframe]
 min_translation = 0.5

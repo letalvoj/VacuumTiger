@@ -53,9 +53,9 @@ max_theta_deviation = 0.35
 max_translation_deviation = 0.5
 
 [matcher]
-# multi_res: ATE 0.09/0.17 m on the mock benches, zero drift on a real static v8
-# recording, 84 ms/scan on the R16 (budget 166 ms at 6 Hz). p2l is 10x cheaper and
-# best on the mock, but drifts 0.5 m on the real static data (hybrid_p2l too): see
+# multi_res: ATE 0.10/0.18 m on the mock benches, zero drift on a real static v8
+# recording, 16 ms/scan on the R16 with the window below (budget 166 ms at 6 Hz).
+# p2l is cheaper and best on the mock, but drifts 0.5 m on real static data: see
 # docs/SLAM_BENCH.md before switching.
 algorithm = "multi_res"
 always_correlative = true
@@ -75,6 +75,12 @@ icp_min_correspondences = 10
 icp_outlier_ratio = 0.1
 icp_robust_kernel = "welsch"
 icp_kernel_scale = 0.1
+# multi_res coarse search window around the odometry guess. 0.2 m / 0.2 rad: same
+# ATE as 0.5 on the mock benches, 16 ms/scan on the R16 instead of 84 (0.15 -> 11 ms;
+# kept some margin for real-floor wheel slip the mock does not model).
+multires_window_xy = 0.2
+multires_window_theta = 0.2
+multires_levels = 3
 
 [keyframe]
 min_translation = 0.5

@@ -369,6 +369,11 @@ struct MatcherConfig {
     icp_outlier_ratio: f32,
     icp_robust_kernel: String,
     icp_kernel_scale: f32,
+    // Multi-resolution matcher search window (coarse level); defaults match
+    // MultiResolutionConfig::default() (0.5 m, 0.5 rad).
+    multires_window_xy: f32,
+    multires_window_theta: f32,
+    multires_levels: usize,
 }
 
 impl Default for MatcherConfig {
@@ -392,6 +397,9 @@ impl Default for MatcherConfig {
             icp_outlier_ratio: 0.1,
             icp_robust_kernel: "welsch".to_string(),
             icp_kernel_scale: 0.1,
+            multires_window_xy: 0.5,
+            multires_window_theta: 0.5,
+            multires_levels: 3,
         }
     }
 }
@@ -837,6 +845,9 @@ fn build_slam_config(config: &Config) -> OnlineSlamConfig {
     // Build multi-resolution config (uses default values for most settings)
     let multi_res_config = MultiResolutionConfig {
         min_score: config.matcher.correlative_min_score,
+        coarse_search_window_xy: config.matcher.multires_window_xy,
+        coarse_search_window_theta: config.matcher.multires_window_theta,
+        num_levels: config.matcher.multires_levels.max(1),
         ..Default::default()
     };
 

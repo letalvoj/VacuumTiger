@@ -197,8 +197,15 @@ impl PointToLineIcp {
                 &current_transform,
             );
 
-            // Apply delta
-            current_transform = current_transform.compose(&delta);
+            // Apply delta additively in the world frame: the Jacobian in
+            // gauss_newton.rs is d(R(theta) p + t) wrt (t, theta), so the step is
+            // t += (dx, dy), theta += dtheta. Composing it (body frame) rotated the
+            // translation step by theta.
+            current_transform = Pose2D::new(
+                current_transform.x + delta.x,
+                current_transform.y + delta.y,
+                current_transform.theta + delta.theta,
+            );
 
             // Compute MSE (uses correspondence distances which are already computed)
             let mse = self.compute_mse(&corr_buffer);

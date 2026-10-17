@@ -89,9 +89,23 @@ pub fn compute_transform(
         g[2] -= j2 * r;
     }
 
+    // Levenberg-Marquardt style damping. In near-degenerate geometry (one wall,
+    // corridor, a view half blocked by the dock) H is almost singular along the
+    // unconstrained direction and an undamped f32 solve turns noise into steps
+    // there: a static v8 recording slid 0.5 m in 400 scans. Scale-aware: relative
+    // to the mean diagonal, plus a floor so tiny correspondence sets stay sane.
+    let mean_diag = (h[0][0] + h[1][1] + h[2][2]) / 3.0;
+    let lambda = DAMPING * mean_diag + 1e-6;
+    for (i, row) in h.iter_mut().enumerate() {
+        row[i] += lambda;
+    }
+
     // Solve 3x3 system using Cramer's rule (small system, direct solve)
     solve_3x3(&h, &g)
 }
+
+/// Relative Levenberg-Marquardt damping for the point-to-line normal equations.
+const DAMPING: f32 = 0.01;
 
 /// Solve 3x3 linear system H * x = g using Cramer's rule.
 ///
