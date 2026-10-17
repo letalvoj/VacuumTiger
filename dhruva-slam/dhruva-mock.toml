@@ -32,10 +32,11 @@ ticks_per_meter = 4464.0
 wheel_base = 0.233
 
 [lidar]
-mounting_x = -0.110
+# The SangamIO mock casts rays from the robot centre in the robot frame: no mount.
+mounting_x = 0.0
 mounting_y = 0.0
-optical_offset = 0.025
-angle_offset = 0.2182
+optical_offset = 0.0
+angle_offset = 0.0
 
 [preprocessing]
 min_range = 0.15

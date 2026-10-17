@@ -32,10 +32,13 @@ ticks_per_meter = 4516.7
 wheel_base = 0.238
 
 [lidar]
+# SangamIO (kaiaai delta2d) already rotates points by its lidar_mounting.angle_offset;
+# only the position offsets are left to the consumer. Values are CRL-200S reference
+# geometry, UNVERIFIED on the v8 (HANDOVER T5).
 mounting_x = -0.110
 mounting_y = 0.0
 optical_offset = 0.025
-angle_offset = 0.2182
+angle_offset = 0.0
 
 [preprocessing]
 min_range = 0.15
