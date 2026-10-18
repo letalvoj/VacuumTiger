@@ -267,7 +267,7 @@ export function Recordings({ status }: { status: Json | null }) {
     });
   return (
     <Panel title="Recordings">
-      <p class="muted">SangamIO stream as .sgio.gz in RAM (/tmp); replay with dhruva-slam --replay.</p>
+      <p class="muted">SangamIO stream as MCAP in RAM (/tmp); opens in Foxglove.</p>
       <div class="row">
         {active ? (
           <>

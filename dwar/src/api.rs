@@ -331,7 +331,7 @@ struct RecReq {
 
 async fn rec_start(State(hub): St, body: Option<Json<RecReq>>) -> ApiResult {
     let tag = body.and_then(|b| b.0.tag);
-    match hub.recorder.start(tag.as_deref()) {
+    match hub.recorder.start(tag.as_deref(), &hub.run_metadata()) {
         Ok(info) => {
             hub.event("info", format!("recording {}", info.name));
             ok(json!({ "ok": true, "recording": info }))

@@ -97,9 +97,9 @@ impl Default for Control {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Recordings {
-    /// Where `.sgio.gz` recordings go. Keep it in RAM (/tmp) on the robot.
+    /// Where `.mcap` recordings go. Keep it in RAM (/tmp) on the robot.
     pub dir: String,
-    /// A recording stops by itself at this size (uncompressed MB).
+    /// A recording stops by itself at this size (MB on disk).
     pub max_mb: u64,
     /// No new recording once the directory holds this much (MB).
     pub max_total_mb: u64,

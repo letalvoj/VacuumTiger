@@ -23,7 +23,7 @@ deadman_ms = 300           # teleop silence -> zero velocity
 
 [recordings]
 dir = "/tmp/v8/cap"        # RAM on the robot
-max_mb = 64               # per recording, uncompressed
+max_mb = 64               # per recording, on disk
 max_total_mb = 128        # no new recording beyond this
 
 [robot]

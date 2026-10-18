@@ -9,3 +9,6 @@ pub mod sangamio {
 pub mod dhruva {
     include!(concat!(env!("OUT_DIR"), "/dhruva.rs"));
 }
+
+/// Both schemas as a serialized `FileDescriptorSet`.
+pub const DESCRIPTORS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/protos.bin"));

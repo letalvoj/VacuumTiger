@@ -5,6 +5,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let protos = ["../sangamio/proto/sangamio.proto", "../dhruva-slam/proto/dhruva.proto"];
     let mut config = prost_build::Config::new();
     config.type_attribute(".", "#[allow(clippy::enum_variant_names)]");
+    // The schemas themselves, for self-describing recordings (MCAP).
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
+    config.file_descriptor_set_path(out.join("protos.bin"));
     config.compile_protos(&protos, &["../sangamio/proto/", "../dhruva-slam/proto/"])?;
     for p in protos {
         println!("cargo:rerun-if-changed={}", p);

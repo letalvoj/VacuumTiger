@@ -41,7 +41,13 @@ async fn main() {
     if cfg.http.token.is_none() && !loopback {
         log::warn!("no [http] token: anyone on this network can use the API");
     }
-    let init = hub::Hub::build(cfg);
+    let init = match hub::Hub::build(cfg) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("dwar: {}", e);
+            std::process::exit(1);
+        }
+    };
     let hub = init.hub;
 
     tokio::spawn(sangam::run(Arc::clone(&hub), init.sangam_rx));

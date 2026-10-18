@@ -16,9 +16,10 @@ rust-embed = { version = "8", features = ["mime-guess"] }
 form_urlencoded = "1"
 tokio-util = { version = "0.7", default-features = false, features = ["io", "codec"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 log = "0.4"
 env_logger = { version = "0.10", default-features = false, features = ["humantime"] }
+foxglove = { version = "0.29", default-features = false, features = ["zstd"] }
+humantime = "2"
 
 [build-dependencies]
 prost-build = "0.13"
@@ -29,3 +30,6 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[dev-dependencies]
+mcap = { version = "0.25", default-features = false, features = ["zstd"] }

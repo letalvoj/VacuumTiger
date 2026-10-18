@@ -38,7 +38,7 @@ restores the vendor firmware afterwards.
 | `POST /actuators/{lidar,vacuum,main_brush,side_brush,water_pump,led}` `{enabled, speed?, state?}` | |
 | `POST /slam/{start_mapping,stop_mapping,clear_map}`, `GET /maps`, `GET /maps/current.pgm`, `POST /maps/{id}/enable`, `DELETE /maps/{id}` | |
 | `GET /maps/{id}/segments` | reserved for rooms (501) |
-| `GET /recordings`, `POST /recordings/{start,stop}`, `GET/DELETE /recordings/{name}` | SangamIO stream as `.sgio.gz` (replays with `dhruva-slam --replay`) |
+| `GET /recordings`, `POST /recordings/{start,stop}`, `GET/DELETE /recordings/{name}` | SangamIO stream as MCAP (`<UTC start>_<tag>_<random>.mcap`, protobuf with embedded schema: Foxglove, `mcap` CLI/Python) |
 | `GET /ws` | the WebSocket (below) |
 
 Replies: `{"ok":true,…}` when dwar did the thing itself (recordings, STOP),

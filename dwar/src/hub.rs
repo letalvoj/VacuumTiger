@@ -77,11 +77,11 @@ pub struct HubInit {
 
 impl Hub {
     /// The hub plus the receiving ends of its command queues (for the upstream tasks).
-    pub fn build(cfg: Config) -> HubInit {
+    pub fn build(cfg: Config) -> Result<HubInit, String> {
         let (to_sangam, normal) = mpsc::channel(64);
         let (to_sangam_urgent, urgent) = mpsc::channel(32);
         let (to_dhruva, dhruva_rx) = mpsc::channel(16);
-        let recorder = crate::recorder::Recorder::new(&cfg.recordings);
+        let recorder = crate::recorder::Recorder::new(&cfg.recordings)?;
         let hub = Arc::new(Hub {
             cfg,
             started: Instant::now(),
@@ -106,11 +106,11 @@ impl Hub {
             map_version: AtomicU64::new(0),
             last_throttled: Mutex::default(),
         });
-        HubInit {
+        Ok(HubInit {
             hub,
             sangam_rx: crate::sangam::Queues { normal, urgent },
             dhruva_rx,
-        }
+        })
     }
 
     pub fn shared(&self) -> std::sync::MutexGuard<'_, Shared> {
@@ -195,6 +195,21 @@ impl Hub {
             .try_send(msg)
             .map(|_| id)
             .map_err(|e| format!("DhruvaSLAM command dropped: {}", e))
+    }
+
+    /// What a recording says about where it came from (its `run` metadata).
+    pub fn run_metadata(&self) -> BTreeMap<String, String> {
+        let r = &self.cfg.robot;
+        let mut m = BTreeMap::from([
+            ("robot".to_string(), r.name.clone()),
+            ("model".to_string(), r.model.clone()),
+            ("dwar".to_string(), env!("CARGO_PKG_VERSION").to_string()),
+        ]);
+        for (k, v) in &self.shared().version {
+            let v = v.as_str().map_or_else(|| v.to_string(), str::to_string);
+            m.insert(format!("sangamio.{}", k), v);
+        }
+        m
     }
 
     /// The JSON status topic (also `GET /api/v1/status`).
