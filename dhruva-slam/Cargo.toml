@@ -24,6 +24,7 @@ socket2 = { version = "0.5", features = ["all"] }     # For SO_REUSEADDR on UDP 
 thiserror = "2.0"
 basic-toml = "0.1"  # Minimal TOML parser
 mcap = { version = "0.25", default-features = false, features = ["zstd"] }
+faer = { version = "0.22", default-features = false, features = ["std"] }
 
 [build-dependencies]
 prost-build = "0.13"

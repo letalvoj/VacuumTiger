@@ -22,6 +22,12 @@
 //!
 //! Where H is the Hessian approximation and b is the gradient.
 
+use std::collections::HashMap;
+
+use faer::linalg::solvers::Solve;
+use faer::sparse::{SparseColMat, Triplet};
+use faer::{Mat, Side};
+
 use super::pose_graph::{Information2D, PoseGraph};
 use crate::core::types::Pose2D;
 
@@ -140,17 +146,15 @@ impl GraphOptimizer {
             iterations = iter + 1;
 
             // Build the linear system H * dx = -b
-            let (h, b) = self.build_linear_system(graph, dim);
+            let (mut h, b) = self.build_linear_system(graph, dim);
 
             // Apply Levenberg-Marquardt damping if enabled
-            let h_damped = if self.config.use_levenberg_marquardt {
-                self.apply_damping(&h, lambda, dim)
-            } else {
-                h
-            };
+            if self.config.use_levenberg_marquardt {
+                apply_damping(&mut h, lambda, dim);
+            }
 
             // Solve the linear system
-            let dx = match self.solve_linear_system(&h_damped, &b, dim) {
+            let dx = match solve_linear_system(&h, &b, dim) {
                 Some(dx) => dx,
                 None => {
                     return OptimizationResult {
@@ -289,9 +293,10 @@ impl GraphOptimizer {
         ]
     }
 
-    /// Build the linear system H * dx = -b.
-    fn build_linear_system(&self, graph: &PoseGraph, dim: usize) -> (Vec<f64>, Vec<f64>) {
-        let mut h = vec![0.0; dim * dim];
+    /// Build the linear system H * dx = -b. H is sparse (one 3x3 block per node and
+    /// per edge), kept as (row, col) -> value.
+    fn build_linear_system(&self, graph: &PoseGraph, dim: usize) -> (SparseH, Vec<f64>) {
+        let mut h = SparseH::new();
         let mut b = vec![0.0; dim];
 
         for edge in graph.edges() {
@@ -321,7 +326,6 @@ impl GraphOptimizer {
             self.add_edge_contribution(
                 &mut h,
                 &mut b,
-                dim,
                 idx_i,
                 idx_j,
                 &ji,
@@ -331,12 +335,13 @@ impl GraphOptimizer {
             );
         }
 
-        // Fix first pose for gauge freedom
+        // Fix first pose for gauge freedom (a stiff penalty, not an exact constraint;
+        // apply_update also skips the first node)
         if self.config.fix_first_pose && dim >= 3 {
             let large_value = 1e10;
-            h[0] = large_value; // x
-            h[dim + 1] = large_value; // y
-            h[2 * dim + 2] = large_value; // theta
+            for i in 0..3 {
+                h.insert((i, i), large_value);
+            }
         }
 
         (h, b)
@@ -382,9 +387,8 @@ impl GraphOptimizer {
     /// Add edge contribution to H and b.
     fn add_edge_contribution(
         &self,
-        h: &mut [f64],
+        h: &mut SparseH,
         b: &mut [f64],
-        dim: usize,
         idx_i: usize,
         idx_j: usize,
         ji: &[f64; 9],
@@ -431,10 +435,10 @@ impl GraphOptimizer {
         // Add to H matrix
         for r in 0..3 {
             for c in 0..3 {
-                h[(base_i + r) * dim + base_i + c] += h_ii[r * 3 + c];
-                h[(base_i + r) * dim + base_j + c] += h_ij[r * 3 + c];
-                h[(base_j + r) * dim + base_i + c] += h_ij[c * 3 + r]; // H_ji = H_ij^T
-                h[(base_j + r) * dim + base_j + c] += h_jj[r * 3 + c];
+                *h.entry((base_i + r, base_i + c)).or_default() += h_ii[r * 3 + c];
+                *h.entry((base_i + r, base_j + c)).or_default() += h_ij[r * 3 + c];
+                *h.entry((base_j + r, base_i + c)).or_default() += h_ij[c * 3 + r]; // H_ji = H_ij^T
+                *h.entry((base_j + r, base_j + c)).or_default() += h_jj[r * 3 + c];
             }
         }
 
@@ -451,72 +455,6 @@ impl GraphOptimizer {
             b[base_i + r] += ji[r] * omega_e[0] + ji[3 + r] * omega_e[1] + ji[6 + r] * omega_e[2];
             b[base_j + r] += jj[r] * omega_e[0] + jj[3 + r] * omega_e[1] + jj[6 + r] * omega_e[2];
         }
-    }
-
-    /// Apply Levenberg-Marquardt damping.
-    fn apply_damping(&self, h: &[f64], lambda: f64, dim: usize) -> Vec<f64> {
-        let mut h_damped = h.to_vec();
-
-        for i in 0..dim {
-            h_damped[i * dim + i] += lambda * h_damped[i * dim + i].max(1.0);
-        }
-
-        h_damped
-    }
-
-    /// Solve the linear system using Cholesky decomposition.
-    ///
-    /// For small graphs, uses dense Cholesky.
-    /// For production, this should use sparse solvers.
-    fn solve_linear_system(&self, h: &[f64], b: &[f64], dim: usize) -> Option<Vec<f64>> {
-        // For small to medium graphs, use dense Cholesky
-        // In production, would use sparse solver like conjugate gradient
-
-        // Cholesky decomposition: H = L * L^T
-        let mut l = vec![0.0; dim * dim];
-
-        for i in 0..dim {
-            for j in 0..=i {
-                let mut sum = h[i * dim + j];
-
-                for k in 0..j {
-                    sum -= l[i * dim + k] * l[j * dim + k];
-                }
-
-                if i == j {
-                    if sum <= 0.0 {
-                        // Matrix not positive definite
-                        return None;
-                    }
-                    l[i * dim + j] = sum.sqrt();
-                } else {
-                    l[i * dim + j] = sum / l[j * dim + j];
-                }
-            }
-        }
-
-        // Forward substitution: L * y = b
-        let mut y = vec![0.0; dim];
-        for i in 0..dim {
-            let mut sum = b[i];
-            for j in 0..i {
-                sum -= l[i * dim + j] * y[j];
-            }
-            y[i] = sum / l[i * dim + i];
-        }
-
-        // Backward substitution: L^T * x = y
-        let mut x = vec![0.0; dim];
-        for i in (0..dim).rev() {
-            let mut sum = y[i];
-            for j in (i + 1)..dim {
-                sum -= l[j * dim + i] * x[j];
-            }
-            x[i] = sum / l[i * dim + i];
-        }
-
-        // Return negative (H * dx = -b => dx = -H^{-1} * b)
-        Some(x.iter().map(|v| -v).collect())
     }
 
     /// Apply update to all poses.
@@ -564,6 +502,32 @@ fn normalize_angle_f32(angle: f32) -> f32 {
     a
 }
 
+/// The sparse Gauss-Newton matrix H: (row, col) -> value, one 3x3 block per node
+/// and per edge.
+type SparseH = HashMap<(usize, usize), f64>;
+
+/// Levenberg-Marquardt damping: d += lambda * max(d, 1) on the diagonal.
+fn apply_damping(h: &mut SparseH, lambda: f64, dim: usize) {
+    for i in 0..dim {
+        let d = h.entry((i, i)).or_default();
+        *d += lambda * d.max(1.0);
+    }
+}
+
+/// Solve H dx = -b with a sparse Cholesky factorisation (faer). `None` when H is
+/// not positive definite.
+fn solve_linear_system(h: &SparseH, b: &[f64], dim: usize) -> Option<Vec<f64>> {
+    let triplets: Vec<Triplet<usize, usize, f64>> = h
+        .iter()
+        .map(|(&(r, c), &v)| Triplet::new(r, c, v))
+        .collect();
+    let h = SparseColMat::<usize, f64>::try_new_from_triplets(dim, dim, &triplets).ok()?;
+    let llt = h.sp_cholesky(Side::Lower).ok()?;
+    let x = llt.solve(Mat::from_fn(dim, 1, |i, _| -b[i]));
+    let x: Vec<f64> = (0..dim).map(|i| x[(i, 0)]).collect();
+    x.iter().all(|v| v.is_finite()).then_some(x)
+}
+
 /// Multiply two 3x3 matrices (row-major).
 fn mat3_mul(a: &[f64; 9], b: &[f64; 9]) -> [f64; 9] {
     let mut c = [0.0; 9];
@@ -593,6 +557,55 @@ fn mat3_transpose_mul(a: &[f64; 9], b: &[f64; 9]) -> [f64; 9] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::graph::PoseNode;
+
+    /// A 600-node circle (about a run's worth of keyframes) whose odometry turns
+    /// 0.02° too much per step, closed by one loop-closure edge back to the start.
+    #[test]
+    fn closes_a_large_loop_quickly() {
+        let n = 600u64;
+        let step = Pose2D::new(0.1, 0.0, std::f32::consts::TAU / n as f32);
+        let drifted = Pose2D::new(step.x, step.y, step.theta + 0.02f32.to_radians());
+        let mut graph = PoseGraph::new();
+        let mut pose = Pose2D::identity();
+        for id in 0..n {
+            graph.add_node_full(PoseNode::new(id, pose, 0));
+            if id > 0 {
+                graph.add_odometry_edge(
+                    id - 1,
+                    id,
+                    drifted,
+                    Information2D::from_std_dev(0.05, 0.05, 0.03),
+                );
+            }
+            pose = pose.compose(&drifted);
+        }
+        graph.fix_first_node();
+        // The last node is one true step before the first.
+        graph.add_loop_closure_edge(
+            n - 1,
+            0,
+            step,
+            Information2D::from_std_dev(0.02, 0.02, 0.01),
+            1.0,
+        );
+
+        let start = std::time::Instant::now();
+        let result = GraphOptimizer::new(GraphOptimizerConfig::default()).optimize(&mut graph);
+        assert!(result.converged, "{result:?}");
+        assert!(
+            start.elapsed().as_secs_f32() < 1.0,
+            "took {:?}",
+            start.elapsed()
+        );
+        assert!(
+            result.final_error < result.initial_error / 100.0,
+            "{result:?}"
+        );
+        // The loop closes: last pose composed with one step lands on the first.
+        let last = graph.get_node(n - 1).unwrap().pose.compose(&step);
+        assert!(last.x.hypot(last.y) < 0.05, "{last:?}");
+    }
 
     #[test]
     fn test_optimizer_creation() {
