@@ -6,9 +6,9 @@
 //! # Design Principles
 //!
 //! Following the SangamIO UDP streaming pattern:
-//! - **UDP unicast** to registered client (not broadcast)
+//! - **UDP unicast** to every registered client (not broadcast)
 //! - **Client registration** via TCP connection
-//! - **Single-client** enforcement
+//! - **Every TCP client** gets the stream (capped at `MAX_UDP_CLIENTS`, oldest evicted)
 //! - **Length-prefixed Protobuf** framing (same as TCP)
 //!
 //! # Wire Format
@@ -53,13 +53,16 @@ impl From<prost::EncodeError> for PublisherError {
 
 pub type Result<T> = std::result::Result<T, PublisherError>;
 
-/// Type alias for UDP client registry (single client at a time).
-pub type UdpClientRegistry = Arc<Mutex<Option<SocketAddr>>>;
+/// UDP client registry: every connected TCP client gets the UDP stream.
+pub type UdpClientRegistry = Arc<Mutex<Vec<SocketAddr>>>;
 
 /// Create a new client registry.
 pub fn create_client_registry() -> UdpClientRegistry {
-    Arc::new(Mutex::new(None))
+    Arc::new(Mutex::new(Vec::new()))
 }
+
+/// Maximum number of UDP stream clients.
+const MAX_UDP_CLIENTS: usize = 8;
 
 /// Maximum UDP datagram size (should fit most DhruvaStream messages).
 const MAX_UDP_BUFFER_SIZE: usize = 4096;
@@ -80,7 +83,7 @@ impl DhruvaUdpPublisher {
     ///
     /// # Arguments
     /// * `port` - UDP port to bind (same as TCP for simplicity)
-    /// * `client_registry` - Shared registry for client address
+    /// * `client_registry` - Shared registry of client addresses
     /// * `running` - Shared flag for shutdown coordination
     pub fn new(
         port: u16,
@@ -108,48 +111,44 @@ impl DhruvaUdpPublisher {
     /// for UDP unicast on the same port.
     pub fn register_client(registry: &UdpClientRegistry, client_addr: SocketAddr) {
         let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(client_addr);
-        log::info!("UDP client registered: {}", client_addr);
+        if !guard.contains(&client_addr) {
+            // A half-open TCP client (lost Wi-Fi) is never detected as failed;
+            // cap the list so such entries can't pile up.
+            if guard.len() >= MAX_UDP_CLIENTS {
+                let old = guard.remove(0);
+                log::info!("UDP client limit reached: dropping oldest {}", old);
+            }
+            guard.push(client_addr);
+        }
+        log::info!("UDP client registered: {} ({} total)", client_addr, guard.len());
     }
 
-    /// Check if a client is already registered for UDP streaming.
-    pub fn has_client(registry: &UdpClientRegistry) -> bool {
-        let guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-        guard.is_some()
-    }
-
-    /// Get the currently registered client address.
-    pub fn get_registered_client(registry: &UdpClientRegistry) -> Option<SocketAddr> {
-        let guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-        *guard
-    }
-
-    /// Unregister the current client.
-    ///
-    /// Called when TCP client disconnects.
-    pub fn unregister_client(registry: &UdpClientRegistry) {
+    /// Unregister a client. Called when its TCP connection goes away.
+    pub fn unregister_client(registry: &UdpClientRegistry, addr: SocketAddr) {
         let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(addr) = guard.take() {
+        let before = guard.len();
+        guard.retain(|a| *a != addr);
+        if guard.len() < before {
             log::info!("UDP client unregistered: {}", addr);
         }
     }
 
-    /// Get current registered client address.
-    fn get_client(&self) -> Option<SocketAddr> {
-        *self
-            .client_registry
+    /// Snapshot of the registered client addresses.
+    fn get_clients(&self) -> Vec<SocketAddr> {
+        self.client_registry
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
-    /// Publish a DhruvaStream message to the registered client.
+    /// Publish a DhruvaStream message to every registered client.
     ///
     /// Non-blocking: drops message if no client or send fails.
     pub fn publish(&mut self, msg: &super::DhruvaStream) {
-        let target = match self.get_client() {
-            Some(addr) => addr,
-            None => return, // No client registered
-        };
+        let targets = self.get_clients();
+        if targets.is_empty() {
+            return; // No client registered
+        }
 
         // Encode message
         let payload = msg.encode_to_vec();
@@ -161,10 +160,12 @@ impl DhruvaUdpPublisher {
         self.send_buffer.extend_from_slice(&payload);
 
         // Send (non-blocking, ignore errors - UDP is best-effort)
-        if let Err(e) = self.socket.send_to(&self.send_buffer, target) {
-            // Only log if not WouldBlock (expected for non-blocking)
-            if e.kind() != std::io::ErrorKind::WouldBlock {
-                log::trace!("UDP send failed: {}", e);
+        for target in targets {
+            if let Err(e) = self.socket.send_to(&self.send_buffer, target) {
+                // Only log if not WouldBlock (expected for non-blocking)
+                if e.kind() != std::io::ErrorKind::WouldBlock {
+                    log::trace!("UDP send to {} failed: {}", target, e);
+                }
             }
         }
     }
@@ -428,5 +429,32 @@ fn build_mapping_progress_message(
             status_message: progress.status_message.clone(),
             failure_reason: progress.failure_reason.clone(),
         })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    #[test]
+    fn registry_dedups_unregisters_and_caps() {
+        let reg = create_client_registry();
+        DhruvaUdpPublisher::register_client(&reg, addr(1));
+        DhruvaUdpPublisher::register_client(&reg, addr(1));
+        DhruvaUdpPublisher::register_client(&reg, addr(2));
+        assert_eq!(*reg.lock().unwrap(), vec![addr(1), addr(2)]);
+        DhruvaUdpPublisher::unregister_client(&reg, addr(9));
+        DhruvaUdpPublisher::unregister_client(&reg, addr(1));
+        assert_eq!(*reg.lock().unwrap(), vec![addr(2)]);
+        for p in 10..10 + MAX_UDP_CLIENTS as u16 {
+            DhruvaUdpPublisher::register_client(&reg, addr(p));
+        }
+        let r = reg.lock().unwrap();
+        assert_eq!(r.len(), MAX_UDP_CLIENTS);
+        assert!(!r.contains(&addr(2)), "oldest client evicted");
     }
 }

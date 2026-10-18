@@ -296,21 +296,8 @@ fn run_publisher_loop(
     while running.load(Ordering::Relaxed) {
         // Accept new TCP clients (non-blocking)
         while let Ok((stream, addr)) = listener.accept() {
-            // Only register for UDP streaming if no client is currently registered
-            // This prevents command-only TCP connections from stealing the UDP stream
-            // from an existing pose monitor client
-            if DhruvaUdpPublisher::has_client(&udp_registry) {
-                log::info!(
-                    "TCP client connected: {} (UDP already registered, not replacing)",
-                    addr
-                );
-            } else {
-                log::info!(
-                    "TCP client connected: {} - registering for UDP streaming",
-                    addr
-                );
-                DhruvaUdpPublisher::register_client(&udp_registry, addr);
-            }
+            // Every TCP client gets the UDP stream (to its TCP peer address).
+            DhruvaUdpPublisher::register_client(&udp_registry, addr);
 
             clients.push(Client::new(stream, addr));
         }
@@ -436,28 +423,14 @@ fn run_publisher_loop(
         clients.retain(|c| !c.failed);
 
         if clients.len() < client_count_before {
-            // Check if the registered UDP client was one of the failed clients
-            let registered_udp_client = DhruvaUdpPublisher::get_registered_client(&udp_registry);
-            let mut udp_unregistered = false;
-
-            if let Some(registered_addr) = registered_udp_client {
-                // Only unregister if the registered client failed
-                if failed_clients.contains(&registered_addr) {
-                    DhruvaUdpPublisher::unregister_client(&udp_registry);
-                    udp_unregistered = true;
-                }
+            for addr in &failed_clients {
+                DhruvaUdpPublisher::unregister_client(&udp_registry, *addr);
             }
-
             log::info!(
-                "Removed {} disconnected TCP clients ({:?}), {} remaining{}",
+                "Removed {} disconnected TCP clients ({:?}), {} remaining",
                 client_count_before - clients.len(),
                 failed_clients,
-                clients.len(),
-                if udp_unregistered {
-                    " (UDP unregistered)"
-                } else {
-                    ""
-                }
+                clients.len()
             );
         }
 
