@@ -19,13 +19,17 @@ use crate::map::MapState;
 use crate::wire;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::response::Response;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use futures_util::stream::SplitSink;
+use futures_util::{SinkExt, StreamExt};
+use std::sync::atomic::Ordering;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
 /// Client messages are tiny; anything bigger is a mistake or an attack.
 const MAX_MESSAGE: usize = 4096;
@@ -33,13 +37,20 @@ const MAX_MESSAGE: usize = 4096;
 const SEND_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_HZ: f32 = 50.0;
 const MIN_HZ: f32 = 0.1;
+const MAX_SESSIONS: usize = 8;
 
 pub async fn upgrade(State(hub): State<Arc<Hub>>, ws: WebSocketUpgrade) -> Response {
+    // Each tab costs timers and buffers on a 512 MB robot.
+    if hub.ws_sessions.fetch_add(1, Ordering::AcqRel) >= MAX_SESSIONS {
+        hub.ws_sessions.fetch_sub(1, Ordering::AcqRel);
+        return (StatusCode::SERVICE_UNAVAILABLE, "too many open tabs").into_response();
+    }
     ws.max_message_size(MAX_MESSAGE).on_upgrade(move |socket| async move {
         let id = hub.new_session_id();
         log::info!("WebSocket session #{} opened", id);
-        Session::new(Arc::clone(&hub), id).run(socket).await;
+        session(Arc::clone(&hub), id, socket).await;
         hub.release_teleop(id, "tab closed");
+        hub.ws_sessions.fetch_sub(1, Ordering::AcqRel);
         log::info!("WebSocket session #{} closed", id);
     })
 }
@@ -90,9 +101,11 @@ impl Topic {
     }
 }
 
-struct Session {
+/// The sending half: topics, events and replies, rate-capped and latest-wins.
+/// It may stall on a slow client; the reading half (STOP, drive) never waits
+/// for it.
+struct Writer {
     hub: Arc<Hub>,
-    id: SessionId,
     sensors: Topic,
     scan: Topic,
     pose: Topic,
@@ -103,19 +116,85 @@ struct Session {
     /// Map version / geometry this client has.
     map_sent: (u64, u64),
     events: Option<broadcast::Receiver<Message>>,
-    /// A "take teleop first" reply was sent; don't repeat it per drive frame.
-    refused_drive: bool,
 }
 
-async fn send(socket: &mut WebSocket, m: Message) -> Result<(), ()> {
-    match tokio::time::timeout(SEND_TIMEOUT, socket.send(m)).await {
+type Sink = SplitSink<WebSocket, Message>;
+
+async fn send(sink: &mut Sink, m: Message) -> Result<(), ()> {
+    match tokio::time::timeout(SEND_TIMEOUT, sink.send(m)).await {
         Ok(Ok(())) => Ok(()),
         _ => Err(()),
     }
 }
 
-impl Session {
-    fn new(hub: Arc<Hub>, id: SessionId) -> Self {
+async fn session(hub: Arc<Hub>, id: SessionId, socket: WebSocket) {
+    let (mut sink, mut stream) = socket.split();
+    let hello = json!({
+        "type": "hello",
+        "session": id,
+        "robot": hub.cfg.robot,
+        "topics": ["sensors", "scan", "pose", "map", "status", "events"],
+    });
+    if send(&mut sink, Message::Text(hello.to_string().into())).await.is_err() {
+        return;
+    }
+    let (reply_tx, replies) = mpsc::channel::<String>(16);
+    let (sub_tx, subs) = mpsc::channel::<HashMap<String, f32>>(4);
+    let writer = Writer::new(Arc::clone(&hub)).run(&mut sink, replies, subs);
+    let reader = async {
+        let mut refused_drive = false;
+        while let Some(Ok(msg)) = stream.next().await {
+            let Message::Text(text) = msg else {
+                if matches!(msg, Message::Close(_)) {
+                    break;
+                }
+                continue;
+            };
+            let reply = match serde_json::from_str::<ClientMsg>(&text) {
+                Err(e) => Some(json!({"type": "error", "error": e.to_string()})),
+                Ok(ClientMsg::Subscribe { topics }) => {
+                    let _ = sub_tx.try_send(topics);
+                    None
+                }
+                Ok(ClientMsg::Stop) => {
+                    let r = hub.stop_all(&format!("web session #{}", id));
+                    r.err().map(|e| json!({"type": "error", "error": e}))
+                }
+                Ok(ClientMsg::Teleop { take }) => {
+                    let result = if take {
+                        hub.take_teleop(id)
+                    } else {
+                        hub.release_teleop(id, "released");
+                        Ok(())
+                    };
+                    refused_drive = false;
+                    let holder = hub.teleop_holder() == Some(id);
+                    Some(json!({"type": "teleop", "holder": holder, "error": result.err()}))
+                }
+                Ok(ClientMsg::Drive { linear, angular }) => match hub.drive(id, linear, angular) {
+                    Ok(()) => None,
+                    // Once per refusal, not per drive frame.
+                    Err(e) if !refused_drive => {
+                        refused_drive = true;
+                        Some(json!({"type": "teleop", "holder": false, "error": e}))
+                    }
+                    Err(_) => None,
+                },
+            };
+            if let Some(r) = reply {
+                let _ = reply_tx.try_send(r.to_string());
+            }
+        }
+    };
+    // Both halves run concurrently in this task; either ending ends the session.
+    tokio::select! {
+        _ = reader => {}
+        _ = writer => {}
+    }
+}
+
+impl Writer {
+    fn new(hub: Arc<Hub>) -> Self {
         Self {
             sensors: Topic::new(&hub.sensors),
             scan: Topic::new(&hub.scan),
@@ -126,22 +205,16 @@ impl Session {
             map_last: None,
             map_sent: (0, 0),
             events: None,
-            refused_drive: false,
             hub,
-            id,
         }
     }
 
-    async fn run(mut self, mut socket: WebSocket) {
-        let hello = json!({
-            "type": "hello",
-            "session": self.id,
-            "robot": self.hub.cfg.robot,
-            "topics": ["sensors", "scan", "pose", "map", "status", "events"],
-        });
-        if send(&mut socket, Message::Text(hello.to_string().into())).await.is_err() {
-            return;
-        }
+    async fn run(
+        mut self,
+        sink: &mut Sink,
+        mut replies: mpsc::Receiver<String>,
+        mut subs: mpsc::Receiver<HashMap<String, f32>>,
+    ) {
         let mut tick = tokio::time::interval(Duration::from_millis(20));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -152,34 +225,51 @@ impl Session {
                 }
             };
             let ok = tokio::select! {
-                msg = socket.recv() => match msg {
-                    Some(Ok(Message::Text(t))) => match self.on_message(&t) {
-                        Some(reply) => send(&mut socket, Message::Text(reply.into())).await,
-                        None => Ok(()),
-                    },
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => Err(()),
-                    Some(Ok(_)) => Ok(()),
+                reply = replies.recv() => match reply {
+                    Some(r) => send(sink, Message::Text(r.into())).await,
+                    None => Err(()),
                 },
+                topics = subs.recv() => {
+                    if let Some(t) = topics {
+                        self.subscribe(&t);
+                    }
+                    Ok(())
+                }
                 ev = event => match ev {
-                    Ok(m) => send(&mut socket, m).await,
+                    Ok(m) => send(sink, m).await,
                     Err(broadcast::error::RecvError::Lagged(_)) => Ok(()),
                     Err(broadcast::error::RecvError::Closed) => {
                         self.events = None;
                         Ok(())
                     }
                 },
-                _ = tick.tick() => self.flush(&mut socket).await,
+                _ = tick.tick() => self.flush(sink).await,
             };
             if ok.is_err() {
-                break;
+                return;
             }
         }
     }
 
-    async fn flush(&mut self, socket: &mut WebSocket) -> Result<(), ()> {
+    fn subscribe(&mut self, topics: &HashMap<String, f32>) {
+        let hz = |k: &str| topics.get(k).copied().unwrap_or(0.0);
+        self.sensors.set_rate(hz("sensors"));
+        self.scan.set_rate(hz("scan"));
+        self.pose.set_rate(hz("pose"));
+        self.status.set_rate(hz("status"));
+        let map_period = period(hz("map").min(10.0));
+        if map_period.is_some() && self.map_period.is_none() {
+            self.map_sent = (0, 0); // newly subscribed: send everything
+            self.map.mark_changed();
+        }
+        self.map_period = map_period;
+        self.events = (hz("events") > 0.0).then(|| self.hub.events.subscribe());
+    }
+
+    async fn flush(&mut self, sink: &mut Sink) -> Result<(), ()> {
         for topic in [&mut self.status, &mut self.sensors, &mut self.pose, &mut self.scan] {
             if let Some(m) = topic.poll() {
-                send(socket, m).await?;
+                send(sink, m).await?;
             }
         }
         if let Some(period) = self.map_period
@@ -189,7 +279,7 @@ impl Session {
             self.map_last = Some(Instant::now());
             let map = self.map.borrow_and_update().clone();
             if let Some(m) = map {
-                self.send_map(socket, &m).await?;
+                self.send_map(sink, &m).await?;
             }
         }
         Ok(())
@@ -197,67 +287,20 @@ impl Session {
 
     /// Send what this client lacks: everything after a geometry change (or on
     /// subscribe), otherwise only the tiles newer than its version.
-    async fn send_map(&mut self, socket: &mut WebSocket, m: &MapState) -> Result<(), ()> {
+    async fn send_map(&mut self, sink: &mut Sink, m: &MapState) -> Result<(), ()> {
         let (sent_version, sent_geometry) = self.map_sent;
         let full = sent_geometry != m.geometry;
         if full {
-            send(socket, Message::Text(m.meta_json().to_string().into())).await?;
+            send(sink, Message::Text(m.meta_json().to_string().into())).await?;
         }
         for ty in 0..m.tiles_y {
             for tx in 0..m.tiles_x {
                 if full || m.tile_version[ty * m.tiles_x + tx] > sent_version {
-                    send(socket, Message::Binary(wire::tile_frame(m, tx, ty))).await?;
+                    send(sink, Message::Binary(wire::tile_frame(m, tx, ty))).await?;
                 }
             }
         }
         self.map_sent = (m.version, m.geometry);
         Ok(())
-    }
-
-    fn on_message(&mut self, text: &str) -> Option<String> {
-        let msg = match serde_json::from_str::<ClientMsg>(text) {
-            Ok(m) => m,
-            Err(e) => return Some(json!({"type": "error", "error": e.to_string()}).to_string()),
-        };
-        match msg {
-            ClientMsg::Subscribe { topics } => {
-                let hz = |k: &str| topics.get(k).copied().unwrap_or(0.0);
-                self.sensors.set_rate(hz("sensors"));
-                self.scan.set_rate(hz("scan"));
-                self.pose.set_rate(hz("pose"));
-                self.status.set_rate(hz("status"));
-                let map_period = period(hz("map").min(10.0));
-                if map_period.is_some() && self.map_period.is_none() {
-                    self.map_sent = (0, 0); // newly subscribed: send everything
-                    self.map.mark_changed();
-                }
-                self.map_period = map_period;
-                self.events = (hz("events") > 0.0).then(|| self.hub.events.subscribe());
-                None
-            }
-            ClientMsg::Stop => {
-                let r = self.hub.stop_all(&format!("web session #{}", self.id));
-                r.err().map(|e| json!({"type": "error", "error": e}).to_string())
-            }
-            ClientMsg::Teleop { take } => {
-                let result = if take {
-                    self.hub.take_teleop(self.id)
-                } else {
-                    self.hub.release_teleop(self.id, "released");
-                    Ok(())
-                };
-                self.refused_drive = false;
-                let holder = self.hub.teleop_holder() == Some(self.id);
-                Some(json!({"type": "teleop", "holder": holder, "error": result.err()}).to_string())
-            }
-            ClientMsg::Drive { linear, angular } => match self.hub.drive(self.id, linear, angular) {
-                Ok(()) => None,
-                Err(e) if !self.refused_drive => {
-                    self.refused_drive = true;
-                    Some(json!({"type": "teleop", "holder": false, "error": e}).to_string())
-                }
-                Err(_) => None,
-            },
-        }
     }
 }

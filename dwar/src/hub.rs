@@ -55,8 +55,12 @@ pub struct Hub {
     /// Events: refused commands, upstream up/down, dead-man trips.
     pub events: broadcast::Sender<Message>,
     pub to_sangam: mpsc::Sender<sangamio::Command>,
+    /// Stops and dead-man zeroes: sent before anything in `to_sangam`.
+    pub to_sangam_urgent: mpsc::Sender<sangamio::Command>,
     pub to_dhruva: mpsc::Sender<dhruva::DhruvaCommand>,
     pub recorder: crate::recorder::Recorder,
+    /// Open WebSocket sessions (capped in ws.rs).
+    pub ws_sessions: std::sync::atomic::AtomicUsize,
     next_session: AtomicU64,
     next_request: AtomicU64,
     /// Map versions, monotonic across DhruvaSLAM reconnects.
@@ -67,14 +71,15 @@ pub struct Hub {
 
 pub struct HubInit {
     pub hub: Arc<Hub>,
-    pub sangam_rx: mpsc::Receiver<sangamio::Command>,
+    pub sangam_rx: crate::sangam::Queues,
     pub dhruva_rx: mpsc::Receiver<dhruva::DhruvaCommand>,
 }
 
 impl Hub {
     /// The hub plus the receiving ends of its command queues (for the upstream tasks).
     pub fn build(cfg: Config) -> HubInit {
-        let (to_sangam, sangam_rx) = mpsc::channel(64);
+        let (to_sangam, normal) = mpsc::channel(64);
+        let (to_sangam_urgent, urgent) = mpsc::channel(32);
         let (to_dhruva, dhruva_rx) = mpsc::channel(16);
         let recorder = crate::recorder::Recorder::new(&cfg.recordings);
         let hub = Arc::new(Hub {
@@ -92,8 +97,10 @@ impl Hub {
             map: watch::channel(None).0,
             events: broadcast::channel(64).0,
             to_sangam,
+            to_sangam_urgent,
             to_dhruva,
             recorder,
+            ws_sessions: Default::default(),
             next_session: AtomicU64::new(1),
             next_request: AtomicU64::new(1),
             map_version: AtomicU64::new(0),
@@ -101,7 +108,7 @@ impl Hub {
         });
         HubInit {
             hub,
-            sangam_rx,
+            sangam_rx: crate::sangam::Queues { normal, urgent },
             dhruva_rx,
         }
     }
@@ -150,7 +157,22 @@ impl Hub {
 
     /// Queue a SangamIO component command. Returns false if it was dropped.
     pub fn sangam(&self, id: &str, action: Action, config: &[(&str, sangamio::sensor_value::Value)]) -> bool {
-        match self.to_sangam.try_send(crate::sangam::component(id, action, config)) {
+        self.queue(&self.to_sangam, id, action, config)
+    }
+
+    /// Like `sangam`, on the lane that goes first (stops, dead-man zero).
+    pub fn sangam_urgent(&self, id: &str, action: Action, config: &[(&str, sangamio::sensor_value::Value)]) -> bool {
+        self.queue(&self.to_sangam_urgent, id, action, config)
+    }
+
+    fn queue(
+        &self,
+        lane: &mpsc::Sender<sangamio::Command>,
+        id: &str,
+        action: Action,
+        config: &[(&str, sangamio::sensor_value::Value)],
+    ) -> bool {
+        match lane.try_send(crate::sangam::component(id, action, config)) {
             Ok(()) => true,
             Err(e) => {
                 self.event_throttled("warn", format!("SangamIO command '{}' dropped: {}", id, e));

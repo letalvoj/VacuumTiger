@@ -10,20 +10,24 @@ use prost::Message as _;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use futures_util::StreamExt;
+use tokio::io::AsyncWriteExt;
+use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 
 /// Largest TCP frame accepted (a full map: 4000 × 4000 cells = 16 MB).
 const MAX_FRAME: usize = 16 << 20;
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// A command write that takes longer means DhruvaSLAM stopped reading: reconnect.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub async fn run(hub: Arc<Hub>, mut rx: mpsc::Receiver<dhruva::DhruvaCommand>) {
     let mut backoff = Duration::from_millis(500);
     loop {
-        if let Ok(sock) = TcpStream::connect(&hub.cfg.dhruva.address).await {
+        let connect = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&hub.cfg.dhruva.address));
+        if let Ok(Ok(sock)) = connect.await {
             backoff = Duration::from_millis(500);
             // Commands queued while offline are stale; don't replay them.
             while rx.try_recv().is_ok() {}
@@ -58,39 +62,23 @@ async fn session(
     let udp = UdpSocket::bind(("0.0.0.0", local.port()))
         .await
         .map_err(|e| format!("UDP bind {}: {}", local.port(), e))?;
-    let (mut r, mut w) = sock.into_split();
+    let (r, mut w) = sock.into_split();
     hub.shared().dhruva_connected = true;
     hub.event("info", format!("DhruvaSLAM connected ({})", hub.cfg.dhruva.address));
 
-    // TCP reader in its own task: read_exact is not cancel-safe in select!.
-    let (tcp_tx, mut tcp_rx) = mpsc::channel::<Vec<u8>>(8);
-    let reader = tokio::spawn(async move {
-        let mut len = [0u8; 4];
-        loop {
-            if let Err(e) = r.read_exact(&mut len).await {
-                return e.to_string();
-            }
-            let n = u32::from_be_bytes(len) as usize;
-            if n > MAX_FRAME {
-                return format!("frame too large ({} B)", n);
-            }
-            let mut body = vec![0u8; n];
-            if let Err(e) = r.read_exact(&mut body).await {
-                return e.to_string();
-            }
-            if tcp_tx.send(body).await.is_err() {
-                return "closed".into();
-            }
-        }
-    });
-
+    // `u32 BE length | protobuf`; FramedRead is cancel-safe in select!.
+    let mut frames = FramedRead::new(
+        r,
+        LengthDelimitedCodec::builder().length_field_length(4).max_frame_length(MAX_FRAME).new_codec(),
+    );
     let mut buf = vec![0u8; 65536];
-    let result = loop {
+    loop {
         tokio::select! {
-            body = tcp_rx.recv() => {
-                let Some(body) = body else { break Err(String::new()) };
-                on_tcp(hub, &body);
-            }
+            body = frames.next() => match body {
+                Some(Ok(body)) => on_tcp(hub, &body),
+                Some(Err(e)) => return Err(e.to_string()),
+                None => return Err("connection closed".into()),
+            },
             got = udp.recv(&mut buf) => {
                 if let Ok(n) = got
                     && n >= 4
@@ -104,22 +92,17 @@ async fn session(
                 }
             }
             cmd = rx.recv() => {
-                let Some(cmd) = cmd else { break Ok(()) };
+                let Some(cmd) = cmd else { return Ok(()) };
                 let body = cmd.encode_to_vec();
                 let mut out = (body.len() as u32).to_be_bytes().to_vec();
                 out.extend_from_slice(&body);
                 match tokio::time::timeout(WRITE_TIMEOUT, w.write_all(&out)).await {
                     Ok(Ok(())) => {}
-                    Ok(Err(e)) => break Err(e.to_string()),
-                    Err(_) => break Err("command write timed out".into()),
+                    Ok(Err(e)) => return Err(e.to_string()),
+                    Err(_) => return Err("command write timed out".into()),
                 }
             }
         }
-    };
-    reader.abort();
-    match (result, reader.await) {
-        (Err(e), Ok(reason)) if e.is_empty() => Err(reason),
-        (r, _) => r,
     }
 }
 
@@ -185,7 +168,7 @@ fn on_stream(hub: &Hub, msg: dhruva::DhruvaStream) {
         }
         Some(Data::CurrentMap(m)) => {
             let prev = hub.map.borrow().clone();
-            if let Some(next) = MapState::update(prev.as_deref(), &m, hub.next_map_version()) {
+            if let Some(next) = MapState::update(prev.as_deref(), m, hub.next_map_version()) {
                 let changed = prev.as_ref().is_none_or(|p| next.tile_version.iter().any(|&v| v > p.version));
                 if changed {
                     hub.map.send_replace(Some(Arc::new(next)));

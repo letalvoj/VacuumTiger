@@ -56,14 +56,13 @@ impl Hub {
         if t.holder == Some(session) {
             return Ok(());
         }
-        let prev = t.holder.replace(session);
-        t.moving = false;
-        t.enabled = false;
-        t.last_drive = None;
-        drop(t);
         // Take SangamIO's lease from whoever drives now (SLAM controller, another
         // tool); SangamIO zeroes the drive on the handover.
-        self.sangam("lease", Action::Enable, &[("force", V::BoolVal(true))]);
+        if !self.sangam("lease", Action::Enable, &[("force", V::BoolVal(true))]) {
+            return Err("SangamIO command queue full".into());
+        }
+        let prev = std::mem::replace(&mut *t, Teleop { holder: Some(session), ..Teleop::default() }).holder;
+        drop(t);
         self.event("warn", format!("teleop taken by web session #{} (was {:?})", session, prev));
         Ok(())
     }
@@ -75,8 +74,8 @@ impl Hub {
         }
         *t = Teleop::default();
         drop(t);
-        self.sangam("drive", Action::Disable, &[]);
-        self.sangam("lease", Action::Disable, &[]);
+        self.sangam_urgent("drive", Action::Disable, &[]);
+        self.sangam_urgent("lease", Action::Disable, &[]);
         self.event("info", format!("teleop released by web session #{} ({})", session, why));
     }
 
@@ -112,14 +111,16 @@ impl Hub {
         Ok(())
     }
 
-    /// Emergency stop: zero the drive, cleaning actuators off, revoke teleop.
-    /// SangamIO accepts these from any client, lease or not.
+    /// Emergency stop: zero the drive, cleaning actuators off, revoke teleop
+    /// and give SangamIO's lease back (so a SLAM controller isn't locked out).
+    /// SangamIO accepts the stops from any client; they jump the queue.
     pub fn stop_all(&self, why: &str) -> Result<(), String> {
         let holder = std::mem::take(&mut *self.teleop()).holder;
         let mut queued = true;
         for id in stop_components() {
-            queued &= self.sangam(id, Action::Disable, &[]);
+            queued &= self.sangam_urgent(id, Action::Disable, &[]);
         }
+        self.sangam_urgent("lease", Action::Disable, &[]);
         {
             let mut s = self.shared();
             for id in stop_components() {
@@ -150,7 +151,7 @@ impl Hub {
         if t.moving && t.last_drive.is_none_or(|l| l.elapsed() > timeout) {
             let zero = [("linear", V::F32Val(0.0)), ("angular", V::F32Val(0.0))];
             // If the zero can't be queued, stay "moving": the next tick retries.
-            if self.sangam("drive", Action::Configure, &zero) {
+            if self.sangam_urgent("drive", Action::Configure, &zero) {
                 t.moving = false;
                 let holder = t.holder;
                 drop(t);

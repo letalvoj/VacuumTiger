@@ -11,7 +11,9 @@ use prost::Message as _;
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use futures_util::StreamExt;
+use tokio::io::AsyncWriteExt;
+use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -19,6 +21,9 @@ use tokio::sync::mpsc;
 const SENSORS_MIN_INTERVAL: Duration = Duration::from_millis(50);
 /// SangamIO streams telemetry continuously; this much silence is a dead link.
 const SILENCE: Duration = Duration::from_secs(5);
+/// Largest telemetry frame accepted.
+const MAX_FRAME: usize = 1 << 20;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// A command write that takes longer means SangamIO stopped reading: reconnect.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -29,13 +34,31 @@ pub enum Action {
     Configure,
 }
 
-pub async fn run(hub: Arc<Hub>, mut rx: mpsc::Receiver<sangamio::Command>) {
+/// Command queues to SangamIO: `urgent` (stops, dead-man zero) is always sent
+/// before `normal`, so a STOP never waits behind queued drive commands.
+pub struct Queues {
+    pub normal: mpsc::Receiver<sangamio::Command>,
+    pub urgent: mpsc::Receiver<sangamio::Command>,
+}
+
+impl Queues {
+    /// Commands queued while offline are stale; don't replay them.
+    fn drain(&mut self) -> usize {
+        let mut n = 0;
+        while self.normal.try_recv().is_ok() || self.urgent.try_recv().is_ok() {
+            n += 1;
+        }
+        n
+    }
+}
+
+pub async fn run(hub: Arc<Hub>, mut rx: Queues) {
     let mut backoff = Duration::from_millis(500);
     loop {
-        if let Ok(sock) = TcpStream::connect(&hub.cfg.sangamio.address).await {
+        let connect = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&hub.cfg.sangamio.address));
+        if let Ok(Ok(sock)) = connect.await {
             backoff = Duration::from_millis(500);
-            // Commands queued while offline are stale; don't replay them.
-            while rx.try_recv().is_ok() {}
+            rx.drain();
             let err = session(&hub, sock, &mut rx).await;
             hub.event("warn", format!("SangamIO disconnected: {}", err));
             {
@@ -47,19 +70,17 @@ pub async fn run(hub: Arc<Hub>, mut rx: mpsc::Receiver<sangamio::Command>) {
             hub.sensors.send_replace(None);
             hub.scan.send_replace(None);
             hub.sangam_lost();
-        } else {
-            while rx.try_recv().is_ok() {
-                hub.event_throttled("warn", "SangamIO offline: command dropped");
-            }
+        } else if rx.drain() > 0 {
+            hub.event_throttled("warn", "SangamIO offline: command dropped");
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(5));
     }
 }
 
-async fn session(hub: &Hub, sock: TcpStream, rx: &mut mpsc::Receiver<sangamio::Command>) -> String {
+async fn session(hub: &Hub, sock: TcpStream, rx: &mut Queues) -> String {
     let _ = sock.set_nodelay(true);
-    let (mut r, mut w) = sock.into_split();
+    let (r, mut w) = sock.into_split();
     // Switch this client's telemetry to TCP before anything else.
     if let Err(e) = w.write_all(&frame(component("telemetry", Action::Enable, &[]))).await {
         return e.to_string();
@@ -67,51 +88,45 @@ async fn session(hub: &Hub, sock: TcpStream, rx: &mut mpsc::Receiver<sangamio::C
     hub.shared().sangam_connected = true;
     hub.event("info", format!("SangamIO connected ({})", hub.cfg.sangamio.address));
 
-    // Reader in its own task: read_exact is not cancel-safe in select!.
-    let (tx, mut frames) = mpsc::channel::<Vec<u8>>(64);
-    let reader = tokio::spawn(async move {
-        let mut len = [0u8; 4];
-        loop {
-            match tokio::time::timeout(SILENCE, r.read_exact(&mut len)).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => return e.to_string(),
-                Err(_) => return format!("no telemetry for {} s", SILENCE.as_secs()),
-            }
-            let n = u32::from_be_bytes(len) as usize;
-            if n > 1 << 20 {
-                return format!("frame too large ({} B)", n);
-            }
-            let mut body = vec![0u8; n];
-            if let Err(e) = r.read_exact(&mut body).await {
-                return e.to_string();
-            }
-            if tx.send(body).await.is_err() {
-                return "closed".into();
-            }
-        }
-    });
-
+    // `u32 BE length | protobuf`; FramedRead is cancel-safe in select!.
+    let mut frames = FramedRead::new(
+        r,
+        LengthDelimitedCodec::builder().length_field_length(4).max_frame_length(MAX_FRAME).new_codec(),
+    );
     let mut telemetry = Telemetry::new();
-    let err = loop {
-        tokio::select! {
-            body = frames.recv() => match body {
-                Some(body) => telemetry.on_frame(hub, &body),
-                None => break String::new(),
-            },
-            cmd = rx.recv() => {
-                let Some(cmd) = cmd else { break "shutting down".into() };
-                match tokio::time::timeout(WRITE_TIMEOUT, w.write_all(&frame(cmd))).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => break e.to_string(),
-                    Err(_) => break "command write timed out".into(),
+    let silence = tokio::time::sleep(SILENCE);
+    tokio::pin!(silence);
+    loop {
+        // Stops (urgent) go before queued drive commands; telemetry last.
+        let cmd = tokio::select! {
+            biased;
+            cmd = rx.urgent.recv() => {
+                // Anything still queued predates the stop: a stale drive
+                // command sent after it would undo it.
+                let stale = std::iter::from_fn(|| rx.normal.try_recv().ok()).count();
+                if stale > 0 {
+                    log::info!("dropped {} queued commands behind a stop", stale);
                 }
+                cmd
             }
+            cmd = rx.normal.recv() => cmd,
+            body = frames.next() => match body {
+                Some(Ok(body)) => {
+                    silence.as_mut().reset(tokio::time::Instant::now() + SILENCE);
+                    telemetry.on_frame(hub, &body);
+                    continue;
+                }
+                Some(Err(e)) => return e.to_string(),
+                None => return "connection closed".into(),
+            },
+            _ = &mut silence => return format!("no telemetry for {} s", SILENCE.as_secs()),
+        };
+        let Some(cmd) = cmd else { return "shutting down".into() };
+        match tokio::time::timeout(WRITE_TIMEOUT, w.write_all(&frame(cmd))).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return e.to_string(),
+            Err(_) => return "command write timed out".into(),
         }
-    };
-    reader.abort();
-    match reader.await {
-        Ok(reason) if err.is_empty() => reason,
-        _ => err,
     }
 }
 

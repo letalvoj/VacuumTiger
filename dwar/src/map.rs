@@ -31,7 +31,7 @@ impl MapState {
     /// Fold a new grid into the previous state.
     /// `version` must grow monotonically across DhruvaSLAM reconnects, so a
     /// client's "tiles newer than v" never misses a restarted map.
-    pub fn update(prev: Option<&MapState>, m: &dhruva::CurrentMap, version: u64) -> Option<MapState> {
+    pub fn update(prev: Option<&MapState>, m: dhruva::CurrentMap, version: u64) -> Option<MapState> {
         let (w, h) = (m.width as usize, m.height as usize);
         if w == 0 || h == 0 || m.cells.len() != w * h {
             return None;
@@ -65,14 +65,14 @@ impl MapState {
         Some(MapState {
             version,
             geometry,
-            map_id: m.map_id.clone(),
-            name: m.name.clone(),
+            map_id: m.map_id,
+            name: m.name,
             resolution: m.resolution,
             width: w,
             height: h,
             origin_x: m.origin_x,
             origin_y: m.origin_y,
-            cells: m.cells.clone(),
+            cells: m.cells,
             tiles_x,
             tiles_y,
             tile_version,
