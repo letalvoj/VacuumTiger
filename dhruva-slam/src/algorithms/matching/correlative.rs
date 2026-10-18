@@ -8,7 +8,7 @@
 //! 1. Build a lookup table (grid) from target point cloud
 //! 2. For each candidate pose (x, y, θ) in search window:
 //!    a. Transform source points by candidate pose
-//!    b. Score alignment by counting points near target
+//!    b. Score alignment: mean of the target grid, smeared with a Gaussian, under the points
 //! 3. Return pose with highest score
 //!
 //! # Use Cases
@@ -41,10 +41,12 @@ pub struct CorrelativeConfig {
 
     /// Grid resolution for scoring (meters).
     ///
-    /// Points within this distance of target are considered hits.
+    /// Score grid cell size. Target points are smeared with a Gaussian of this deviation,
+    /// so it sets both the quantisation and how forgiving the score is (multi-resolution
+    /// levels scale it up).
     pub grid_resolution: f32,
 
-    /// Minimum score (fraction of points matched) to consider successful.
+    /// Minimum score (mean smeared grid value under the source points, 0-1) to accept.
     pub min_score: f32,
 }
 
@@ -56,11 +58,31 @@ impl Default for CorrelativeConfig {
             search_window_theta: 0.5, // ±28° (increased from ±17° to handle noisy odometry)
             linear_resolution: 0.02,  // 2cm steps
             angular_resolution: 0.02, // ~1.1° steps
-            grid_resolution: 0.05,    // 5cm grid cells
-            min_score: 0.5,           // At least 50% of points must match
+            grid_resolution: 0.05,    // 5cm grid cells and smear deviation
+            min_score: 0.5,
         }
     }
 }
+
+/// Cells a target point is smeared over, on each side.
+const SMEAR_RADIUS: usize = 2;
+
+/// Score of a source point `(dx, dy)` cells away from a target point: a Gaussian with a
+/// deviation of one cell, `exp(-(dx² + dy²) / 2)`, cut off at `SMEAR_RADIUS`.
+const SMEAR_KERNEL: [[f32; 2 * SMEAR_RADIUS + 1]; 2 * SMEAR_RADIUS + 1] = {
+    const A: f32 = 0.018_316; // d² = 8
+    const B: f32 = 0.082_085; // d² = 5
+    const C: f32 = 0.135_335; // d² = 4
+    const D: f32 = 0.367_879; // d² = 2
+    const E: f32 = 0.606_531; // d² = 1
+    [
+        [A, B, C, B, A],
+        [B, D, E, D, B],
+        [C, E, 1.0, E, C],
+        [B, D, E, D, B],
+        [A, B, C, B, A],
+    ]
+};
 
 /// Grid parameters for scoring (avoids too many function arguments).
 #[derive(Clone, Copy)]
@@ -92,7 +114,7 @@ impl ScoreGrid {
         cloud: &PointCloud2D,
         resolution: f32,
         padding: f32,
-        buffer: &mut Vec<bool>,
+        buffer: &mut Vec<f32>,
     ) -> Self {
         if cloud.is_empty() {
             buffer.clear();
@@ -118,24 +140,36 @@ impl ScoreGrid {
 
         // Resize buffer if needed (amortized O(1) - only grows)
         if buffer.len() < required_size {
-            buffer.resize(required_size, false);
+            buffer.resize(required_size, 0.0);
         }
 
         // Clear relevant portion
         for cell in buffer[..required_size].iter_mut() {
-            *cell = false;
+            *cell = 0.0;
         }
 
-        // Mark cells containing target points
-        // Note: Only mark the exact cell, not neighbors. The grid resolution already
-        // provides tolerance for matching. Marking neighbors creates false positives
-        // that reduce discrimination between correct and incorrect poses.
+        // Smear every target point with SMEAR_KERNEL (Karto's lookup table). The score
+        // surface is then smooth in the pose, so nearby search poses rank by how well
+        // they fit instead of tying on which cell a point happens to fall in.
+        let r = SMEAR_RADIUS as isize;
         for i in 0..cloud.len() {
             let cx = ((cloud.xs[i] - origin_x) / resolution) as isize;
             let cy = ((cloud.ys[i] - origin_y) / resolution) as isize;
-
-            if cx >= 0 && cy >= 0 && (cx as usize) < width && (cy as usize) < height {
-                buffer[cy as usize * width + cx as usize] = true;
+            let inside = |x: isize, y: isize| {
+                x >= 0 && y >= 0 && (x as usize) < width && (y as usize) < height
+            };
+            // Another point in this cell already stamped the same kernel.
+            if inside(cx, cy) && buffer[cy as usize * width + cx as usize] == 1.0 {
+                continue;
+            }
+            for (ky, row) in SMEAR_KERNEL.iter().enumerate() {
+                for (kx, &w) in row.iter().enumerate() {
+                    let (x, y) = (cx + kx as isize - r, cy + ky as isize - r);
+                    if inside(x, y) {
+                        let cell = &mut buffer[y as usize * width + x as usize];
+                        *cell = cell.max(w);
+                    }
+                }
             }
         }
 
@@ -156,7 +190,7 @@ impl ScoreGrid {
 pub struct CorrelativeMatcher {
     config: CorrelativeConfig,
     /// Preallocated grid buffer (reused across matches).
-    grid_buffer: Vec<bool>,
+    grid_buffer: Vec<f32>,
     /// Preallocated buffer for transformed cloud (reused across matches).
     transformed_xs: Vec<f32>,
     transformed_ys: Vec<f32>,
@@ -231,7 +265,7 @@ impl CorrelativeMatcher {
     #[inline]
     fn score_with_grid_params(
         &self,
-        grid_cells: &[bool],
+        grid_cells: &[f32],
         params: GridParams,
         tx: f32,
         ty: f32,
@@ -241,7 +275,7 @@ impl CorrelativeMatcher {
         }
 
         let n = self.transformed_xs.len();
-        let mut hits = 0u32;
+        let mut hits = 0.0f32;
 
         let inv_res = 1.0 / params.resolution;
 
@@ -280,9 +314,8 @@ impl CorrelativeMatcher {
                     && cy >= 0
                     && (cx as usize) < params.width
                     && (cy as usize) < params.height
-                    && grid_cells[cy as usize * params.width + cx as usize]
                 {
-                    hits += 1;
+                    hits += grid_cells[cy as usize * params.width + cx as usize];
                 }
             }
         }
@@ -294,17 +327,12 @@ impl CorrelativeMatcher {
             let cx = ((world_x - params.origin_x) * inv_res) as isize;
             let cy = ((world_y - params.origin_y) * inv_res) as isize;
 
-            if cx >= 0
-                && cy >= 0
-                && (cx as usize) < params.width
-                && (cy as usize) < params.height
-                && grid_cells[cy as usize * params.width + cx as usize]
-            {
-                hits += 1;
+            if cx >= 0 && cy >= 0 && (cx as usize) < params.width && (cy as usize) < params.height {
+                hits += grid_cells[cy as usize * params.width + cx as usize];
             }
         }
 
-        hits as f32 / n as f32
+        hits / n as f32
     }
 }
 
@@ -387,9 +415,6 @@ impl ScanMatcher for CorrelativeMatcher {
         self.grid_buffer = grid_buffer;
 
         // Check if score meets threshold
-        // MSE estimate: The search resolution determines the maximum possible alignment error.
-        // A score of 1.0 means perfect alignment (MSE ~ 0), lower scores mean worse alignment.
-        // Use linear_resolution (search step size) for MSE estimate, not grid_resolution.
         if best_score >= min_score {
             // Identity snapping: If we have a very high score and the transform is very close
             // to the initial guess, snap to the initial guess to avoid quantization drift.
@@ -436,6 +461,34 @@ mod tests {
     use crate::core::types::Point2D;
     use approx::assert_relative_eq;
 
+    #[test]
+    fn smeared_score_falls_off_with_distance() {
+        let mut target = PointCloud2D::new();
+        target.push(Point2D::new(0.025, 0.025)); // centre of a 5 cm cell
+        let mut buffer = Vec::new();
+        let grid = ScoreGrid::from_cloud_into(&target, 0.05, 0.2, &mut buffer);
+        let at = |cells: isize| {
+            let cx = ((0.025 - grid.origin_x) / grid.resolution) as isize + cells;
+            let cy = ((0.025 - grid.origin_y) / grid.resolution) as isize;
+            buffer[cy as usize * grid.width + cx as usize]
+        };
+        assert_eq!(at(0), 1.0);
+        assert_relative_eq!(at(1), 0.6065, epsilon = 1e-3);
+        assert_relative_eq!(at(2), 0.1353, epsilon = 1e-3);
+        assert_eq!(at(3), 0.0);
+    }
+
+    #[test]
+    fn smearing_at_the_grid_edge_is_clipped() {
+        let mut target = PointCloud2D::new();
+        target.push(Point2D::new(0.0, 0.0));
+        target.push(Point2D::new(1.0, 1.0));
+        let mut buffer = Vec::new();
+        // No padding: both points sit in a corner cell, half the kernel falls outside.
+        let grid = ScoreGrid::from_cloud_into(&target, 0.05, 0.0, &mut buffer);
+        let cells = &buffer[..grid.width * grid.height];
+        assert_eq!(cells.iter().filter(|&&v| v == 1.0).count(), 2);
+    }
     fn create_l_shape(n: usize, length: f32) -> PointCloud2D {
         let mut cloud = PointCloud2D::with_capacity(2 * n);
         // Add tiny noise to avoid k-d tree bucket issues with perfectly aligned points
