@@ -81,6 +81,9 @@ const DRIVE_BRUSH_KEEPALIVE_INTERVAL_MS: u64 = 1000;
 /// "componente ativo" ao GD32, sem estraçalhar o chão/consumir.
 const DRIVE_BRUSH_KEEPALIVE_SPEED: u8 = 30;
 
+/// No 0x15 status for this long = the MCU is silent (sleep or fault).
+const MCU_SILENCE_MS: u64 = 2000;
+
 /// Brush keep-alive gate. Off on the viomi v8: the author marks the keep-alive as an
 /// unvalidated hypothesis (oangelo 274a691/309f347), and it spins the main brush
 /// without being asked. Re-enable only to test the wheel-cut theory on blocks.
@@ -193,6 +196,9 @@ pub(super) fn heartbeat_loop<W: std::io::Write + Send + 'static>(
     // if a cycle runs late.
     let mut next_tick = std::time::Instant::now() + std::time::Duration::from_millis(interval_ms);
     let mut lidar_pid = LidarSpeedPid::default();
+    let wake = super::packet::initialize_packet();
+    let mut mcu_silent = false;
+    let mut wake_counter: u64 = 0;
 
     while !shutdown.load(Ordering::Relaxed) {
         // Use blocking lock to ensure commands are always sent
@@ -423,6 +429,30 @@ pub(super) fn heartbeat_loop<W: std::io::Write + Send + 'static>(
             } else {
                 log::trace!("Heartbeat sent");
             }
+        }
+
+        // Silent-MCU watchdog. In its docked sleep state the GD32 stops streaming and
+        // holds CTS low (seen live 2026-10-18; vendor AuxCtrl has a g_sleep_mode for it).
+        // Re-send the 0x08 wake/init frame we send at start-up every 2 s; it is the frame
+        // that brought the MCU back in earlier sessions. Only status, never a power command.
+        match component_state.status_silence_ms() {
+            Some(ms) if ms > MCU_SILENCE_MS => {
+                if !mcu_silent {
+                    log::warn!("GD32 silent for {} ms (sleep?); re-sending wake 0x08 every 2 s", ms);
+                    mcu_silent = true;
+                }
+                wake_counter += 1;
+                if wake_counter >= MCU_SILENCE_MS / interval_ms {
+                    wake_counter = 0;
+                    let _ = wake.send_to(&mut *port);
+                }
+            }
+            Some(_) if mcu_silent => {
+                log::info!("GD32 streaming again");
+                mcu_silent = false;
+                wake_counter = 0;
+            }
+            _ => {}
         }
 
         // Send STM32 data request (0x0D) every ~1.5 seconds

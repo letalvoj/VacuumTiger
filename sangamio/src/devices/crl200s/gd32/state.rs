@@ -179,6 +179,9 @@ pub struct ComponentState {
     lidar_speed: OnceLock<Arc<AtomicU64>>,
     /// Closed-loop lidar speed target in milli-rev/s; 0 = fixed PWM (`lidar_pwm`).
     pub lidar_speed_target_mrps: AtomicU32,
+    /// Monotonic ms of the last 0x15 status packet (0 = none yet). The heartbeat uses it
+    /// to notice a silent MCU (the GD32 stops streaming in its docked sleep state).
+    pub last_status_ms: AtomicU64,
 }
 
 /// Default velocity scale (reference robot): device units per m/s and per rad/s.
@@ -218,7 +221,19 @@ impl ComponentState {
             lidar_scan_counter: OnceLock::new(),
             lidar_speed: OnceLock::new(),
             lidar_speed_target_mrps: AtomicU32::new(0),
+            last_status_ms: AtomicU64::new(0),
         }
+    }
+
+    /// Record that a status packet arrived now.
+    pub fn note_status_packet(&self) {
+        self.last_status_ms.store(monotonic_ms().max(1), Ordering::Relaxed);
+    }
+
+    /// Milliseconds since the last status packet (since process start if none arrived yet).
+    pub fn status_silence_ms(&self) -> Option<u64> {
+        let last = self.last_status_ms.load(Ordering::Relaxed);
+        Some(monotonic_ms().saturating_sub(last))
     }
 
     /// Attach the lidar driver's speed handle (see `Delta2DDriver::speed_handle`).

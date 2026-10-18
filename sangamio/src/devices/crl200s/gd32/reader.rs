@@ -123,6 +123,10 @@ pub(super) fn reader_loop(
                     );
                 }
 
+                if packet.cmd == CMD_STATUS {
+                    component_state.note_status_packet();
+                }
+
                 // Handle sensor status data
                 if packet.cmd == CMD_STATUS
                     && packet.payload_len() >= STATUS_PAYLOAD_MIN_SIZE
