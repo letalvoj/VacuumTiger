@@ -26,6 +26,9 @@ interface Palette {
   grid: string;
   scan: string;
   accent: string;
+  danger: string;
+  ok: string;
+  card: string;
   free: [number, number, number, number];
   occupied: [number, number, number, number];
 }
@@ -46,6 +49,33 @@ const FADE_REDRAW_MS = 250;
 /** Point sizes, CSS px. */
 const HISTORY_DOT = 1.5;
 const LIVE_DOT = 2;
+
+/**
+ * Robot model, top view, in the robot frame (x forward, y left); angles from
+ * forward, CCW; distances as fractions of the body radius. Bumper halves are
+ * arcs of the front; the four cliff IRs sit under the front rim
+ * (docs/HW_PROTOCOLS.md 0x01/0x03; the angles are estimates until the bits
+ * are mapped on the floor, T3).
+ */
+const BUMPER_RING = 1.08;
+const CLIFF_RING = 0.8;
+const TURRET = 0.25;
+const BUMPERS = [
+  { key: "bumper_left", from: 0, to: Math.PI / 2 },
+  { key: "bumper_right", from: -Math.PI / 2, to: 0 },
+];
+const CLIFFS = [
+  { key: "cliff_left_side", angle: (55 * Math.PI) / 180 },
+  { key: "cliff_left_front", angle: (25 * Math.PI) / 180 },
+  { key: "cliff_right_front", angle: (-25 * Math.PI) / 180 },
+  { key: "cliff_right_side", angle: (-55 * Math.PI) / 180 },
+];
+/** Drive wheels: half the track and the tyre size. */
+const WHEEL = { y: 0.66, length: 0.4, width: 0.12 };
+/** Below this radius (CSS px) only the body and heading are drawn. */
+const DETAIL_MIN_PX = 12;
+/** The robot never shrinks below this radius (CSS px). */
+const BODY_MIN_PX = 5;
 
 /** Scan points in the world frame, as [x0, y0, x1, y1, ...]. */
 function scanPoints(scan: Scan, p: Pose, robot: Robot): Float32Array {
@@ -86,6 +116,8 @@ export class MapRenderer {
   /** Earlier scans in the world frame, oldest first (only while SLAM runs). */
   private history: { t: number; points: Float32Array }[] = [];
   private pose: Pose | null = null;
+  /** Latest sensor values (bumpers, cliffs, dock) for the robot model. */
+  private sensors: Json = {};
   /** View centre (m) and zoom in CSS px per metre. */
   private view = { cx: 0, cy: 0, scale: 60 };
   private pointers = new Map<number, { x: number; y: number }>();
@@ -164,6 +196,11 @@ export class MapRenderer {
     this.invalidate();
   }
 
+  setSensors(values: Json) {
+    this.sensors = values;
+    this.invalidate();
+  }
+
   setScan(s: Scan | null) {
     // The scan being replaced joins the history, aged from when it arrived.
     // Without its own pose it takes the current one (a scan interval late).
@@ -196,6 +233,9 @@ export class MapRenderer {
       grid: v("--grid", "#888888"),
       scan: v("--scan", "#e0352b"),
       accent: v("--accent", "#f0a020"),
+      danger: v("--danger", "#d4342c"),
+      ok: v("--ok", "#1f9d55"),
+      card: v("--card", "#ffffff"),
       free: rgba(v("--map-free", "#e8ebf0"), 255),
       occupied: rgba(v("--map-occupied", "#1e2430"), 255),
     };
@@ -285,16 +325,78 @@ export class MapRenderer {
     const scan = this.scan;
     if (scan) this.drawPoints(scanPoints(scan, this.pose ? (scan.pose ?? pose) : pose, robot), LIVE_DOT * dpr);
 
-    // Robot body + heading.
+    this.drawRobot(pose, robot);
+  }
+
+  /**
+   * Top view of the robot at its pose: body, drive wheels, lidar turret,
+   * heading, and the switches lit when they trigger (bumper halves, cliff IRs);
+   * a green rim while it sits on the dock contacts.
+   */
+  private drawRobot(pose: Pose, robot: Robot) {
+    const ctx = this.ctx;
+    const dpr = this.dpr();
+    const p = this.palette;
+    // Docked, the bumper/cliff bits read whatever the dock configuration left
+    // there (all set under the vendor setup), not hits: no red then.
+    const docked = !!this.sensors.is_dock_connected;
+    const hit = (k: string) => !docked && !!this.sensors[k];
     const [rx, ry] = this.w2s(pose.x, pose.y);
-    const rr = robot.radius * this.view.scale * dpr;
-    ctx.strokeStyle = this.palette.accent;
+    const r = Math.max(robot.radius * this.view.scale, BODY_MIN_PX) * dpr; // px
+    const perMetre = r / robot.radius;
+    ctx.save();
+    // Robot frame in canvas px: x forward, y left (canvas y points down).
+    ctx.translate(rx, ry);
+    ctx.rotate(-pose.theta);
+    ctx.scale(1, -1);
     ctx.lineWidth = 2 * dpr;
+
+    // Body, slightly translucent over the scan points it covers.
+    ctx.fillStyle = p.card;
+    ctx.globalAlpha = 0.85;
     ctx.beginPath();
-    ctx.arc(rx, ry, rr, 0, 2 * Math.PI);
-    ctx.moveTo(rx, ry);
-    ctx.lineTo(rx + Math.cos(pose.theta) * rr, ry - Math.sin(pose.theta) * rr);
+    ctx.arc(0, 0, r, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = docked ? p.ok : p.accent;
     ctx.stroke();
+
+    // Heading: a notch at the front.
+    ctx.fillStyle = p.accent;
+    ctx.beginPath();
+    ctx.moveTo(0.95 * r, 0);
+    ctx.lineTo(0.6 * r, 0.18 * r);
+    ctx.lineTo(0.6 * r, -0.18 * r);
+    ctx.fill();
+
+    if (r >= DETAIL_MIN_PX * dpr) {
+      ctx.fillStyle = p.grid;
+      for (const side of [1, -1]) {
+        ctx.fillRect((-WHEEL.length / 2) * r, (side * WHEEL.y - WHEEL.width / 2) * r, WHEEL.length * r, WHEEL.width * r);
+      }
+      ctx.strokeStyle = p.grid;
+      ctx.beginPath();
+      ctx.arc(robot.lidar_offset_x * perMetre, robot.lidar_offset_y * perMetre, TURRET * r, 0, 2 * Math.PI);
+      ctx.stroke();
+
+      const dot = Math.max(2 * dpr, 0.09 * r);
+      for (const c of CLIFFS) {
+        ctx.fillStyle = hit(c.key) ? p.danger : p.grid;
+        ctx.beginPath();
+        ctx.arc(CLIFF_RING * r * Math.cos(c.angle), CLIFF_RING * r * Math.sin(c.angle), dot, 0, 2 * Math.PI);
+        ctx.fill();
+      }
+    }
+
+    ctx.lineWidth = Math.max(2 * dpr, 0.08 * r);
+    for (const b of BUMPERS) {
+      ctx.strokeStyle = hit(b.key) ? p.danger : p.accent;
+      ctx.globalAlpha = hit(b.key) ? 1 : 0.35;
+      ctx.beginPath();
+      ctx.arc(0, 0, BUMPER_RING * r, b.from, b.to);
+      ctx.stroke();
+    }
+    ctx.restore();
   }
 
   /** World points as squares; `w2s` inlined (tens of thousands per frame). */

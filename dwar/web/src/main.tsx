@@ -75,6 +75,7 @@ function App() {
             break;
           case "sensors":
             setSensors(m.values ?? {});
+            map.current?.setSensors(m.values ?? {});
             break;
           case "pose":
             setHasPose(true);
@@ -154,11 +155,14 @@ function App() {
             <MapView robot={robot} hasPose={hasPose} bind={(r) => (map.current = r)} />
           </Boundary>
         </section>
+        <Boundary title="Teleop">
+          <Teleop link={link} caps={caps} holder={holder && session !== null} online={online} max={max} />
+        </Boundary>
         <Boundary title="Links">
           <Health status={status} online={online} />
         </Boundary>
-        <Boundary title="Teleop">
-          <Teleop link={link} caps={caps} holder={holder && session !== null} online={online} max={max} />
+        <Boundary title="Sensors" wide>
+          <Sensors values={sensors} />
         </Boundary>
         <Boundary title="Hardware">
           <Controls caps={caps} status={status} />
@@ -173,9 +177,6 @@ function App() {
             <Recordings status={status} />
           </Boundary>
         )}
-        <Boundary title="Sensors" wide>
-          <Sensors values={sensors} />
-        </Boundary>
         <Boundary title="Events" wide>
           <Events events={events} />
         </Boundary>
