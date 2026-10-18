@@ -57,28 +57,33 @@
 //! # Client Registration
 //!
 //! UDP streaming uses unicast (not broadcast) for security and efficiency.
-//! Clients must first connect via TCP to register their UDP endpoint:
+//! Clients connect via TCP and join the [`ClientHub`]:
 //!
 //! 1. Client connects to TCP port 5555
-//! 2. Server records client's IP address
-//! 3. UDP packets are sent to client's IP on same port
-//! 4. When TCP disconnects, UDP streaming to that client stops
+//! 2. It joins the hub; telemetry goes to `<its IP>:udp_client_port`
+//!    (or over its TCP socket after the `telemetry` Enable command)
+//! 3. Only the lease holder may drive; stops are accepted from anyone
+//! 4. When TCP disconnects it leaves the hub (lease holder: drive zeroed)
 //!
 //! # Module Contents
 //!
-//! - [`UdpPublisher`]: Streams sensor data to registered clients
-//! - [`TcpReceiver`]: Handles incoming commands and client registration
+//! - [`ClientHub`]: connected clients and the control lease
+//! - [`UdpPublisher`]: fans sensor data out to every client
+//! - [`TcpReceiver`]: handles one client's commands
 //! - [`wire`]: Protobuf serialization/deserialization
 
+pub mod clients;
+pub mod net;
 pub mod tcp_receiver;
 pub mod udp_publisher;
 pub mod wire;
 
+pub use clients::{Client, ClientHub};
 pub use tcp_receiver::TcpReceiver;
-pub use udp_publisher::{UdpClientRegistry, UdpPublisher};
+pub use udp_publisher::UdpPublisher;
 pub use wire::create_serializer;
 
-/// Which transport carries sensor telemetry to the current client.
+/// Which transport carries sensor telemetry to a client.
 ///
 /// UDP unicast is the low-latency default (see module docs). TCP is a fallback
 /// for clients behind NAT / operating remotely, where the robot's UDP packets

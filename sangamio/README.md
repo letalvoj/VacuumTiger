@@ -354,12 +354,20 @@ For the CRL-200S, `wheel_mm_per_tick` and `wheel_track_m` are
 
 ### Client Registration
 
-UDP uses unicast (not broadcast). Clients are registered automatically:
+Several clients may be connected at once (`[network] max_clients`, default 8);
+each gets the full telemetry stream. The protocol is described in
+`src/streaming/clients.rs`:
 
-1. Client connects TCP to port 5555
-2. Server records client IP address
-3. UDP packets are sent to client on same port
-4. When TCP disconnects, UDP streaming stops
+1. Client connects TCP to port 5555 and joins the hub
+2. Telemetry goes over UDP to `<client IP>:udp_client_port`, or over the TCP
+   socket after `ComponentControl{id:"telemetry", Enable}` (use this for a
+   second client on the same host)
+3. A control lease decides who may drive/switch actuators: taken implicitly by
+   the first controlling command, or with `ComponentControl{id:"lease",
+   Enable{force}}`; released with `Disable`. Stops are accepted from anyone.
+   The drive is zeroed whenever the lease changes hands
+4. When TCP disconnects (or keepalive fails, ~15 s) the client leaves; a lease
+   holder's drive is zeroed
 
 ### Python Client Example
 

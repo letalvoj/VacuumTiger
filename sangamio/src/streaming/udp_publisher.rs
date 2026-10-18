@@ -1,8 +1,9 @@
-//! UDP publisher for real-time sensor data streaming
+//! Telemetry publisher: fans sensor data out to every connected client
 //!
-//! This module implements the UDP unicast publisher that streams sensor data
-//! to registered clients. It's optimized for low-latency, high-frequency
-//! sensor delivery on embedded systems.
+//! Each frame is serialized once and sent to every client in the
+//! [`ClientHub`]: one UDP datagram per distinct `<IP>:udp_port` target, or a
+//! queued frame for clients that switched to TCP telemetry. It's optimized for
+//! low-latency, high-frequency sensor delivery on embedded systems.
 //!
 //! # Design Principles
 //!
@@ -25,22 +26,15 @@
 //!
 //! UDP streaming uses **unicast** (not broadcast) because:
 //!
-//! - **Security**: Only authorized clients receive data
+//! - **Privacy**: only connected clients receive data (no auth: trusted LAN)
 //! - **Efficiency**: No processing overhead on non-listening hosts
 //! - **Firewall-friendly**: Works across subnets with proper routing
-//! - **Single client**: Robot typically has one SLAM client at a time
 //!
-//! # Client Registration
+//! # Clients
 //!
-//! Clients are automatically registered when they connect via TCP:
-//!
-//! ```text
-//! 1. Client connects TCP to port 5555
-//! 2. TcpReceiver extracts client IP from socket
-//! 3. Client IP is stored in UdpClientRegistry
-//! 4. UdpPublisher sends packets to registered IP
-//! 5. When TCP disconnects, registration is cleared
-//! ```
+//! Clients join the hub when they connect via TCP (see [`crate::streaming::clients`]).
+//! When a client joins or switches transport, the polled one-shot groups
+//! (device version) are sent again so it learns them.
 //!
 //! # Wire Format
 //!
@@ -69,26 +63,14 @@
 
 use crate::core::types::{SensorGroupData, StreamReceiver};
 use crate::error::Result;
+use crate::streaming::clients::ClientHub;
 use crate::streaming::wire::Serializer;
-use crate::streaming::Transport;
 use crossbeam_channel::TryRecvError;
 use std::collections::HashMap;
-use std::io::Write;
-use std::net::{SocketAddr, TcpStream, UdpSocket};
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-/// Shared handle to the current client's TCP socket (a write-clone), used to send
-/// telemetry when the client has fallen back to TCP. `None` when no client is
-/// connected. Set/cleared by the accept loop in `main.rs`.
-pub type TcpWriter = Arc<Mutex<Option<TcpStream>>>;
-
-/// Shared selected telemetry transport for the current client.
-pub type TransportSel = Arc<Mutex<Transport>>;
-
-/// Type alias for UDP client registry (single client at a time)
-pub type UdpClientRegistry = Arc<Mutex<Option<SocketAddr>>>;
 
 /// Maximum expected UDP payload size (4-byte length prefix + protobuf message)
 /// Typical sensor message ~150 bytes, lidar ~2KB, allow headroom
@@ -99,7 +81,7 @@ const MAX_UDP_BUFFER_SIZE: usize = 4096;
 const REPUBLISHED_GROUPS: &[&str] = &["kinematics"];
 const REPUBLISH_INTERVAL: Duration = Duration::from_secs(2);
 
-/// UDP publisher that streams sensor data to registered clients
+/// Publisher that fans sensor data out to every connected client
 pub struct UdpPublisher {
     socket: UdpSocket,
     serializer: Serializer,
@@ -109,26 +91,19 @@ pub struct UdpPublisher {
     stream_receivers: HashMap<String, StreamReceiver>,
     /// Global running flag (daemon shutdown)
     running: Arc<AtomicBool>,
-    /// Client registry - current registered client for UDP streaming
-    client_registry: UdpClientRegistry,
-    /// Selected telemetry transport (UDP default, TCP fallback for NAT/remote)
-    transport: TransportSel,
-    /// Write handle to the current client's TCP socket, used when transport == Tcp
-    tcp_writer: TcpWriter,
+    /// Connected clients (each with its own UDP target or TCP queue)
+    hub: Arc<ClientHub>,
 }
 
 impl UdpPublisher {
-    /// Create a new UDP publisher
-    #[allow(clippy::too_many_arguments)]
+    /// Create a new publisher
     pub fn new(
         socket: UdpSocket,
         serializer: Serializer,
         sensor_data: HashMap<String, Arc<Mutex<SensorGroupData>>>,
         stream_receivers: HashMap<String, StreamReceiver>,
         running: Arc<AtomicBool>,
-        client_registry: UdpClientRegistry,
-        transport: TransportSel,
-        tcp_writer: TcpWriter,
+        hub: Arc<ClientHub>,
     ) -> Self {
         Self {
             socket,
@@ -136,29 +111,17 @@ impl UdpPublisher {
             sensor_data,
             stream_receivers,
             running,
-            client_registry,
-            transport,
-            tcp_writer,
+            hub,
         }
     }
 
-    /// Get current registered client address (if any)
-    fn get_client(&self) -> Option<SocketAddr> {
-        *self
-            .client_registry
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Run the publisher loop (unicast to registered client)
+    /// Main publishing loop
     pub fn run(&mut self) -> Result<()> {
-        log::info!("UDP publisher started (unicast mode - waiting for client registration)");
+        log::info!("Telemetry publisher started (fan-out to all connected clients)");
 
-        // Pre-allocate send buffer to avoid allocation per message
         let mut send_buffer = Vec::with_capacity(MAX_UDP_BUFFER_SIZE);
 
-        // Track last sent sequence numbers for polling-based groups
-        // (excluding groups that have streaming channels)
+        // Track last sent sequence for polled groups (non-streaming)
         let mut last_seq: HashMap<String, u64> = HashMap::new();
         for group_id in self.sensor_data.keys() {
             if !self.stream_receivers.contains_key(group_id) {
@@ -166,33 +129,32 @@ impl UdpPublisher {
             }
         }
 
-        let mut last_client: Option<SocketAddr> = None;
+        // Hub generation: when a client joins or switches transport, the polled
+        // groups (version, lidar) are resent; the others just see them once more.
+        let mut generation = u64::MAX;
+        let mut outgoing: Vec<SensorGroupData> = Vec::new();
+        let mut udp_sent: Vec<SocketAddr> = Vec::new();
         let mut last_republish = Instant::now();
 
         while self.running.load(Ordering::Relaxed) {
-            // Get current registered client
-            let client_addr = self.get_client();
-
-            // Log client registration changes
-            if client_addr != last_client {
-                match &client_addr {
-                    Some(addr) => log::info!("UDP streaming to client: {}", addr),
-                    None => log::info!("UDP streaming paused (no client registered)"),
+            // Generation first: `connect` adds the client, then bumps it, so a
+            // bump seen here always comes with that client in the snapshot.
+            let current_generation = self.hub.generation();
+            let clients = self.hub.clients();
+            if clients.is_empty() {
+                // Drain streaming channels so stale telemetry isn't sent on connect
+                for rx in self.stream_receivers.values() {
+                    while rx.try_recv().is_ok() {}
                 }
-                last_client = client_addr;
-                // Resend every polled group to a newly registered client, so it
-                // also gets groups that rarely change (kinematics, device_version).
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            if current_generation != generation {
+                generation = current_generation;
                 for seq in last_seq.values_mut() {
                     *seq = 0;
                 }
             }
-
-            // Skip sending if no client registered
-            let Some(target_addr) = client_addr else {
-                // No client - sleep longer to reduce CPU usage
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
-            };
 
             if last_republish.elapsed() >= REPUBLISH_INTERVAL {
                 for group_id in REPUBLISHED_GROUPS {
@@ -203,31 +165,13 @@ impl UdpPublisher {
                 last_republish = Instant::now();
             }
 
-            let mut sent_any = false;
+            outgoing.clear();
 
-            // Phase 1: Drain all streaming channels (high-rate sensors like GD32 @ 110Hz)
+            // Streaming groups: drain every queued packet
             for (group_id, rx) in &self.stream_receivers {
                 loop {
                     match rx.try_recv() {
-                        Ok(data) => {
-                            if let Err(e) = self.send_sensor_group_with_buffer(
-                                &data,
-                                target_addr,
-                                &mut send_buffer,
-                            ) {
-                                // UDP send errors are not fatal - just log and continue
-                                log::warn!("Failed to send {} stream data: {}", group_id, e);
-                            } else {
-                                log::trace!(
-                                    "Sent {} (seq: {}, ts: {}) to {}",
-                                    data.group_id,
-                                    data.sequence_number,
-                                    data.timestamp_us,
-                                    target_addr
-                                );
-                            }
-                            sent_any = true;
-                        }
+                        Ok(data) => outgoing.push(data),
                         Err(TryRecvError::Empty) => break,
                         Err(TryRecvError::Disconnected) => {
                             log::warn!("Stream channel for {} disconnected", group_id);
@@ -237,100 +181,53 @@ impl UdpPublisher {
                 }
             }
 
-            // Phase 2: Poll mutex-based groups (low-rate sensors like lidar @ 5Hz)
+            // Polled groups: send when the sequence number changed
             for (group_id, data_mutex) in &self.sensor_data {
-                // Skip groups that have streaming channels
                 if self.stream_receivers.contains_key(group_id) {
                     continue;
                 }
-
-                let data = match data_mutex.lock() {
-                    Ok(d) => d,
-                    Err(e) => {
-                        log::error!("Failed to lock sensor data for {}: {}", group_id, e);
-                        continue;
-                    }
+                let Ok(data) = data_mutex.lock() else {
+                    log::error!("Failed to lock sensor data for {}", group_id);
+                    continue;
                 };
-
                 let last = last_seq.get(group_id).copied().unwrap_or(0);
                 if data.sequence_number != last {
-                    // Clone data while holding lock
                     let cloned = data.clone();
                     drop(data); // Release lock before serializing
-
                     if let Some(seq) = last_seq.get_mut(group_id) {
                         *seq = cloned.sequence_number;
                     }
+                    outgoing.push(cloned);
+                }
+            }
 
-                    if let Err(e) =
-                        self.send_sensor_group_with_buffer(&cloned, target_addr, &mut send_buffer)
-                    {
-                        // UDP send errors are not fatal - just log and continue
-                        log::warn!("Failed to send {} poll data: {}", group_id, e);
-                    } else {
-                        log::trace!(
-                            "Sent {} (seq: {}) to {} [polled]",
-                            cloned.group_id,
-                            cloned.sequence_number,
-                            target_addr
-                        );
+
+            for data in &outgoing {
+                match self.serializer.serialize_sensor_group(data) {
+                    Ok(payload) => {
+                        send_buffer.clear();
+                        send_buffer.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                        send_buffer.extend_from_slice(&payload);
+                        // One datagram per distinct UDP target, one shared frame
+                        // for all TCP clients.
+                        let mut shared = None;
+                        udp_sent.clear();
+                        for c in &clients {
+                            c.deliver(&send_buffer, &mut shared, &self.socket, &mut udp_sent);
+                        }
                     }
-                    sent_any = true;
+                    Err(e) => log::warn!("Failed to serialize {}: {}", data.group_id, e),
                 }
             }
 
-            // Rate limiting: Always sleep briefly to yield CPU on single-core embedded systems.
-            // At 110Hz sensor rate, we need ~9ms between messages. 500μs sleep is plenty of margin
-            // while still allowing up to 2000 packets/sec if needed.
-            if sent_any {
-                std::thread::sleep(Duration::from_micros(500));
-            } else {
-                // No data - sleep longer to reduce CPU usage
+            if outgoing.is_empty() {
                 std::thread::sleep(Duration::from_millis(1));
+            } else {
+                std::thread::sleep(Duration::from_micros(500));
             }
         }
 
-        log::info!("UDP publisher stopped");
-        Ok(())
-    }
-
-    /// Send a sensor group to the current client over the selected transport.
-    ///
-    /// Both transports use the same wire format for client compatibility:
-    /// [4-byte length prefix (big-endian)] + [protobuf payload]. UDP is the
-    /// low-latency default; TCP is the fallback for NAT/remote clients.
-    ///
-    /// Uses provided buffer to avoid allocation per message.
-    fn send_sensor_group_with_buffer(
-        &self,
-        data: &SensorGroupData,
-        target: SocketAddr,
-        buffer: &mut Vec<u8>,
-    ) -> Result<()> {
-        let payload = self.serializer.serialize_sensor_group(data)?;
-        let len = (payload.len() as u32).to_be_bytes();
-
-        // Reuse buffer - clear and rebuild (no allocation if capacity sufficient)
-        buffer.clear();
-        buffer.extend_from_slice(&len);
-        buffer.extend_from_slice(&payload);
-
-        match *self.transport.lock().unwrap_or_else(|e| e.into_inner()) {
-            Transport::Udp => {
-                self.socket.send_to(buffer, target)?;
-            }
-            Transport::Tcp => {
-                // Write the identical [len][protobuf] frame into the client's TCP
-                // socket. The write-clone in main.rs carries a write timeout so a
-                // wedged remote can't freeze this (110Hz) loop; a write error is
-                // treated like UDP packet loss (logged by the caller, non-fatal).
-                let mut guard = self.tcp_writer.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(w) = guard.as_mut() {
-                    w.write_all(buffer)?;
-                }
-            }
-        }
-
+        log::info!("Telemetry publisher stopped");
         Ok(())
     }
 }

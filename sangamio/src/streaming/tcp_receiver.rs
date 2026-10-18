@@ -10,7 +10,7 @@
 //!
 //! - **Reliability**: Commands must not be lost (e.g., "stop motors")
 //! - **Ordering**: Commands must execute in sequence
-//! - **Acknowledgment**: Sender knows the command was received
+//! - **No replies**: the protocol has no acknowledgements; refusals are logged
 //! - **State sync**: TCP connection state tracks client presence
 //!
 //! # Wire Format
@@ -36,15 +36,20 @@
 //! | `ComponentControl::water_pump` | Control water pump speed |
 //! | `ComponentControl::led` | Set LED state |
 //! | `Shutdown` | Graceful daemon shutdown |
+//! | `ComponentControl::lease` | Take (Enable, `force`) / release (Disable) the control lease |
+//! | `ComponentControl::telemetry` | Switch this client's telemetry to TCP (Enable) / UDP |
+//!
+//! Only the lease holder may drive or switch actuators; stops are accepted
+//! from anyone (see [`crate::streaming::clients`]). Refused commands are logged.
 //!
 //! # Connection Lifecycle
 //!
 //! ```text
 //! 1. Client connects to TCP port 5555
 //! 2. Server spawns TcpReceiver thread for this client
-//! 3. Client IP is registered for UDP streaming
+//! 3. The client is registered in the ClientHub (telemetry fan-out)
 //! 4. Receiver loop processes commands until disconnect
-//! 5. On disconnect, UDP registration is cleared
+//! 5. On disconnect it leaves the hub; if it held the lease, the drive is zeroed
 //! ```
 //!
 //! # Safety Features
@@ -56,14 +61,13 @@
 use crate::core::driver::DeviceDriver;
 use crate::core::types::{Command, ComponentAction};
 use crate::error::{Error, Result};
-use crate::streaming::udp_publisher::TransportSel;
+use crate::streaming::clients::{Client, ClientHub, Verdict, is_stop};
 use crate::streaming::wire::Serializer;
-use crate::streaming::Transport;
 use std::io::Read;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// TCP receiver that handles commands from connected client
 pub struct TcpReceiver {
@@ -71,10 +75,10 @@ pub struct TcpReceiver {
     driver: Arc<Mutex<Box<dyn DeviceDriver>>>,
     /// Global running flag (daemon shutdown)
     running: Arc<AtomicBool>,
-    /// Per-connection alive flag (connection health)
-    conn_alive: Arc<AtomicBool>,
-    /// Selected telemetry transport, flipped by the reserved "telemetry" command
-    transport: TransportSel,
+    /// All clients and the control lease
+    hub: Arc<ClientHub>,
+    /// This connection's entry in the hub
+    client: Arc<Client>,
     /// Reusable buffer for reading command payloads (avoids allocation per command)
     read_buffer: Vec<u8>,
 }
@@ -105,15 +109,15 @@ impl TcpReceiver {
         serializer: Serializer,
         driver: Arc<Mutex<Box<dyn DeviceDriver>>>,
         running: Arc<AtomicBool>,
-        conn_alive: Arc<AtomicBool>,
-        transport: TransportSel,
+        hub: Arc<ClientHub>,
+        client: Arc<Client>,
     ) -> Self {
         Self {
             serializer,
             driver,
             running,
-            conn_alive,
-            transport,
+            hub,
+            client,
             // Pre-allocate buffer to avoid allocation on first command
             read_buffer: Vec::with_capacity(INITIAL_BUFFER_CAPACITY),
         }
@@ -136,7 +140,7 @@ impl TcpReceiver {
                 log::debug!("Running flag cleared, exiting");
                 break;
             }
-            if !self.conn_alive.load(Ordering::Relaxed) {
+            if !self.client.alive.load(Ordering::Relaxed) {
                 log::debug!("Connection alive flag cleared, exiting");
                 break;
             }
@@ -177,13 +181,14 @@ impl TcpReceiver {
                 }
                 Err(e) => {
                     // Signal connection is dead and shutdown socket
-                    self.conn_alive.store(false, Ordering::Relaxed);
+                    self.client.alive.store(false, Ordering::Relaxed);
                     let _ = stream.shutdown(std::net::Shutdown::Both);
 
                     // Check if it's a connection closed error
                     if let Error::Io(ref io_err) = e
                         && (io_err.kind() == std::io::ErrorKind::UnexpectedEof
-                            || io_err.kind() == std::io::ErrorKind::ConnectionReset)
+                            || io_err.kind() == std::io::ErrorKind::ConnectionReset
+                            || io_err.kind() == std::io::ErrorKind::TimedOut)
                     {
                         log::info!("Client disconnected");
                         return Ok(());
@@ -195,7 +200,7 @@ impl TcpReceiver {
         }
 
         // Clean shutdown: signal connection dead and close socket
-        self.conn_alive.store(false, Ordering::Relaxed);
+        self.client.alive.store(false, Ordering::Relaxed);
         let _ = stream.shutdown(std::net::Shutdown::Both);
 
         log::info!("TCP receiver stopped");
@@ -213,7 +218,8 @@ impl TcpReceiver {
                 log::trace!("Read length prefix: {:?}", len_buf);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Ok(None),
+            // SO_RCVTIMEO expiry is WouldBlock on Unix; TimedOut here means the
+            // connection died (keepalive / TCP_USER_TIMEOUT): fall through to error.
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 log::trace!("EOF on length read");
                 return Err(Error::Io(e));
@@ -242,30 +248,56 @@ impl TcpReceiver {
 
     /// Handle a command
     fn handle_command(&self, cmd: Command) -> Result<()> {
-        // Reserved pseudo-component "telemetry": switch this client's sensor-stream
-        // transport instead of forwarding to the device driver. Enable = TCP (the
-        // NAT/remote fallback), Disable = UDP (the low-latency default). The bridge
-        // sends this when UDP telemetry doesn't arrive.
-        if let Command::ComponentControl { id, action } = &cmd {
-            if id == "telemetry" {
-                let t = if matches!(action, ComponentAction::Enable { .. }) {
-                    Transport::Tcp
-                } else {
-                    Transport::Udp
-                };
-                *self.transport.lock().unwrap_or_else(|e| e.into_inner()) = t;
-                log::info!("Telemetry transport -> {:?}", t);
+        // Lease policy, plus the reserved pseudo-components "telemetry" (switch
+        // this client's stream to TCP/UDP) and "lease" (take/release control).
+        // The drive is zeroed whenever the lease changes hands.
+        match self.hub.authorize(&self.client, &cmd, || stop_drive(&self.driver)) {
+            Verdict::Execute => {}
+            Verdict::Handled => return Ok(()),
+            Verdict::Refused(holder) => {
+                log::warn!(
+                    "Client #{} refused '{}': control lease held by #{}",
+                    self.client.id,
+                    describe(&cmd),
+                    holder
+                );
                 return Ok(());
             }
         }
 
         log::trace!("Executing command: {:?}", cmd);
         let mut driver = self.driver.lock().map_err(|_| Error::ThreadPanic)?;
+        // The lease may have changed hands while we waited for the driver
+        // (a forced takeover zeroes the drive first): don't undo that.
+        if !is_stop_command(&cmd) && self.hub.lease_holder() != Some(self.client.id) {
+            log::warn!(
+                "Client #{} lost the lease before '{}' ran: dropped",
+                self.client.id,
+                describe(&cmd)
+            );
+            return Ok(());
+        }
         let result = driver.send_command(cmd);
         if result.is_err() {
             log::warn!("Command execution failed: {:?}", result);
         }
         result
+    }
+}
+
+fn is_stop_command(cmd: &Command) -> bool {
+    matches!(cmd, Command::ComponentControl { id, action } if is_stop(id, action))
+}
+
+/// Zero and disable the drive. The GD32 holds the last velocity forever, so
+/// this runs whenever the controlling client changes or goes away.
+pub fn stop_drive(driver: &Mutex<Box<dyn DeviceDriver>>) {
+    let mut drv = driver.lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(e) = drv.send_command(Command::ComponentControl {
+        id: "drive".to_string(),
+        action: ComponentAction::Disable { config: None },
+    }) {
+        log::warn!("Failed to stop the drive: {}", e);
     }
 }
 

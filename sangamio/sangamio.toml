@@ -110,7 +110,7 @@ z = [0, 1]    # output_z (yaw) = input_x * 1 (CCW positive, REP-103; measured
 # TCP server bind address for command connections
 # Format: "host:port"
 # Use "0.0.0.0:5555" to listen on all interfaces
-# TCP is commands-only + triggers UDP streaming registration
+# TCP carries commands; each connected client gets telemetry (UDP or TCP)
 bind_address = "0.0.0.0:5555"
 
 # UDP streaming uses the same port as TCP (extracted from bind_address)

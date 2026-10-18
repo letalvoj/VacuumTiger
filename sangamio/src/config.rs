@@ -626,6 +626,17 @@ pub struct NetworkConfig {
     /// **Default**: Same as TCP port from `bind_address`
     #[serde(default)]
     pub udp_client_port: Option<u16>,
+
+    /// Maximum simultaneous clients; the oldest is evicted when a new one
+    /// connects beyond this (a stale half-open connection can't lock others out).
+    ///
+    /// **Default**: 8
+    #[serde(default = "default_max_clients")]
+    pub max_clients: usize,
+}
+
+fn default_max_clients() -> usize {
+    8
 }
 
 impl NetworkConfig {

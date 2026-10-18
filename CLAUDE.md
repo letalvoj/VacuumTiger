@@ -142,11 +142,19 @@ See `sangam-io/proto/sangamio.proto` for SangamIO messages (sensors, commands).
 
 ### Client Registration
 
-UDP uses unicast (not broadcast). Clients are registered automatically:
+UDP uses unicast (not broadcast). Several clients may be connected at once
+(`[network] max_clients`, default 8; the oldest client not holding the lease is evicted):
 1. Client connects TCP to port 5555
-2. Server records client IP address
-3. UDP packets are sent to client on same port
-4. When TCP disconnects, UDP streaming stops
+2. Every client gets the telemetry stream: UDP to `<its IP>:udp_client_port`, or
+   over its TCP socket after `ComponentControl{id:"telemetry", Enable}` (needed
+   for a second client on the same host, which would share the UDP port)
+3. A control lease decides who may drive/switch actuators: taken implicitly by
+   the first controlling command, explicitly with `ComponentControl{id:"lease",
+   Enable{force}}`, released with `Disable`. Stops (drive Disable/Reset, actuator
+   Disable) are accepted from anyone. The drive is zeroed whenever the lease
+   changes hands.
+4. When TCP disconnects (or keepalive fails, ~15 s), the client leaves; if it
+   held the lease, the drive is zeroed
 
 ### Example Python Client
 
