@@ -72,3 +72,8 @@ z = [0, 1]
 
 [network]
 bind_address = "0.0.0.0:5555"
+# UDP telemetry goes to <client ip>:5556. Same port as TCP (the default) collides on
+# the robot itself: SangamIO's own UDP socket and an on-robot client (DhruvaSLAM) both
+# bind 5555 and Linux delivers each datagram to only one of them. Remote clients that
+# use TCP telemetry (sangam_client.py, vacuum_ros2_bridge) are unaffected.
+udp_client_port = 5556

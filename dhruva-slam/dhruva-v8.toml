@@ -10,6 +10,9 @@
 
 [source]
 sangam_address = "127.0.0.1:5555"
+# Must match SangamIO's [network] udp_client_port (viomi_v8.toml): receiving on 5555
+# next to SangamIO's own UDP socket loses the datagrams.
+udp_port = 5556
 
 [output]
 bind_port = 5557
