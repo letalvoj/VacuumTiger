@@ -8,4 +8,5 @@
 //! - [`graph`]: Pose graph optimization and loop closure detection
 
 pub mod graph;
+pub mod pipeline;
 pub mod slam;

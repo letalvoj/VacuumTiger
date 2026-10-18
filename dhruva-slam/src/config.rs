@@ -13,6 +13,7 @@ use crate::algorithms::matching::{
     PointToLineIcpConfig, RobustKernel,
 };
 use crate::engine::graph::{GraphOptimizerConfig, LoopDetectorConfig};
+use crate::engine::pipeline::PipelineConfig;
 use crate::engine::slam::{
     KeyframeManagerConfig, LoopClosureConfig as SlamLoopClosureConfig, OnlineSlamConfig,
     SubmapManagerConfig,
@@ -765,9 +766,11 @@ pub fn build_slam_thread_config(config: &Config) -> SlamThreadConfig {
     SlamThreadConfig {
         sangam_address: config.source.sangam_address.clone(),
         udp_port: config.source.udp_port,
-        slam_config,
-        odometry_type: config.odometry.algorithm_type(),
-        odometry_config,
-        preprocessor_config,
+        pipeline: PipelineConfig {
+            slam_config,
+            odometry_type: config.odometry.algorithm_type(),
+            odometry_config,
+            preprocessor_config,
+        },
     }
 }

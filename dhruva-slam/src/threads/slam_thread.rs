@@ -22,14 +22,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use crate::core::types::{LaserScan, Pose2D, PoseTracker};
-use crate::engine::slam::{OnlineSlam, OnlineSlamConfig, SlamEngine, SlamMode};
+use crate::core::types::{LaserScan, Pose2D};
+use crate::engine::pipeline::{PipelineConfig, SlamPipeline};
+use crate::engine::slam::{SlamEngine, SlamMode};
 use crate::io::sangam_client::Message as SangamMessage;
 use crate::io::sangam_udp_receiver::{
     LidarData, ReceiverConfig, SangamUdpReceiver, SensorStatusData,
 };
-use crate::sensors::odometry::{DynOdometry, DynOdometryConfig, OdometryType};
-use crate::sensors::preprocessing::{PreprocessorConfig, ScanPreprocessor};
 use crate::state::{
     CommandReceiver, CommandResponse, CommandResult, RobotState, SharedStateHandle, SlamCommand,
 };
@@ -45,14 +44,8 @@ pub struct SlamThreadConfig {
     /// If specified, UDP receiver will bind to this port instead of the TCP port.
     /// Useful for localhost testing where TCP and UDP need different ports.
     pub udp_port: Option<u16>,
-    /// SLAM engine configuration.
-    pub slam_config: OnlineSlamConfig,
-    /// Odometry algorithm type.
-    pub odometry_type: OdometryType,
-    /// Odometry configuration.
-    pub odometry_config: DynOdometryConfig,
-    /// Scan preprocessor configuration.
-    pub preprocessor_config: PreprocessorConfig,
+    /// Odometry, preprocessing and SLAM engine.
+    pub pipeline: PipelineConfig,
 }
 
 /// SLAM Thread handle.
@@ -187,18 +180,11 @@ fn run_live_loop(
 /// Robot radius used for bumper obstacle marking.
 const ROBOT_RADIUS: f32 = 0.18;
 
-/// Internal SLAM context holding all processing state.
+/// The SLAM thread's state: the processing pipeline plus what the daemon
+/// publishes about it.
 struct SlamContext {
-    /// SLAM engine.
-    slam: OnlineSlam,
-    /// Odometry estimator.
-    odometry: DynOdometry,
-    /// Scan preprocessor.
-    preprocessor: ScanPreprocessor,
-    /// Pose tracker for odometry.
-    odom_tracker: PoseTracker,
-    /// Last odometry pose (for delta computation).
-    last_odom_pose: Pose2D,
+    /// Odometry, preprocessing and SLAM engine.
+    pipeline: SlamPipeline,
     /// Whether SLAM is in mapping mode.
     is_mapping: bool,
     /// Whether SLAM is in localization mode.
@@ -215,20 +201,8 @@ struct SlamContext {
 
 impl SlamContext {
     fn new(config: &SlamThreadConfig) -> Self {
-        let slam = OnlineSlam::new(config.slam_config.clone());
-        log::info!(
-            "Initializing odometry with algorithm: {:?}",
-            config.odometry_type
-        );
-        let odometry = DynOdometry::new(config.odometry_type, config.odometry_config.clone());
-        let preprocessor = ScanPreprocessor::new(config.preprocessor_config.clone());
-
         Self {
-            slam,
-            odometry,
-            preprocessor,
-            odom_tracker: PoseTracker::new(),
-            last_odom_pose: Pose2D::identity(),
+            pipeline: SlamPipeline::new(&config.pipeline),
             is_mapping: false,
             is_localizing: false,
             distance_traveled: 0.0,
@@ -256,8 +230,8 @@ impl SlamContext {
         match cmd {
             SlamCommand::StartMapping { map_id, name } => {
                 log::info!("Starting mapping: {} ({})", name, map_id);
-                self.slam.reset();
-                self.slam.set_mode(SlamMode::Mapping);
+                self.pipeline.slam_mut().reset();
+                self.pipeline.slam_mut().set_mode(SlamMode::Mapping);
                 self.is_mapping = true;
                 self.is_localizing = false;
                 self.distance_traveled = 0.0;
@@ -278,7 +252,7 @@ impl SlamContext {
 
             SlamCommand::StopMapping => {
                 log::info!("Stopping mapping");
-                self.slam.set_mode(SlamMode::Idle);
+                self.pipeline.slam_mut().set_mode(SlamMode::Idle);
                 self.is_mapping = false;
 
                 // Update shared state
@@ -294,7 +268,7 @@ impl SlamContext {
 
             SlamCommand::ClearMap => {
                 log::info!("Clearing map");
-                self.slam.reset();
+                self.pipeline.slam_mut().reset();
                 self.distance_traveled = 0.0;
                 self.last_pose_for_distance = Pose2D::identity();
 
@@ -314,10 +288,10 @@ impl SlamContext {
                 log::info!("Enabling map for localization: {} ({})", name, map_id);
 
                 // Set the reference map for localization matching
-                self.slam.set_reference_map(map.clone());
+                self.pipeline.slam_mut().set_reference_map(map.clone());
 
                 // Set localization mode
-                self.slam.set_mode(SlamMode::Localization);
+                self.pipeline.slam_mut().set_mode(SlamMode::Localization);
                 self.is_mapping = false;
                 self.is_localizing = true;
 
@@ -335,7 +309,7 @@ impl SlamContext {
                 log::warn!("Emergency stop activated!");
 
                 // Stop mapping/localization
-                self.slam.set_mode(SlamMode::Idle);
+                self.pipeline.slam_mut().set_mode(SlamMode::Idle);
                 self.is_mapping = false;
                 self.is_localizing = false;
 
@@ -378,7 +352,7 @@ impl SlamContext {
             let bumper_right_rising = bumper_right && !self.prev_bumper_state.1;
 
             if (bumper_left_rising || bumper_right_rising) && self.is_mapping {
-                let pose = self.slam.current_pose();
+                let pose = self.pipeline.slam().current_pose();
                 log::info!(
                     "Bumper triggered (left={}, right={}) at pose ({:.2}, {:.2}, {:.2}°) - marking obstacle",
                     bumper_left,
@@ -388,7 +362,7 @@ impl SlamContext {
                     pose.theta.to_degrees()
                 );
 
-                self.slam.mark_bumper_obstacle(
+                self.pipeline.slam_mut().mark_bumper_obstacle(
                     pose.x,
                     pose.y,
                     pose.theta,
@@ -435,33 +409,25 @@ impl SlamContext {
         timestamp_us: u64,
         shared_state: &SharedStateHandle,
     ) {
-        // Update odometry
-        if let Some(odom_pose) = self.odometry.update(left, right, gyro_yaw, timestamp_us) {
+        if let Some(odom_pose) = self
+            .pipeline
+            .on_odometry(left, right, gyro_yaw, timestamp_us)
+        {
             static ODOM_LOG_COUNT: std::sync::atomic::AtomicU32 =
                 std::sync::atomic::AtomicU32::new(0);
             let c = ODOM_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if c % 200 == 0 {
+            if c.is_multiple_of(200) {
                 log::debug!(
                     "[odom] left={} right={} gyro={} -> pose=({:.3},{:.3},{:.1}°)",
-                    left, right, gyro_yaw, odom_pose.x, odom_pose.y, odom_pose.theta.to_degrees()
+                    left,
+                    right,
+                    gyro_yaw,
+                    odom_pose.x,
+                    odom_pose.y,
+                    odom_pose.theta.to_degrees()
                 );
             }
-            // Every DynOdometry variant returns the CUMULATIVE odometry pose (the
-            // wrappers compose encoder deltas internally), so set(), not update().
-            // Composing it again (oangelo b81eee3) turns any motion into a spiral:
-            // replay of a mock 3-lap rectangle (18 m) drifted to 200 m. The zero
-            // odom_delta that commit chased was the dropped sensor channel (9753ae7).
-            self.odom_tracker.set(odom_pose);
-
-            // Interpolated pose: SLAM pose (do ultimo scan) + odometria acumulada
-            // desde esse scan. odom_pose aqui e o delta de UMA amostra (local);
-            // a referencia global do ultimo scan e last_odom_pose. Compose-los
-            // direto mistura local com global -> published_pose travava perto do
-            // scan e puxava a pose publicada pra tras (close_loop via -24° quando
-            // o scan matcher ja tinha -133°). Usar o tracker ACUMULADO desde o
-            // ultimo scan e' a interpolação correta.
-            let odom_delta = self.last_odom_pose.inverse().compose(&self.odom_tracker.pose());
-            let published_pose = self.slam.current_pose().compose(&odom_delta);
+            let published_pose = self.pipeline.interpolated_pose();
 
             // Update distance traveled
             let dx = published_pose.x - self.last_pose_for_distance.x;
@@ -496,18 +462,14 @@ impl SlamContext {
         timestamp_us: u64,
         shared_state: &SharedStateHandle,
     ) {
-        // Preprocess scan
-        let laser_scan = LaserScan::from_lidar_scan(lidar_data);
-        let scan_cloud = self.preprocessor.process(&laser_scan);
-
-        // Skip sparse scans
-        if scan_cloud.len() < 50 {
-            log::debug!("Skipping sparse scan: {} points", scan_cloud.len());
-            return;
-        }
+        let process = self.is_mapping || self.is_localizing;
+        let laser = LaserScan::from_lidar_scan(lidar_data);
+        let Some(step) = self.pipeline.on_scan(laser, timestamp_us, process) else {
+            return; // too sparse
+        };
 
         // Log scan processing decision (debug level - routine idle state)
-        if !self.is_mapping && !self.is_localizing {
+        if !process {
             static SKIP_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let count = SKIP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if count < 5 || count.is_multiple_of(50) {
@@ -520,17 +482,8 @@ impl SlamContext {
             }
         }
 
-        // Compute odometry delta since last scan
-        let current_odom = self.odom_tracker.pose();
-        let odom_delta = self.last_odom_pose.inverse().compose(&current_odom);
-
-        // Only process if mapping or localizing
-        if self.is_mapping || self.is_localizing {
-            // Process through OnlineSlam
-            let result = self
-                .slam
-                .process_scan(&scan_cloud, &odom_delta, timestamp_us);
-
+        if let Some(result) = &step.result {
+            let odom_delta = step.odom_delta;
             // Log pose updates at debug level (high frequency diagnostic data)
             static POSE_LOG_COUNT: std::sync::atomic::AtomicU32 =
                 std::sync::atomic::AtomicU32::new(0);
@@ -550,7 +503,7 @@ impl SlamContext {
 
             // Update shared state
             if let Ok(mut state) = shared_state.write() {
-                let status = self.slam.status();
+                let status = self.pipeline.slam().status();
                 state.update_from_slam(
                     result.pose,
                     if self.is_mapping {
@@ -561,14 +514,15 @@ impl SlamContext {
                         RobotState::Localizing
                     },
                     status.num_keyframes as u32,
-                    self.slam.total_loop_closures() as u32,
+                    self.pipeline.slam().total_loop_closures() as u32,
                     result.match_score,
                     timestamp_us,
                 );
 
                 // Update lidar data in sensor status
                 // Apply lidar angle_offset to transform from lidar frame to robot frame
-                let angle_offset = self.preprocessor.lidar_offset().total_theta();
+                let angle_offset = self.pipeline.preprocessor().lidar_offset().total_theta();
+                let laser_scan = &step.laser;
                 state.sensor_status.lidar_ranges = laser_scan.ranges.clone();
                 state.sensor_status.lidar_angles = (0..laser_scan.ranges.len())
                     .map(|i| {
@@ -583,7 +537,7 @@ impl SlamContext {
             // Data time, not wall time: same cadence live, deterministic on replay.
             if timestamp_us.saturating_sub(self.last_map_update_us) > 500_000 {
                 if let Ok(mut state) = shared_state.write() {
-                    let map = self.slam.global_map();
+                    let map = self.pipeline.slam_mut().global_map();
                     let (w, h) = map.dimensions();
                     log::debug!("Updating map in shared state: {}x{}", w, h);
                     state.update_map(map);
@@ -591,10 +545,6 @@ impl SlamContext {
                 self.last_map_update_us = timestamp_us;
             }
         }
-
-        // Update for next iteration
-        self.last_odom_pose = current_odom;
-        self.odom_tracker.take_snapshot();
     }
 
     /// Process sensor status from UDP receiver.
@@ -621,7 +571,7 @@ impl SlamContext {
 
         if (bumper_left_rising || bumper_right_rising) && self.is_mapping {
             // Get current pose for obstacle marking
-            let pose = self.slam.current_pose();
+            let pose = self.pipeline.slam().current_pose();
             log::info!(
                 "Bumper triggered (left={}, right={}) at pose ({:.2}, {:.2}, {:.2}°) - marking obstacle",
                 data.bumper_left,
@@ -632,7 +582,7 @@ impl SlamContext {
             );
 
             // Mark obstacle in map
-            self.slam.mark_bumper_obstacle(
+            self.pipeline.slam_mut().mark_bumper_obstacle(
                 pose.x,
                 pose.y,
                 pose.theta,
@@ -728,8 +678,8 @@ pub fn run_replay(
     std::fs::create_dir_all(out_dir)?;
     let shared_state = crate::state::create_shared_state();
     let mut ctx = SlamContext::new(&config);
-    ctx.slam.reset();
-    ctx.slam.set_mode(SlamMode::Mapping);
+    ctx.pipeline.slam_mut().reset();
+    ctx.pipeline.slam_mut().set_mode(SlamMode::Mapping);
     ctx.is_mapping = true;
 
     let mut csv = std::io::BufWriter::new(std::fs::File::create(out_dir.join("timing.csv"))?);
@@ -767,8 +717,8 @@ pub fn run_replay(
                     let t0 = Instant::now();
                     ctx.process_udp_lidar(&d, &shared_state);
                     let ms = t0.elapsed().as_secs_f64() * 1e3;
-                    let p = ctx.slam.current_pose();
-                    let st = ctx.slam.status();
+                    let p = ctx.pipeline.slam().current_pose();
+                    let st = ctx.pipeline.slam().status();
                     let score = shared_state
                         .read()
                         .map(|s| s.robot_status.localization_confidence)
@@ -798,7 +748,11 @@ pub fn run_replay(
     csv.flush()?;
 
     // Map in ROS map_server format (0 occupied, 254 free, 205 unknown).
-    let map = crate::state::CurrentMapData::from_occupancy_grid(ctx.slam.global_map(), "replay", "replay");
+    let map = crate::state::CurrentMapData::from_occupancy_grid(
+        ctx.pipeline.slam_mut().global_map(),
+        "replay",
+        "replay",
+    );
     let (w, h) = (map.width as usize, map.height as usize);
     let mut pgm = std::io::BufWriter::new(std::fs::File::create(out_dir.join("map.pgm"))?);
     write!(pgm, "P5\n{} {}\n255\n", w, h)?;
