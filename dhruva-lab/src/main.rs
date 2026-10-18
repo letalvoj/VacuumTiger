@@ -42,6 +42,24 @@ struct Args {
     /// Data seconds between map snapshots in the trace (an unchanged map is skipped).
     #[arg(long, default_value_t = 5.0, value_parser = positive)]
     map_every: f64,
+    /// Replay only part of the recording: A:B as fractions of its sensor time span
+    /// (0.4:0.6 = the middle fifth), starting cold like a run that started there.
+    /// Same cut as `tools/py/sgio2bag.py --window` makes for the reference SLAMs.
+    #[arg(long, default_value = "0:1", value_parser = window)]
+    window: (f64, f64),
+}
+
+fn window(s: &str) -> Result<(f64, f64), String> {
+    let (a, b) = s.split_once(':').ok_or("expected A:B")?;
+    let (a, b): (f64, f64) = (
+        a.parse().map_err(|_| format!("{a}: not a number"))?,
+        b.parse().map_err(|_| format!("{b}: not a number"))?,
+    );
+    if (0.0..b).contains(&a) && b <= 1.0 {
+        Ok((a, b))
+    } else {
+        Err(format!("{s}: need 0 <= A < B <= 1"))
+    }
 }
 
 fn positive(s: &str) -> Result<f64, String> {
@@ -83,7 +101,13 @@ fn run(args: Args) -> Result<(), String> {
     let mut last_map_us = 0u64;
     let wall = Instant::now();
 
+    let (lo, hi) = window_bounds_us(&args.recording, args.window)?;
     for_each_sample(&args.recording, |sample| {
+        // Compared as f64 on purpose: the same cut as sgio2bag.py, see window_bounds_us.
+        let t = sample.timestamp_us() as f64;
+        if t < lo || t > hi {
+            return Ok(());
+        }
         match sample {
             Sample::Status(s) => {
                 pipeline.on_odometry(
@@ -155,6 +179,30 @@ fn run(args: Args) -> Result<(), String> {
         args.out.display()
     );
     Ok(())
+}
+
+/// The inclusive data-time bounds (us) of a window given as fractions of the
+/// recording's sensor time span.
+///
+/// Must cut exactly where `tools/py/sgio2bag.py --window` (`window_us`) cuts the
+/// bags for the reference SLAMs, so it does the same IEEE arithmetic: f64 bounds
+/// `t0 + f * (t1 - t0)`, compared with the f64 sample time (exact: < 2^53).
+fn window_bounds_us(recording: &std::path::Path, (a, b): (f64, f64)) -> Result<(f64, f64), String> {
+    if (a, b) == (0.0, 1.0) {
+        return Ok((f64::NEG_INFINITY, f64::INFINITY));
+    }
+    let (mut t0, mut t1) = (u64::MAX, 0);
+    for_each_sample(recording, |s| {
+        t0 = t0.min(s.timestamp_us());
+        t1 = t1.max(s.timestamp_us());
+        Ok(())
+    })
+    .map_err(|e| format!("{}: {e}", recording.display()))?;
+    if t0 > t1 {
+        return Err(format!("{}: no sensor samples", recording.display()));
+    }
+    let at = |f: f64| t0 as f64 + f * (t1 - t0) as f64;
+    Ok((at(a), at(b)))
 }
 
 fn write_traj(path: &std::path::Path, rows: &[PoseRow]) -> Result<(), String> {
