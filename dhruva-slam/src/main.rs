@@ -1,47 +1,5 @@
-//! DhruvaSLAM - Modular SLAM implementation for robotic vacuum cleaners
-//!
-//! Production-optimized SLAM daemon using:
-//! - **Matcher**: Configurable scan matching (MultiRes, ICP, Correlative, Hybrid)
-//! - **Odometry**: Configurable fusion (Mahony, ESKF, Complementary, Wheel-only)
-//! - **Maps**: Dual representation (Occupancy Grid + Feature-based)
-//! - **Loop Closure**: LiDAR-IRIS descriptor + Sparse CG optimization
-//!
-//! # Architecture
-//!
-//! The crate is organized into 5 logical layers:
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────┐
-//! │                      main                           │  ← Entry point
-//! └─────────────────────────────────────────────────────┘
-//!                          │
-//! ┌─────────────────────────────────────────────────────┐
-//! │                      io/                            │  ← Infrastructure
-//! │            (sangam_client, streaming)               │
-//! └─────────────────────────────────────────────────────┘
-//!                          │
-//! ┌─────────────────────────────────────────────────────┐
-//! │                    engine/                          │  ← Orchestration
-//! │              (slam, graph optimization)             │
-//! └─────────────────────────────────────────────────────┘
-//!                          │
-//! ┌─────────────────────────────────────────────────────┐
-//! │                  algorithms/                        │  ← Core algorithms
-//! │         (matching, mapping, localization)           │
-//! └─────────────────────────────────────────────────────┘
-//!                          │
-//! ┌─────────────────────────────────────────────────────┐
-//! │                   sensors/                          │  ← Sensor processing
-//! │            (odometry, preprocessing)                │
-//! └─────────────────────────────────────────────────────┘
-//!                          │
-//! ┌─────────────────────────────────────────────────────┐
-//! │                     core/                           │  ← Foundation
-//! │                (types, math)                        │
-//! └─────────────────────────────────────────────────────┘
-//! ```
-//!
-//! # Usage
+//! dhruva-slam daemon: the SLAM threads of the `dhruva_slam` library behind a TCP
+//! stream, or an offline `--replay` of a recording.
 //!
 //! ```bash
 //! # With default config
@@ -50,42 +8,14 @@
 //! # With custom config file
 //! cargo run --release -- --config dhruva-slam.toml
 //!
-//! # With command line overrides
-//! cargo run --release -- --sangam 192.168.68.101:5555 --port 5557
+//! # Offline replay
+//! cargo run --release -- -c dhruva-v8.toml --replay run.mcap --out /tmp/out
 //! ```
-
-// Layer 1: Core foundation (no internal deps)
-mod core;
-
-// Layer 2: Sensor processing (depends on core)
-mod sensors;
-
-// Layer 3: Algorithms (depends on core, sensors)
-mod algorithms;
-
-// Layer 4: SLAM engine (depends on core, sensors, algorithms)
-mod engine;
-
-// Layer 5: I/O infrastructure (depends on all layers)
-mod io;
-
-// Layer 6: Multi-threaded state management
-mod state;
-
-// Layer 7: Thread infrastructure
-mod threads;
-
-// Layer 8: Autonomous exploration
-mod exploration;
-
-// Layer 9: Navigation (path planning and execution)
-mod navigation;
 
 // ============================================================================
 // Imports
 // ============================================================================
 
-use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -93,591 +23,20 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
-
-use crate::algorithms::descriptors::LidarIrisConfig;
-use crate::algorithms::mapping::{MapIntegratorConfig, OccupancyGridConfig};
-use crate::algorithms::matching::{
-    CorrelativeConfig, DynMatcherConfig, IcpConfig, MatcherType, MultiResolutionConfig,
-    PointToLineIcpConfig, RobustKernel,
+use dhruva_slam::algorithms::planning::AStarConfig;
+use dhruva_slam::config::{Config, build_slam_thread_config};
+use dhruva_slam::exploration::FrontierConfig;
+use dhruva_slam::io::map_manager::MapManager;
+use dhruva_slam::io::motion_controller::{MotionConfig, create_shared_motion_controller};
+use dhruva_slam::navigation::NavigatorConfig;
+use dhruva_slam::state::{
+    CommandReceiver, CommandSender, SharedStateHandle, create_command_channel, create_shared_state,
 };
-use crate::algorithms::planning::AStarConfig;
-use crate::engine::graph::{GraphOptimizerConfig, LoopDetectorConfig};
-use crate::engine::slam::{
-    KeyframeManagerConfig, LoopClosureConfig as SlamLoopClosureConfig, OnlineSlamConfig,
-    SubmapManagerConfig,
-};
-use crate::exploration::FrontierConfig;
-use crate::io::map_manager::MapManager;
-use crate::io::motion_controller::{MotionConfig, create_shared_motion_controller};
-use crate::navigation::NavigatorConfig;
-use crate::sensors::odometry::{
-    DynOdometryConfig, MahonyConfig, OdometryType, WheelOdometryConfig,
-};
-use crate::sensors::preprocessing::{
-    AngularDownsamplerConfig, LidarOffset, OutlierFilterConfig, PreprocessorConfig,
-    RangeFilterConfig,
-};
-use crate::state::{create_command_channel, create_shared_state};
-use crate::threads::{
+use dhruva_slam::threads::{
     ExplorationConfig, ExplorationThread, NavigationThread, NavigationThreadConfig,
     PublisherThread, SlamThread, SlamThreadConfig, StreamConfig as ThreadStreamConfig,
-    create_nav_channel,
+    create_nav_channel, run_replay,
 };
-
-// ============================================================================
-// Configuration
-// ============================================================================
-
-#[derive(Debug, Deserialize, Default)]
-struct Config {
-    #[serde(default)]
-    source: SourceConfig,
-    #[serde(default)]
-    output: OutputConfig,
-    #[serde(default)]
-    stream: StreamConfig,
-    #[serde(default)]
-    map_storage: MapStorageConfig,
-    #[serde(default)]
-    preprocessing: PreprocessingConfig,
-    #[serde(default)]
-    slam: SlamConfig,
-    #[serde(default)]
-    lidar: LidarConfig,
-    #[serde(default)]
-    odometry: OdometryConfig,
-    #[serde(default)]
-    matcher: MatcherConfig,
-    #[serde(default)]
-    keyframe: KeyframeConfig,
-    #[serde(default)]
-    submap: SubmapConfig,
-    #[serde(default)]
-    map: MapConfig,
-    #[serde(default)]
-    loop_closure: LoopClosureConfig,
-    #[serde(default)]
-    optimization: OptimizationConfig,
-    #[serde(default)]
-    exploration: ExplorationCfg,
-    #[serde(default)]
-    navigation: NavigationConfig,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct SourceConfig {
-    /// SangamIO address for TCP commands and UDP sensor data
-    /// Format: "host:port" (e.g., "192.168.68.101:5555")
-    /// Both TCP and UDP use the same port for simpler configuration.
-    sangam_address: String,
-    /// UDP port override for sensor streaming (optional).
-    /// If specified, UDP receiver will bind to this port instead of the TCP port.
-    /// Useful for localhost testing where TCP and UDP need different ports.
-    udp_port: Option<u16>,
-}
-
-impl Default for SourceConfig {
-    fn default() -> Self {
-        Self {
-            sangam_address: "192.168.68.101:5555".to_string(),
-            udp_port: None,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct OutputConfig {
-    bind_port: u16,
-    odometry_rate_hz: f32,
-    map_rate_hz: f32,
-    feature_rate_hz: f32,
-}
-
-impl Default for OutputConfig {
-    fn default() -> Self {
-        Self {
-            bind_port: 5557,
-            odometry_rate_hz: 50.0,
-            map_rate_hz: 1.0,
-            feature_rate_hz: 0.2, // Every 5 seconds
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct StreamConfig {
-    robot_status_hz: f32,
-    sensor_status_hz: f32,
-    map_hz: f32,
-    navigation_hz: f32,
-}
-
-impl Default for StreamConfig {
-    fn default() -> Self {
-        Self {
-            robot_status_hz: 10.0,
-            sensor_status_hz: 10.0,
-            map_hz: 1.0,
-            navigation_hz: 5.0,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct MapStorageConfig {
-    path: String,
-}
-
-impl Default for MapStorageConfig {
-    fn default() -> Self {
-        Self {
-            path: "/var/lib/dhruva/maps".to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct PreprocessingConfig {
-    min_range: f32,
-    max_range: f32,
-    target_points: usize,
-    min_angle_step: f32,
-}
-
-impl Default for PreprocessingConfig {
-    fn default() -> Self {
-        Self {
-            min_range: 0.15,
-            max_range: 8.0,
-            target_points: 180,
-            min_angle_step: 0.0175, // ~1 degree
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct SlamConfig {
-    min_match_score: f32,
-    lost_threshold: f32,
-    min_scan_points: usize,
-    encoder_weight: f32,
-    use_submap_matching: bool,
-    /// Maximum rotation deviation from odometry before rejecting scan match (radians)
-    max_theta_deviation: f32,
-    /// Maximum translation deviation from odometry before rejecting scan match (meters)
-    max_translation_deviation: f32,
-    /// Reference-scan matching: move the reference after this distance (m); 0 = scan-to-scan
-    reference_update_distance: f32,
-    /// ... or after this rotation (rad)
-    reference_update_angle: f32,
-}
-
-impl Default for SlamConfig {
-    fn default() -> Self {
-        Self {
-            min_match_score: 0.3,
-            lost_threshold: 0.1,
-            min_scan_points: 50,
-            encoder_weight: 0.8,
-            use_submap_matching: false,
-            max_theta_deviation: 0.35,      // ~20 degrees
-            max_translation_deviation: 0.5, // 50cm
-            reference_update_distance: 0.0,
-            reference_update_angle: 0.3,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct LidarConfig {
-    mounting_x: f32,
-    mounting_y: f32,
-    optical_offset: f32,
-    angle_offset: f32,
-}
-
-impl Default for LidarConfig {
-    fn default() -> Self {
-        Self {
-            mounting_x: -0.0936,
-            mounting_y: 0.0,
-            optical_offset: 0.0258,
-            angle_offset: 0.0,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct OdometryConfig {
-    /// Odometry algorithm: "wheel", "complementary", "eskf", "mahony"
-    algorithm: String,
-    /// Encoder ticks per meter of wheel travel
-    ticks_per_meter: f32,
-    /// Distance between wheel centers in meters
-    wheel_base: f32,
-}
-
-impl Default for OdometryConfig {
-    fn default() -> Self {
-        Self {
-            algorithm: "mahony".to_string(),
-            // CRL-200S defaults measured on this unit (2026-09-30, tape measure):
-            // 1 tick = 0.2214 mm -> 4516.7 ticks/m; 209 mm wheel base.
-            ticks_per_meter: 4516.7,
-            wheel_base: 0.209,
-        }
-    }
-}
-
-impl OdometryConfig {
-    fn algorithm_type(&self) -> OdometryType {
-        match self.algorithm.to_lowercase().as_str() {
-            "wheel" => OdometryType::Wheel,
-            "complementary" => OdometryType::Complementary,
-            "eskf" => OdometryType::Eskf,
-            _ => OdometryType::Mahony,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct MatcherConfig {
-    /// Matcher algorithm: "icp", "p2l", "correlative", "multi_res", "hybrid_icp", "hybrid_p2l"
-    algorithm: String,
-    /// Always run correlative first
-    always_correlative: bool,
-    /// Encoder weight for initial guess
-    encoder_weight: f32,
-    // Correlative search window
-    search_window_x: f32,
-    search_window_y: f32,
-    search_window_theta: f32,
-    linear_resolution: f32,
-    angular_resolution: f32,
-    grid_resolution: f32,
-    correlative_min_score: f32,
-    // ICP configuration
-    icp_max_iterations: u32,
-    icp_translation_epsilon: f32,
-    icp_rotation_epsilon: f32,
-    icp_max_correspondence_distance: f32,
-    icp_min_correspondences: usize,
-    icp_outlier_ratio: f32,
-    icp_robust_kernel: String,
-    icp_kernel_scale: f32,
-    // Multi-resolution matcher search window (coarse level); defaults match
-    // MultiResolutionConfig::default() (0.5 m, 0.5 rad).
-    multires_window_xy: f32,
-    multires_window_theta: f32,
-    multires_levels: usize,
-}
-
-impl Default for MatcherConfig {
-    fn default() -> Self {
-        Self {
-            algorithm: "hybrid_p2l".to_string(),
-            always_correlative: true,
-            encoder_weight: 1.0,
-            search_window_x: 0.3,
-            search_window_y: 0.3,
-            search_window_theta: 0.5,
-            linear_resolution: 0.03,
-            angular_resolution: 0.03,
-            grid_resolution: 0.05,
-            correlative_min_score: 0.4,
-            icp_max_iterations: 50,
-            icp_translation_epsilon: 0.001,
-            icp_rotation_epsilon: 0.001,
-            icp_max_correspondence_distance: 0.5,
-            icp_min_correspondences: 10,
-            icp_outlier_ratio: 0.1,
-            icp_robust_kernel: "welsch".to_string(),
-            icp_kernel_scale: 0.1,
-            multires_window_xy: 0.5,
-            multires_window_theta: 0.5,
-            multires_levels: 3,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct KeyframeConfig {
-    min_translation: f32,
-    min_rotation: f32,
-    max_keyframes: usize,
-    min_interval_ms: u64,
-}
-
-impl Default for KeyframeConfig {
-    fn default() -> Self {
-        Self {
-            min_translation: 0.5,
-            min_rotation: 0.5,
-            max_keyframes: 1000,
-            min_interval_ms: 500,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct SubmapConfig {
-    scans_per_submap: u32,
-    overlap_scans: u32,
-    max_active_submaps: usize,
-}
-
-impl Default for SubmapConfig {
-    fn default() -> Self {
-        Self {
-            scans_per_submap: 100,
-            overlap_scans: 10,
-            max_active_submaps: 2,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct MapConfig {
-    resolution: f32,
-    initial_width: f32,
-    initial_height: f32,
-    log_odds_occupied: f32,
-    log_odds_free: f32,
-    log_odds_max: f32,
-    log_odds_min: f32,
-    occupied_threshold: f32,
-    free_threshold: f32,
-}
-
-impl Default for MapConfig {
-    fn default() -> Self {
-        Self {
-            resolution: 0.02,
-            initial_width: 20.0,
-            initial_height: 20.0,
-            log_odds_occupied: 0.9,
-            log_odds_free: -0.7,
-            log_odds_max: 50.0,
-            log_odds_min: -50.0,
-            occupied_threshold: 0.5,
-            free_threshold: -0.5,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct LoopClosureConfig {
-    enabled: bool,
-    detection_interval: usize,
-    min_keyframe_gap: usize,
-    optimization_threshold: usize,
-    max_candidates: usize,
-    #[serde(default)]
-    iris: IrisConfig,
-    #[serde(default)]
-    matching: LoopMatchingConfig,
-}
-
-impl Default for LoopClosureConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            detection_interval: 5,
-            min_keyframe_gap: 20,
-            optimization_threshold: 3,
-            max_candidates: 5,
-            iris: IrisConfig::default(),
-            matching: LoopMatchingConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct IrisConfig {
-    num_rows: usize,
-    num_cols: usize,
-    max_range: f32,
-    signature_bits: usize,
-}
-
-impl Default for IrisConfig {
-    fn default() -> Self {
-        Self {
-            num_rows: 80,
-            num_cols: 360,
-            max_range: 8.0,
-            signature_bits: 640,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct LoopMatchingConfig {
-    max_hamming_distance: u32,
-    min_icp_score: f32,
-}
-
-impl Default for LoopMatchingConfig {
-    fn default() -> Self {
-        Self {
-            max_hamming_distance: 100,
-            min_icp_score: 0.5,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct OptimizationConfig {
-    solver: String,
-    max_iterations: usize,
-    tolerance: f64,
-}
-
-impl Default for OptimizationConfig {
-    fn default() -> Self {
-        Self {
-            solver: "sparse_cg".to_string(),
-            max_iterations: 50,
-            tolerance: 1e-6,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct ExplorationCfg {
-    /// Enable exploration thread.
-    enabled: bool,
-    /// Exploration strategy: "frontier".
-    strategy: String,
-    /// Loop rate for exploration thread (Hz).
-    loop_rate_hz: f32,
-    #[serde(default)]
-    motion: ExplorationMotionConfig,
-    #[serde(default)]
-    frontier: ExplorationFrontierConfig,
-}
-
-impl Default for ExplorationCfg {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            strategy: "frontier".to_string(),
-            loop_rate_hz: 10.0,
-            motion: ExplorationMotionConfig::default(),
-            frontier: ExplorationFrontierConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct ExplorationMotionConfig {
-    /// Maximum linear velocity (m/s).
-    max_linear_vel: f32,
-    /// Maximum angular velocity (rad/s).
-    max_angular_vel: f32,
-    /// Minimum distance from obstacles (m).
-    obstacle_clearance: f32,
-    /// Normal linear velocity (m/s).
-    linear_vel: f32,
-    /// Normal angular velocity for rotation (rad/s).
-    angular_vel: f32,
-}
-
-impl Default for ExplorationMotionConfig {
-    fn default() -> Self {
-        Self {
-            max_linear_vel: 0.3,
-            max_angular_vel: 0.5,
-            obstacle_clearance: 0.15,
-            linear_vel: 0.2,
-            angular_vel: 0.3,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct ExplorationFrontierConfig {
-    /// Minimum frontier size to consider (cells).
-    min_frontier_size: usize,
-    /// Maximum detection range (m).
-    detection_range: f32,
-    /// Radius to block after bumper trigger (m).
-    blocked_radius: f32,
-    /// Clustering threshold for frontier grouping (m).
-    clustering_threshold: f32,
-}
-
-impl Default for ExplorationFrontierConfig {
-    fn default() -> Self {
-        Self {
-            min_frontier_size: 5,
-            detection_range: 10.0,
-            blocked_radius: 0.3,
-            clustering_threshold: 0.5,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct NavigationConfig {
-    /// Enable navigation thread.
-    enabled: bool,
-    /// Update rate for navigation thread (Hz).
-    update_rate_hz: f32,
-    /// Robot radius for A* inflation (m).
-    robot_radius: f32,
-    /// Safety margin beyond robot radius (m).
-    /// Adds extra clearance to prevent getting too close to walls.
-    safety_margin: f32,
-    /// Maximum linear velocity (m/s).
-    max_linear_vel: f32,
-    /// Maximum angular velocity (rad/s).
-    max_angular_vel: f32,
-    /// Waypoint reached threshold (m).
-    waypoint_threshold: f32,
-    /// Heading threshold (rad).
-    heading_threshold: f32,
-    /// Treat unknown cells as obstacles for path planning.
-    /// Set to false to allow navigation through unexplored areas.
-    unknown_is_obstacle: bool,
-}
-
-impl Default for NavigationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            update_rate_hz: 10.0,
-            robot_radius: 0.18,
-            safety_margin: 0.10, // 10cm extra clearance from walls
-            max_linear_vel: 0.3,
-            max_angular_vel: 0.5,
-            waypoint_threshold: 0.15,
-            heading_threshold: 0.15,
-            unknown_is_obstacle: true,
-        }
-    }
-}
 
 // ============================================================================
 // CLI Arguments
@@ -744,7 +103,9 @@ fn print_help() {
     println!();
     println!("OPTIONS:");
     println!("    -c, --config <FILE>     Configuration file (default: dhruva-slam.toml)");
-    println!("        --replay <PATH>     Offline: run SLAM over a recording (.mcap, run dir, .sgio) and exit");
+    println!(
+        "        --replay <PATH>     Offline: run SLAM over a recording (.mcap, run dir, .sgio) and exit"
+    );
     println!("        --out <DIR>         Output dir for --replay (default: replay_out)");
     println!("    -h, --help              Print help information");
     println!();
@@ -762,183 +123,26 @@ fn print_help() {
 
 fn load_config(args: &Args) -> Config {
     match &args.config_path {
-        Some(path) => match fs::read_to_string(path) {
-            Ok(contents) => match basic_toml::from_str(&contents) {
-                Ok(cfg) => {
-                    log::info!("Loaded config from {}", path);
-                    cfg
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse config {}: {}", path, e);
-                    Config::default()
-                }
-            },
+        Some(path) => match Config::from_file(Path::new(path)) {
+            Ok(cfg) => {
+                log::info!("Loaded config from {}", path);
+                cfg
+            }
             Err(e) => {
-                log::warn!("Failed to read config {}: {}", path, e);
+                log::warn!("Failed to load config: {}", e);
                 Config::default()
             }
         },
         None => {
             // Try default paths
             for path in &["dhruva-slam.toml", "/etc/dhruva-slam.toml"] {
-                if let Ok(contents) = fs::read_to_string(path)
-                    && let Ok(cfg) = basic_toml::from_str(&contents)
-                {
+                if let Ok(cfg) = Config::from_file(Path::new(path)) {
                     log::info!("Loaded config from {}", path);
                     return cfg;
                 }
             }
             Config::default()
         }
-    }
-}
-
-/// Build OnlineSlamConfig from TOML configuration.
-fn build_slam_config(config: &Config) -> OnlineSlamConfig {
-    // Parse matcher type from config string
-    let matcher_type = match config.matcher.algorithm.to_lowercase().as_str() {
-        "icp" => MatcherType::Icp,
-        "p2l" => MatcherType::P2l,
-        "correlative" => MatcherType::Correlative,
-        "multi_res" => MatcherType::MultiRes,
-        "hybrid_icp" => MatcherType::HybridIcp,
-        _ => MatcherType::HybridP2l, // default
-    };
-
-    // Build correlative config from matcher settings
-    let correlative_config = CorrelativeConfig {
-        search_window_x: config.matcher.search_window_x,
-        search_window_y: config.matcher.search_window_y,
-        search_window_theta: config.matcher.search_window_theta,
-        linear_resolution: config.matcher.linear_resolution,
-        angular_resolution: config.matcher.angular_resolution,
-        grid_resolution: config.matcher.grid_resolution,
-        min_score: config.matcher.correlative_min_score,
-    };
-
-    // Build P2P ICP config from matcher settings (with robust kernel)
-    let robust_kernel = match config.matcher.icp_robust_kernel.to_lowercase().as_str() {
-        "huber" => RobustKernel::Huber,
-        "cauchy" => RobustKernel::Cauchy,
-        "welsch" => RobustKernel::Welsch,
-        _ => RobustKernel::None,
-    };
-
-    let icp_config = IcpConfig {
-        max_iterations: config.matcher.icp_max_iterations,
-        translation_epsilon: config.matcher.icp_translation_epsilon,
-        rotation_epsilon: config.matcher.icp_rotation_epsilon,
-        max_correspondence_distance: config.matcher.icp_max_correspondence_distance,
-        min_correspondences: config.matcher.icp_min_correspondences,
-        outlier_ratio: config.matcher.icp_outlier_ratio,
-        robust_kernel,
-        kernel_scale: config.matcher.icp_kernel_scale,
-        ..Default::default()
-    };
-
-    // Build P2L ICP config from matcher settings
-    // Note: P2L ICP doesn't support robust kernels - those are only in P2P ICP
-    let p2l_config = PointToLineIcpConfig {
-        max_iterations: config.matcher.icp_max_iterations,
-        translation_epsilon: config.matcher.icp_translation_epsilon,
-        rotation_epsilon: config.matcher.icp_rotation_epsilon,
-        max_correspondence_distance: config.matcher.icp_max_correspondence_distance,
-        min_correspondences: config.matcher.icp_min_correspondences,
-        outlier_ratio: config.matcher.icp_outlier_ratio,
-        ..Default::default()
-    };
-
-    // Build multi-resolution config (uses default values for most settings)
-    let multi_res_config = MultiResolutionConfig {
-        min_score: config.matcher.correlative_min_score,
-        coarse_search_window_xy: config.matcher.multires_window_xy,
-        coarse_search_window_theta: config.matcher.multires_window_theta,
-        num_levels: config.matcher.multires_levels.max(1),
-        ..Default::default()
-    };
-
-    // Build dynamic matcher config
-    let matcher_config = DynMatcherConfig {
-        correlative: correlative_config,
-        icp: icp_config,
-        p2l: p2l_config,
-        multi_res: multi_res_config,
-        always_correlative: config.matcher.always_correlative,
-        encoder_weight: config.matcher.encoder_weight,
-    };
-
-    // Build global map config
-    let global_map_config = OccupancyGridConfig {
-        resolution: config.map.resolution,
-        initial_width: config.map.initial_width,
-        initial_height: config.map.initial_height,
-        log_odds_occupied: config.map.log_odds_occupied,
-        log_odds_free: config.map.log_odds_free,
-        log_odds_max: config.map.log_odds_max,
-        log_odds_min: config.map.log_odds_min,
-        occupied_threshold: config.map.occupied_threshold,
-        free_threshold: config.map.free_threshold,
-    };
-
-    // Build keyframe manager config
-    let keyframe_config = KeyframeManagerConfig {
-        min_translation: config.keyframe.min_translation,
-        min_rotation: config.keyframe.min_rotation,
-        max_keyframes: config.keyframe.max_keyframes,
-        min_interval_us: config.keyframe.min_interval_ms * 1000,
-    };
-
-    // Build submap manager config
-    let submap_config = SubmapManagerConfig {
-        grid_config: OccupancyGridConfig {
-            resolution: config.map.resolution,
-            initial_width: 10.0, // Smaller for submaps
-            initial_height: 10.0,
-            ..global_map_config.clone()
-        },
-        integrator_config: MapIntegratorConfig::default(),
-        scans_per_submap: config.submap.scans_per_submap,
-        overlap_scans: config.submap.overlap_scans,
-    };
-
-    OnlineSlamConfig {
-        keyframe: keyframe_config,
-        submap: submap_config,
-        matcher_type,
-        matcher: matcher_config,
-        global_map: global_map_config,
-        min_match_score: config.slam.min_match_score,
-        lost_threshold: config.slam.lost_threshold,
-        use_submap_matching: config.slam.use_submap_matching,
-        min_scan_points: config.slam.min_scan_points,
-        max_theta_deviation: config.slam.max_theta_deviation,
-        max_translation_deviation: config.slam.max_translation_deviation,
-        reference_update_distance: config.slam.reference_update_distance,
-        reference_update_angle: config.slam.reference_update_angle,
-        loop_closure: SlamLoopClosureConfig {
-            enabled: config.loop_closure.enabled,
-            detection_interval: config.loop_closure.detection_interval,
-            optimization_threshold: config.loop_closure.optimization_threshold,
-            detector: LoopDetectorConfig {
-                min_node_distance: config.loop_closure.min_keyframe_gap,
-                max_hamming_distance: config.loop_closure.matching.max_hamming_distance,
-                min_match_score: config.loop_closure.matching.min_icp_score,
-                max_candidates: config.loop_closure.max_candidates,
-                iris_config: LidarIrisConfig {
-                    num_rows: config.loop_closure.iris.num_rows,
-                    num_cols: config.loop_closure.iris.num_cols,
-                    max_range: config.loop_closure.iris.max_range,
-                    signature_bits: config.loop_closure.iris.signature_bits,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            optimizer: GraphOptimizerConfig {
-                max_iterations: config.optimization.max_iterations as u32,
-                convergence_threshold: config.optimization.tolerance,
-                ..Default::default()
-            },
-        },
     }
 }
 
@@ -966,11 +170,15 @@ fn main() {
     if let Some(input) = &args.replay {
         let out = args.out.clone().unwrap_or_else(|| "replay_out".to_string());
         let cfg = build_slam_thread_config(&config);
-        match threads::run_replay(cfg, Path::new(input), Path::new(&out)) {
+        match run_replay(cfg, Path::new(input), Path::new(&out)) {
             Ok(r) => {
                 let mut ms = r.scan_ms.clone();
                 ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let pct = |p: f64| ms.get(((ms.len() as f64 - 1.0) * p) as usize).copied().unwrap_or(0.0);
+                let pct = |p: f64| {
+                    ms.get(((ms.len() as f64 - 1.0) * p) as usize)
+                        .copied()
+                        .unwrap_or(0.0)
+                };
                 let mean = ms.iter().sum::<f64>() / ms.len().max(1) as f64;
                 println!(
                     "replay: {} scans, {} sensor msgs, data {:.1} s, wall {:.2} s ({:.1}x realtime)",
@@ -1107,52 +315,13 @@ fn run_threaded_mode(
     )
 }
 
-/// SLAM thread config from the TOML config (shared by the daemon and `--replay`).
-fn build_slam_thread_config(config: &Config) -> SlamThreadConfig {
-    let slam_config = build_slam_config(config);
-    let odometry_config = DynOdometryConfig {
-        wheel: WheelOdometryConfig {
-            ticks_per_meter: config.odometry.ticks_per_meter,
-            wheel_base: config.odometry.wheel_base,
-        },
-        mahony: MahonyConfig::default(),
-        ..Default::default()
-    };
-    let preprocessor_config = PreprocessorConfig {
-        range_filter: RangeFilterConfig {
-            min_range: config.preprocessing.min_range,
-            max_range: config.preprocessing.max_range,
-        },
-        outlier_filter: OutlierFilterConfig::default(),
-        downsampler: AngularDownsamplerConfig {
-            target_points: config.preprocessing.target_points,
-            min_angle_step: config.preprocessing.min_angle_step,
-        },
-        lidar_offset: LidarOffset::new(
-            config.lidar.mounting_x,
-            config.lidar.mounting_y,
-            config.lidar.optical_offset,
-            config.lidar.angle_offset,
-        ),
-    };
-
-    SlamThreadConfig {
-        sangam_address: config.source.sangam_address.clone(),
-        udp_port: config.source.udp_port,
-        slam_config,
-        odometry_type: config.odometry.algorithm_type(),
-        odometry_config,
-        preprocessor_config,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run_threaded_mode_rest(
     config: &Config,
     running: Arc<AtomicBool>,
-    shared_state: crate::state::SharedStateHandle,
-    command_tx: crate::state::CommandSender,
-    command_rx: crate::state::CommandReceiver,
+    shared_state: SharedStateHandle,
+    command_tx: CommandSender,
+    command_rx: CommandReceiver,
     map_manager: Arc<Mutex<MapManager>>,
     slam_thread_config: SlamThreadConfig,
     stream_config: ThreadStreamConfig,
