@@ -6,6 +6,8 @@ const target = process.env.DWAR ?? "http://127.0.0.1:8080";
 
 export default defineConfig({
   plugins: [preact()],
+  // Relative asset URLs: the UI also works behind a proxy prefix.
+  base: "./",
   build: { outDir: "dist", emptyOutDir: true, target: "es2020" },
   server: { proxy: { "/api": { target, ws: true } } },
 });

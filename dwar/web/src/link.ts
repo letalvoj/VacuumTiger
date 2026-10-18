@@ -25,9 +25,12 @@ function token(): string | null {
 
 const TOKEN = token();
 
-/** URL for a plain link (download) that carries the token if one is set. */
+/** API paths are relative to the page, so the UI works under any prefix (e.g. a proxy's /vacuum/). */
+const API = "api/v1";
+
+/** Page-relative URL for a plain link (download) that carries the token if one is set. */
 export function apiUrl(path: string): string {
-  return `/api/v1${path}${TOKEN ? `${path.includes("?") ? "&" : "?"}token=${encodeURIComponent(TOKEN)}` : ""}`;
+  return `${API}${path}${TOKEN ? `${path.includes("?") ? "&" : "?"}token=${encodeURIComponent(TOKEN)}` : ""}`;
 }
 
 /** Generous default: a lidar enable blocks SangamIO for ~20 s. */
@@ -43,7 +46,7 @@ export async function api(path: string, method = "GET", body?: unknown, timeoutM
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), timeoutMs);
   try {
-    const r = await fetch(`/api/v1${path}`, {
+    const r = await fetch(`${API}${path}`, {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -138,8 +141,9 @@ export class Link {
 
   private open() {
     if (this.closed || this.ws) return;
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}${apiUrl("/ws")}`);
+    const url = new URL(apiUrl("/ws"), location.href);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
     // A connect hanging in CONNECTING (host unreachable) gives up after 5 s.
     this.connectTimer = window.setTimeout(() => this.dropped(ws), CONNECT_TIMEOUT_MS);
