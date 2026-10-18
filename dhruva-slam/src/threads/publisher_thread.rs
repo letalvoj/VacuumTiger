@@ -90,16 +90,16 @@ struct Client {
     read_buf: Vec<u8>,
     /// Expected message length (0 if not yet read).
     pending_len: usize,
+    /// Unsent tail of the frame being written (non-blocking socket).
+    out: Vec<u8>,
+    /// Since when `out` has made no progress (a client that stopped reading).
+    stalled_since: Option<Instant>,
 }
 
 impl Client {
     fn new(stream: TcpStream, addr: SocketAddr) -> Self {
-        // Set non-blocking for both reads and writes
+        // Non-blocking for both reads and writes (writes keep their tail in `out`).
         stream.set_nonblocking(true).ok();
-        // Set write timeout as fallback
-        stream
-            .set_write_timeout(Some(Duration::from_millis(100)))
-            .ok();
         Self {
             stream,
             addr: addr.to_string(),
@@ -107,25 +107,51 @@ impl Client {
             failed: false,
             read_buf: Vec::with_capacity(1024),
             pending_len: 0,
+            out: Vec::new(),
+            stalled_since: None,
         }
     }
 
-    /// Try to write data to client. Returns false if write fails.
+    /// Queue a frame for this client. Returns false if the client failed.
+    /// A slow client skips whole frames; a frame is never cut short (that
+    /// would corrupt the length-prefixed stream).
     fn try_write(&mut self, data: &[u8]) -> bool {
-        match self.stream.write_all(data) {
-            Ok(()) => {
-                self.stream.flush().ok();
-                true
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Would block - client is slow, skip this message
-                true
-            }
-            Err(e) => {
-                log::info!("TCP client {} write error: {}", self.addr, e);
-                self.failed = true;
-                false
-            }
+        let backlog = self.out.len();
+        if let Err(e) = send_frame(&mut self.stream, &mut self.out, data) {
+            log::info!("TCP client {} write error: {}", self.addr, e);
+            self.failed = true;
+            return false;
+        }
+        if self.out.len() < backlog {
+            self.stalled_since = None; // progress: the stall clock restarts
+        }
+        self.check_stall()
+    }
+
+    /// A client that stopped reading (or is half-open) must not buffer
+    /// forever: drop it when its backlog is too big or too old.
+    fn check_stall(&mut self) -> bool {
+        if self.out.is_empty() {
+            self.stalled_since = None;
+            return true;
+        }
+        let since = *self.stalled_since.get_or_insert_with(Instant::now);
+        if self.out.len() > MAX_BACKLOG || since.elapsed() > MAX_STALL {
+            log::info!(
+                "TCP client {} stalled ({} B pending for {:.0?}): dropping",
+                self.addr,
+                self.out.len(),
+                since.elapsed()
+            );
+            self.failed = true;
+        }
+        !self.failed
+    }
+
+    /// Continue writing a frame the socket couldn't take at once.
+    fn flush_pending(&mut self) {
+        if !self.out.is_empty() {
+            self.try_write(&[]);
         }
     }
 
@@ -226,6 +252,12 @@ impl Client {
         let mut frame = Vec::with_capacity(4 + buf.len());
         frame.extend_from_slice(&len.to_be_bytes());
         frame.extend_from_slice(&buf);
+        // Responses must not be skipped like stream frames: queue behind a
+        // pending tail (they are small).
+        if !self.out.is_empty() {
+            self.out.extend_from_slice(&frame);
+            return self.try_write(&[]);
+        }
         self.try_write(&frame)
     }
 }
@@ -302,8 +334,9 @@ fn run_publisher_loop(
             clients.push(Client::new(stream, addr));
         }
 
-        // --- Process incoming commands from TCP clients ---
+        // --- Finish frames slow clients couldn't take, then process commands ---
         for client in clients.iter_mut() {
+            client.flush_pending();
             if let Some(cmd) = client.try_read_command() {
                 let response = process_command(
                     &cmd,
@@ -808,4 +841,81 @@ fn chrono_timestamp() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// A client is dropped when this much is waiting for it...
+const MAX_BACKLOG: usize = 8 << 20;
+/// ...or when its backlog hasn't drained for this long.
+const MAX_STALL: Duration = Duration::from_secs(20);
+
+/// Write as much of `buf` as a non-blocking writer takes now.
+fn write_some(w: &mut impl Write, buf: &[u8]) -> std::io::Result<usize> {
+    let mut done = 0;
+    while done < buf.len() {
+        match w.write(&buf[done..]) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => done += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(done)
+}
+
+/// Send `frame` without ever splitting it: first finish the pending tail in
+/// `out`; if that's still incomplete, skip `frame`; otherwise write `frame`
+/// and keep whatever didn't fit in `out`.
+fn send_frame(w: &mut impl Write, out: &mut Vec<u8>, frame: &[u8]) -> std::io::Result<()> {
+    if !out.is_empty() {
+        let n = write_some(w, out)?;
+        out.drain(..n);
+        if !out.is_empty() {
+            return Ok(());
+        }
+    }
+    let n = write_some(w, frame)?;
+    out.extend_from_slice(&frame[n..]);
+    Ok(())
+}
+
+#[cfg(test)]
+mod send_frame_tests {
+    use super::*;
+
+    /// Accepts `budget` bytes, then would block.
+    struct Slow {
+        got: Vec<u8>,
+        budget: usize,
+    }
+
+    impl Write for Slow {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.budget == 0 {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let n = buf.len().min(self.budget);
+            self.budget -= n;
+            self.got.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn frames_are_never_cut_or_interleaved() {
+        let mut w = Slow { got: Vec::new(), budget: 3 };
+        let mut out = Vec::new();
+        send_frame(&mut w, &mut out, b"AAAAA").unwrap();
+        assert_eq!(out, b"AA", "tail kept");
+        send_frame(&mut w, &mut out, b"BBB").unwrap();
+        assert_eq!(out, b"AA", "BBB skipped whole while a tail is pending");
+        w.budget = 100;
+        send_frame(&mut w, &mut out, &[]).unwrap();
+        send_frame(&mut w, &mut out, b"CC").unwrap();
+        assert_eq!(w.got, b"AAAAACC");
+        assert!(out.is_empty());
+    }
 }
