@@ -36,6 +36,36 @@ const TILE = 64;
 /** Pointer travel (CSS px) before a press counts as a pan (taps don't unfollow). */
 const PAN_SLOP = 5;
 
+/** Past scans stay on screen this long, fading out. */
+const HISTORY_MS = 20_000;
+/** Opacity of a fresh past scan: low, so a parked robot's ~100 overlapping
+ *  scans still fade instead of stacking up to a solid wall. */
+const HISTORY_ALPHA = 0.2;
+/** Fading continues even when no message arrives to trigger a redraw. */
+const FADE_REDRAW_MS = 250;
+/** Point sizes, CSS px. */
+const HISTORY_DOT = 1.5;
+const LIVE_DOT = 2;
+
+/** Scan points in the world frame, as [x0, y0, x1, y1, ...]. */
+function scanPoints(scan: Scan, p: Pose, robot: Robot): Float32Array {
+  const cos = Math.cos(p.theta);
+  const sin = Math.sin(p.theta);
+  const n = scan.ranges.length;
+  const out = new Float32Array(2 * n);
+  let k = 0;
+  for (let i = 0; i < n; i++) {
+    const d = scan.ranges[i];
+    if (d <= 0) continue;
+    const a = (i * 2 * Math.PI) / n;
+    const lx = d * Math.cos(a) + robot.lidar_offset_x;
+    const ly = d * Math.sin(a) + robot.lidar_offset_y;
+    out[k++] = p.x + cos * lx - sin * ly;
+    out[k++] = p.y + sin * lx + cos * ly;
+  }
+  return out.slice(0, k);
+}
+
 function rgba(css: string, alpha: number): [number, number, number, number] {
   const m = css.trim().match(/^#([0-9a-f]{6})$/i);
   const n = m ? parseInt(m[1], 16) : 0x808080;
@@ -50,6 +80,11 @@ export class MapRenderer {
   private cells: Uint8Array | null = null;
   private image: HTMLCanvasElement | null = null;
   private scan: Scan | null = null;
+  /** When `scan` arrived (performance.now()). */
+  private scanAt = 0;
+  private fadeTimer = 0;
+  /** Earlier scans in the world frame, oldest first (only while SLAM runs). */
+  private history: { t: number; points: Float32Array }[] = [];
   private pose: Pose | null = null;
   /** View centre (m) and zoom in CSS px per metre. */
   private view = { cx: 0, cy: 0, scale: 60 };
@@ -82,6 +117,7 @@ export class MapRenderer {
 
   destroy() {
     cancelAnimationFrame(this.frame);
+    clearTimeout(this.fadeTimer);
     this.resize.disconnect();
     this.scheme.removeEventListener("change", this.themeChanged);
   }
@@ -124,11 +160,20 @@ export class MapRenderer {
 
   setPose(p: Pose | null) {
     this.pose = p;
+    if (!p) this.history = []; // world-frame points mean nothing without SLAM
     this.invalidate();
   }
 
   setScan(s: Scan | null) {
+    // The scan being replaced joins the history, aged from when it arrived.
+    // Without its own pose it takes the current one (a scan interval late).
+    const prev = this.scan;
+    const now = performance.now();
+    if (prev && this.pose && this.robot && now - this.scanAt < HISTORY_MS) {
+      this.history.push({ t: this.scanAt, points: scanPoints(prev, prev.pose ?? this.pose, this.robot) });
+    }
     this.scan = s;
+    this.scanAt = now;
     this.invalidate();
   }
 
@@ -221,25 +266,24 @@ export class MapRenderer {
     const robot = this.robot;
     if (!robot) return;
 
-    // Live scan, placed with the pose it arrived with when SLAM runs.
-    const scan = this.scan;
-    if (scan) {
-      const p = this.pose ? (scan.pose ?? pose) : pose;
-      const cos = Math.cos(p.theta);
-      const sin = Math.sin(p.theta);
-      const n = scan.ranges.length;
-      const r = 2 * dpr;
-      ctx.fillStyle = this.palette.scan;
-      for (let i = 0; i < n; i++) {
-        const d = scan.ranges[i];
-        if (d <= 0) continue;
-        const a = (i * 2 * Math.PI) / n;
-        const lx = d * Math.cos(a) + robot.lidar_offset_x;
-        const ly = d * Math.sin(a) + robot.lidar_offset_y;
-        const [sx, sy] = this.w2s(p.x + cos * lx - sin * ly, p.y + sin * lx + cos * ly);
-        ctx.fillRect(sx - r / 2, sy - r / 2, r, r);
-      }
+    // Earlier scans fade out; the live one is drawn on top, placed with the
+    // pose it arrived with when SLAM runs.
+    ctx.fillStyle = this.palette.scan;
+    const now = performance.now();
+    while (this.history.length && now - this.history[0].t >= HISTORY_MS) this.history.shift();
+    for (const h of this.history) {
+      ctx.globalAlpha = HISTORY_ALPHA * (1 - (now - h.t) / HISTORY_MS);
+      this.drawPoints(h.points, HISTORY_DOT * dpr);
     }
+    ctx.globalAlpha = 1;
+    if (this.history.length && !this.fadeTimer) {
+      this.fadeTimer = window.setTimeout(() => {
+        this.fadeTimer = 0;
+        this.invalidate();
+      }, FADE_REDRAW_MS);
+    }
+    const scan = this.scan;
+    if (scan) this.drawPoints(scanPoints(scan, this.pose ? (scan.pose ?? pose) : pose, robot), LIVE_DOT * dpr);
 
     // Robot body + heading.
     const [rx, ry] = this.w2s(pose.x, pose.y);
@@ -251,6 +295,17 @@ export class MapRenderer {
     ctx.moveTo(rx, ry);
     ctx.lineTo(rx + Math.cos(pose.theta) * rr, ry - Math.sin(pose.theta) * rr);
     ctx.stroke();
+  }
+
+  /** World points as squares; `w2s` inlined (tens of thousands per frame). */
+  private drawPoints(points: Float32Array, size: number) {
+    const { cx, cy, scale } = this.view;
+    const s = scale * this.dpr();
+    const ox = this.canvas.width / 2 - cx * s - size / 2;
+    const oy = this.canvas.height / 2 + cy * s - size / 2;
+    for (let i = 0; i < points.length; i += 2) {
+      this.ctx.fillRect(ox + points[i] * s, oy - points[i + 1] * s, size, size);
+    }
   }
 
   private drawGrid() {
