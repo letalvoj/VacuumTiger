@@ -671,8 +671,7 @@ pub fn run_replay(
     input: &std::path::Path,
     out_dir: &std::path::Path,
 ) -> std::io::Result<ReplayReport> {
-    use crate::io::sangam_client::proto::sangamio;
-    use prost::Message as _;
+    use crate::io::recording::{Sample, for_each_sample};
     use std::io::Write;
 
     std::fs::create_dir_all(out_dir)?;
@@ -694,52 +693,42 @@ pub fn run_replay(
     };
     let (mut t_first, mut t_last) = (0u64, 0u64);
     let wall = Instant::now();
-    crate::io::recording::for_each_frame(input, |body| {
-        let Ok(msg) = sangamio::Message::decode(body) else {
-            return Ok(());
-        };
-        let Some(sangamio::message::Payload::SensorGroup(sg)) = msg.payload else {
-            return Ok(());
-        };
+    for_each_sample(input, |sample| {
+        let t = sample.timestamp_us();
         if t_first == 0 {
-            t_first = sg.timestamp_us;
+            t_first = t;
         }
-        t_last = t_last.max(sg.timestamp_us);
-        match sg.group_id.as_str() {
-            "sensor_status" => {
-                if let Some(d) = SangamUdpReceiver::parse_sensor_status(&sg) {
-                    ctx.process_udp_sensor_status(&d, &shared_state);
-                    report.sensor_msgs += 1;
-                }
+        t_last = t_last.max(t);
+        match sample {
+            Sample::Status(d) => {
+                ctx.process_udp_sensor_status(&d, &shared_state);
+                report.sensor_msgs += 1;
             }
-            "lidar" => {
-                if let Some(d) = SangamUdpReceiver::parse_lidar(&sg) {
-                    let t0 = Instant::now();
-                    ctx.process_udp_lidar(&d, &shared_state);
-                    let ms = t0.elapsed().as_secs_f64() * 1e3;
-                    let p = ctx.pipeline.slam().current_pose();
-                    let st = ctx.pipeline.slam().status();
-                    let score = shared_state
-                        .read()
-                        .map(|s| s.robot_status.localization_confidence)
-                        .unwrap_or(0.0);
-                    writeln!(
-                        csv,
-                        "{},{:.3},{:.4},{:.4},{:.5},{:.3},{},{}",
-                        d.timestamp_us,
-                        ms,
-                        p.x,
-                        p.y,
-                        p.theta,
-                        score,
-                        st.num_keyframes,
-                        d.points.len()
-                    )?;
-                    report.scan_ms.push(ms);
-                    report.scans += 1;
-                }
+            Sample::Lidar(d) => {
+                let t0 = Instant::now();
+                ctx.process_udp_lidar(&d, &shared_state);
+                let ms = t0.elapsed().as_secs_f64() * 1e3;
+                let p = ctx.pipeline.slam().current_pose();
+                let st = ctx.pipeline.slam().status();
+                let score = shared_state
+                    .read()
+                    .map(|s| s.robot_status.localization_confidence)
+                    .unwrap_or(0.0);
+                writeln!(
+                    csv,
+                    "{},{:.3},{:.4},{:.4},{:.5},{:.3},{},{}",
+                    d.timestamp_us,
+                    ms,
+                    p.x,
+                    p.y,
+                    p.theta,
+                    score,
+                    st.num_keyframes,
+                    d.points.len()
+                )?;
+                report.scan_ms.push(ms);
+                report.scans += 1;
             }
-            _ => {}
         }
         Ok(())
     })?;

@@ -1,4 +1,5 @@
-//! Recorded SangamIO streams, for `--replay`.
+//! Recorded SangamIO streams, for `--replay` and offline tools (dhruva-lab):
+//! raw frames (`for_each_frame`) or decoded sensor samples (`for_each_sample`).
 //!
 //! - MCAP (https://mcap.dev), as dwar records them: the `/sangamio/message`
 //!   channel. A directory is one run split into segments, read in name order
@@ -13,6 +14,8 @@
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+
+use crate::io::sangam_udp_receiver::{LidarData, SangamUdpReceiver, SensorStatusData};
 
 /// The channel dwar records the raw SangamIO stream on.
 const SANGAMIO_TOPIC: &str = "/sangamio/message";
@@ -113,6 +116,64 @@ fn sgio_frames(
     Ok(())
 }
 
+/// A recorded sensor sample, decoded for the SLAM pipeline.
+#[derive(Debug, Clone)]
+pub enum Sample {
+    /// Wheel encoders, gyro, bumpers, cliffs (the `sensor_status` group).
+    Status(SensorStatusData),
+    /// One lidar revolution (the `lidar` group).
+    Lidar(LidarData),
+}
+
+impl Sample {
+    /// Data time of the sample.
+    pub fn timestamp_us(&self) -> u64 {
+        match self {
+            Sample::Status(d) => d.timestamp_us,
+            Sample::Lidar(d) => d.timestamp_us,
+        }
+    }
+}
+
+/// Call `f` with every `sensor_status` and `lidar` group of a recording, decoded,
+/// in order. Other groups (kinematics, versions) and commands are skipped;
+/// frames that don't decode, or sensor groups that don't parse, are skipped and
+/// counted in one warning at the end.
+pub fn for_each_sample(
+    path: &Path,
+    mut f: impl FnMut(Sample) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use crate::io::sangam_client::proto::sangamio;
+    use prost::Message as _;
+
+    let mut malformed = 0usize;
+    let result = for_each_frame(path, |body| {
+        let Ok(msg) = sangamio::Message::decode(body) else {
+            malformed += 1;
+            return Ok(());
+        };
+        let Some(sangamio::message::Payload::SensorGroup(sg)) = msg.payload else {
+            return Ok(());
+        };
+        let sample = match sg.group_id.as_str() {
+            "sensor_status" => SangamUdpReceiver::parse_sensor_status(&sg).map(Sample::Status),
+            "lidar" => SangamUdpReceiver::parse_lidar(&sg).map(Sample::Lidar),
+            _ => return Ok(()),
+        };
+        match sample {
+            Some(s) => f(s),
+            None => {
+                malformed += 1;
+                Ok(())
+            }
+        }
+    });
+    if malformed > 0 {
+        log::warn!("{}: skipped {} malformed frames", path.display(), malformed);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +245,69 @@ mod tests {
         let got = frames(&path);
         assert!(!got.is_empty() && got.len() < 1000, "{} frames", got.len());
         assert_eq!(got, payloads(0..got.len() as u32));
+    }
+
+    fn group(id: &str, values: Vec<(&str, sangamio::sensor_value::Value)>) -> Vec<u8> {
+        use prost::Message as _;
+        let sg = sangamio::SensorGroup {
+            group_id: id.into(),
+            timestamp_us: 7,
+            values: values
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), sangamio::SensorValue { value: Some(v) }))
+                .collect(),
+        };
+        sangamio::Message {
+            topic: format!("sensors/{id}"),
+            payload: Some(sangamio::message::Payload::SensorGroup(sg)),
+        }
+        .encode_to_vec()
+    }
+
+    use crate::io::sangam_client::proto::sangamio;
+    use sangamio::sensor_value::Value;
+
+    #[test]
+    fn samples_are_decoded_in_order_and_the_rest_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run_0001.mcap");
+        // One bin at 0 rad, 1 m (4000 x 0.25 mm), quality 9.
+        let scan = [&1u16.to_le_bytes()[..], &4000u16.to_le_bytes(), &[9]].concat();
+        write_mcap(
+            &path,
+            &[
+                group("kinematics", vec![("wheel_track_m", Value::F32Val(0.238))]),
+                group(
+                    "sensor_status",
+                    vec![
+                        ("wheel_left", Value::U32Val(1)),
+                        ("wheel_right", Value::U32Val(2)),
+                    ],
+                ),
+                b"not protobuf".to_vec(),
+                group("lidar", vec![("scan_packed", Value::BytesVal(scan))]),
+            ],
+        );
+        let mut got = Vec::new();
+        for_each_sample(&path, |s| {
+            got.push(s);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(
+            matches!(&got[0], Sample::Status(d) if (d.left_encoder, d.right_encoder) == (1, 2))
+        );
+        assert!(matches!(&got[1], Sample::Lidar(d) if d.points == vec![(0.0, 1.0, 9)]));
+        assert_eq!(got[1].timestamp_us(), 7);
+
+        // An error from the callback stops the read and is returned.
+        let mut calls = 0;
+        let r = for_each_sample(&path, |_| {
+            calls += 1;
+            Err(std::io::Error::other("stop"))
+        });
+        assert!(r.is_err() && calls == 1);
     }
 
     #[test]
