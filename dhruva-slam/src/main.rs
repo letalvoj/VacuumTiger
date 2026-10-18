@@ -91,7 +91,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -1312,8 +1312,19 @@ fn run_threaded_mode_rest(
     }
 
     // 9. Wait for shutdown signal (main thread just monitors)
+    // SangamIO only streams telemetry to connected TCP clients, and it may
+    // start listening seconds after us (MCU init): keep trying to connect.
+    // The controller's reconnect cooldown is the real rate limit; this timer
+    // only avoids taking the lock every 100 ms, and a busy lock skips a round.
+    let mut last_connect_check = Instant::now();
     while running.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(100));
+        if last_connect_check.elapsed() >= Duration::from_secs(2) {
+            last_connect_check = Instant::now();
+            if let Ok(mut mc) = shared_motion.try_lock() {
+                mc.keep_connected();
+            }
+        }
     }
 
     log::info!("Shutdown signal received, waiting for threads...");

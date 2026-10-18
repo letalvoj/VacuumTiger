@@ -219,6 +219,16 @@ impl MotionController {
         self.client.is_some()
     }
 
+    /// Connect if there is no connection yet (subject to the reconnect
+    /// cooldown). Called periodically: SangamIO only streams telemetry to
+    /// connected TCP clients, so the SLAM sensor feed depends on this
+    /// connection even when no command is ever sent.
+    pub fn keep_connected(&mut self) {
+        if self.client.is_none() && self.has_address() {
+            self.try_reconnect();
+        }
+    }
+
     /// Check if we have an address configured (can attempt connection).
     pub fn has_address(&self) -> bool {
         !self.address.is_empty()
