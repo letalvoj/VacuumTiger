@@ -301,6 +301,8 @@ export function Recordings({ status }: { status: Json | null }) {
 }
 
 const ARM_IDLE_MS = 60_000;
+/** A teleop grant this long after a "Drive" click arms. */
+const ARM_REQUEST_MS = 3_000;
 /** Nothing from the server for this long while driving: the link is suspect, disarm. */
 const LINK_SILENCE_MS = 1500;
 /** Joystick deflection below this is zero (no creeping near the centre). */
@@ -312,9 +314,9 @@ function isTextInput(t: EventTarget | null) {
 }
 
 /**
- * Teleop: take (server lease) + arm (local, deliberate) + joystick / WASD.
- * Any loss — lease, socket, focus, visibility, STOP — zeroes the command and
- * disarms; re-arming is always a deliberate act.
+ * Teleop: one "Drive" click takes teleop (server lease) and arms; then
+ * joystick / WASD / arrows. Any loss — lease, socket, focus, visibility,
+ * STOP — zeroes the command and disarms; arming always takes a click.
  */
 export function Teleop(props: { link: Link | null; caps: string[] | null; holder: boolean; online: boolean; max: { linear: number; angular: number } }) {
   const { link, holder, max } = props;
@@ -334,10 +336,28 @@ export function Teleop(props: { link: Link | null; caps: string[] | null; holder
     setStick({ x: 0, y: 0 });
   };
 
-  // Losing the lease or the link disarms.
+  // When "Drive" last asked for teleop: a grant arms only shortly after that
+  // click (not after a refusal, STOP or hidden tab left the request stale).
+  const armRequested = useRef(0);
+
+  // Losing the lease or the link disarms; a fresh grant after "Drive" arms.
   useEffect(() => {
     if (!holder || !props.online) setArmed(false);
+    else if (Date.now() - armRequested.current < ARM_REQUEST_MS) setArmed(true);
+    armRequested.current = 0;
   }, [holder, props.online]);
+
+  const toggleDrive = () => {
+    if (armed) {
+      setArmed(false);
+      link?.send({ type: "teleop", take: false });
+    } else if (holder) {
+      setArmed(true);
+    } else {
+      armRequested.current = Date.now();
+      link?.send({ type: "teleop", take: true });
+    }
+  };
 
   // Stream the command at 10 Hz while live; dwar zeroes on silence.
   useEffect(() => {
@@ -364,12 +384,14 @@ export function Teleop(props: { link: Link | null; caps: string[] | null; holder
   useEffect(() => {
     const leave = () => {
       if (!document.hidden) return;
+      armRequested.current = 0;
       neutral();
       setArmed(false);
       link?.send({ type: "drive", ...ZERO });
       link?.send({ type: "teleop", take: false });
     };
     const pagehide = () => {
+      armRequested.current = 0;
       link?.send({ type: "drive", ...ZERO });
       link?.send({ type: "teleop", take: false });
     };
@@ -437,17 +459,14 @@ export function Teleop(props: { link: Link | null; caps: string[] | null; holder
       {props.caps === null ? (
         <p class="muted">loading…</p>
       ) : !enabled ? (
-        <p class="muted">Disabled in dwar config ([control] allow_drive). Wheels only with the robot on blocks.</p>
+        <p class="muted">Disabled in dwar config ([control] allow_drive).</p>
       ) : (
         <>
           <div class="row">
-            <button disabled={!props.online} onClick={() => link?.send({ type: "teleop", take: !holder })}>
-              {holder ? "Release" : "Take teleop"}
+            <button class={armed ? "" : "primary"} disabled={!props.online} onClick={toggleDrive}>
+              {armed ? "Stop driving" : "Drive"}
             </button>
-            <label class="row">
-              <input type="checkbox" checked={armed} disabled={!holder} onChange={(e) => setArmed((e.target as HTMLInputElement).checked)} />
-              Arm (disarms after 60 s idle)
-            </label>
+            <span class="muted">{armed ? "drag the pad or use arrows / WASD" : `idle ${ARM_IDLE_MS / 1000} s = stops driving`}</span>
           </div>
           <div
             ref={pad}
@@ -467,7 +486,7 @@ export function Teleop(props: { link: Link | null; caps: string[] | null; holder
             <div class="knob" style={{ left: `${50 + stick.x * 40}%`, top: `${50 + stick.y * 40}%` }} />
           </div>
           <p class="muted">
-            Wheels only with the robot on blocks. ≤ {max.linear.toFixed(2)} m/s, {max.angular.toFixed(2)} rad/s · keys WASD · release = stop · Esc = STOP
+            Supervise the robot. ≤ {max.linear.toFixed(2)} m/s, {max.angular.toFixed(2)} rad/s · keys WASD · release = stop · Esc = STOP
           </p>
         </>
       )}

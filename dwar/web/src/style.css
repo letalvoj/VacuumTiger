@@ -70,6 +70,7 @@ button.small { min-height: 36px; padding: 4px 10px; }
 button:disabled { opacity: .5; cursor: default; }
 button.danger { background: var(--danger); color: #fff; border-color: var(--danger); font-weight: 700; }
 button.big { padding: 8px 24px; }
+button.primary { background: var(--accent); color: #111; border-color: var(--accent); font-weight: 700; }
 a { color: var(--link); }
 input[type="range"] { flex: 1; }
 .sensors { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 4px; }
