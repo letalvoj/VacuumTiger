@@ -435,57 +435,6 @@ impl SubmapManager {
         }
     }
 
-    /// Get the global map by combining all submaps.
-    ///
-    /// This creates a new occupancy grid that merges all submap data.
-    pub fn global_map(&self, config: &OccupancyGridConfig) -> OccupancyGrid {
-        let mut global = OccupancyGrid::new(config.clone());
-
-        for submap in &self.submaps {
-            self.merge_submap_into(&mut global, submap);
-        }
-
-        global
-    }
-
-    /// Merge a submap into a global map.
-    fn merge_submap_into(&self, global: &mut OccupancyGrid, submap: &Submap) {
-        let (width, height) = submap.grid.dimensions();
-        let (sin_t, cos_t) = submap.origin.theta.sin_cos();
-
-        for cy in 0..height {
-            for cx in 0..width {
-                let log_odds = submap.grid.get_log_odds(cx, cy);
-                if log_odds.abs() < 0.1 {
-                    continue; // Skip unknown cells
-                }
-
-                // Convert to world coordinates
-                let (local_x, local_y) = submap.grid.cell_to_world(cx, cy);
-
-                // Apply submap origin transform
-                let world_x = submap.origin.x + local_x * cos_t - local_y * sin_t;
-                let world_y = submap.origin.y + local_x * sin_t + local_y * cos_t;
-
-                // Ensure global map can contain this point
-                global.ensure_contains(world_x, world_y);
-
-                // Update global map
-                if let Some((gx, gy)) = global.world_to_cell(world_x, world_y) {
-                    // Simple merge: use max absolute log-odds
-                    let current = global.get_log_odds(gx, gy);
-                    if log_odds.abs() > current.abs() {
-                        // Direct cell manipulation (bypass normal update)
-                        let occupied = log_odds > 0.0;
-                        for _ in 0..((log_odds.abs() / 0.5) as i32).max(1) {
-                            global.update_cell(gx, gy, occupied);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     /// Get total memory usage.
     pub fn memory_usage(&self) -> usize {
         self.submaps.iter().map(|s| s.memory_usage()).sum()

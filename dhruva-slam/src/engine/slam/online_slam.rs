@@ -12,7 +12,9 @@
 //! 4. Optimizes the pose graph when closures are detected
 //! 5. Corrects keyframe poses after optimization
 
-use crate::algorithms::mapping::{OccupancyGrid, OccupancyGridConfig};
+use crate::algorithms::mapping::{
+    MapIntegrator, MapIntegratorConfig, OccupancyGrid, OccupancyGridConfig,
+};
 use crate::algorithms::matching::{
     DynMatcher, DynMatcherConfig, MatcherType, ScanMatchResult, ScanMatcher,
 };
@@ -246,8 +248,16 @@ pub struct OnlineSlam {
     /// Scan-to-submap matcher (runtime-selected algorithm).
     submap_matcher: DynMatcher,
 
-    /// Global map (built on demand).
+    /// Global map: every keyframe scan ray-traced at its current pose. Built
+    /// incrementally on demand; `None` = rebuild from scratch (after keyframe
+    /// poses moved, or a reset).
     global_map: Option<OccupancyGrid>,
+
+    /// Id of the newest keyframe already in `global_map`.
+    map_last_keyframe: Option<u64>,
+
+    /// Ray tracer for the global map.
+    map_integrator: MapIntegrator,
 
     /// Double-buffer for previous scan to avoid cloning.
     /// scan_buffers[current_scan_idx] is the current scan,
@@ -279,10 +289,6 @@ pub struct OnlineSlam {
 
     /// Last match score.
     last_match_score: f32,
-
-    /// Number of finished submaps when global map was last built.
-    /// Used to avoid unnecessary map rebuilds.
-    last_finished_submaps: usize,
 
     // ========================================================================
     // Loop Closure Components
@@ -345,6 +351,8 @@ impl OnlineSlam {
             matcher,
             submap_matcher,
             global_map: None,
+            map_last_keyframe: None,
+            map_integrator: MapIntegrator::new(MapIntegratorConfig::default()),
             scan_buffers: [
                 PointCloud2D::with_capacity(Self::TYPICAL_SCAN_POINTS),
                 PointCloud2D::with_capacity(Self::TYPICAL_SCAN_POINTS),
@@ -360,7 +368,6 @@ impl OnlineSlam {
             num_scans: 0,
             is_lost: false,
             last_match_score: 1.0,
-            last_finished_submaps: 0,
             // Loop closure fields
             loop_detector,
             pose_graph: PoseGraph::new(),
@@ -424,27 +431,39 @@ impl OnlineSlam {
         &self.submaps
     }
 
-    /// Build and return the global map.
+    /// The global map: every keyframe scan ray-traced at its current pose.
     ///
-    /// This merges all submaps into a single occupancy grid.
+    /// Adds the keyframes created since the last call; after the pose graph
+    /// moved keyframes (or a reset) the map is rebuilt from scratch, so a loop
+    /// closure straightens the whole map, not only the pose. A rebuild sees only
+    /// the keyframes still kept (`[keyframe] max_keyframes`), and drops bumper
+    /// marks (`mark_bumper_obstacle`).
     pub fn global_map(&mut self) -> &OccupancyGrid {
-        if self.global_map.is_none() || self.needs_map_rebuild() {
-            self.rebuild_global_map();
+        self.global_map_mut()
+    }
+
+    /// Drop the cached global map: the next `global_map()` rebuilds it.
+    fn invalidate_global_map(&mut self) {
+        self.global_map = None;
+        self.map_last_keyframe = None;
+    }
+
+    fn global_map_mut(&mut self) -> &mut OccupancyGrid {
+        let grid = self
+            .global_map
+            .get_or_insert_with(|| OccupancyGrid::new(self.config.global_map.clone()));
+        let after = self.map_last_keyframe;
+        for kf in self
+            .keyframes
+            .keyframes()
+            .iter()
+            .filter(|kf| after.is_none_or(|last| kf.id > last))
+        {
+            self.map_integrator
+                .integrate_cloud(grid, &kf.scan.transform(&kf.pose), &kf.pose);
+            self.map_last_keyframe = Some(kf.id);
         }
-        self.global_map.as_ref().unwrap()
-    }
-
-    /// Check if global map needs rebuilding.
-    fn needs_map_rebuild(&self) -> bool {
-        // Only rebuild if we have new finished submaps since last build
-        let current_finished = self.submaps.finished_submaps().count();
-        current_finished > self.last_finished_submaps
-    }
-
-    /// Rebuild the global map from submaps.
-    fn rebuild_global_map(&mut self) {
-        self.last_finished_submaps = self.submaps.finished_submaps().count();
-        self.global_map = Some(self.submaps.global_map(&self.config.global_map));
+        grid
     }
 
     /// Mark a bumper obstacle in the global map.
@@ -454,7 +473,7 @@ impl OnlineSlam {
     /// reflected in the map for future planning.
     ///
     /// Returns true if the obstacle was marked, false if mapping mode is not
-    /// active or the map hasn't been built yet.
+    /// active. The mark lasts until the map is rebuilt (see `global_map`).
     pub fn mark_bumper_obstacle(
         &mut self,
         robot_x: f32,
@@ -469,32 +488,23 @@ impl OnlineSlam {
             return false;
         }
 
-        // Ensure global map exists
-        if self.global_map.is_none() {
-            self.rebuild_global_map();
-        }
-
-        if let Some(ref mut map) = self.global_map {
-            map.mark_bumper_obstacle(
-                robot_x,
-                robot_y,
-                robot_theta,
-                bumper_left,
-                bumper_right,
-                robot_radius,
-            );
-            log::debug!(
-                "Marked bumper obstacle at ({:.2}, {:.2}) theta={:.2}rad, left={}, right={}",
-                robot_x,
-                robot_y,
-                robot_theta,
-                bumper_left,
-                bumper_right
-            );
-            true
-        } else {
-            false
-        }
+        self.global_map_mut().mark_bumper_obstacle(
+            robot_x,
+            robot_y,
+            robot_theta,
+            bumper_left,
+            bumper_right,
+            robot_radius,
+        );
+        log::debug!(
+            "Marked bumper obstacle at ({:.2}, {:.2}) theta={:.2}rad, left={}, right={}",
+            robot_x,
+            robot_y,
+            robot_theta,
+            bumper_left,
+            bumper_right
+        );
+        true
     }
 
     /// Match scan to current submap.
@@ -887,7 +897,7 @@ impl OnlineSlam {
         }
 
         // Invalidate global map cache (will be rebuilt with corrected poses)
-        self.global_map = None;
+        self.invalidate_global_map();
 
         log::debug!(
             "Applied pose corrections to {} keyframes",
@@ -1076,11 +1086,6 @@ impl SlamEngine for OnlineSlam {
                     );
                 }
             }
-
-            // Invalidate cached global map
-            if result.keyframe_created || result.new_submap {
-                self.global_map = None;
-            }
         }
 
         // Store scan for next iteration using double-buffer swap
@@ -1118,7 +1123,7 @@ impl SlamEngine for OnlineSlam {
         self.covariance = Covariance2D::diagonal(0.01, 0.01, 0.01);
         self.keyframes.clear();
         self.submaps.clear();
-        self.global_map = None;
+        self.invalidate_global_map();
         self.scan_buffers[0].clear();
         self.scan_buffers[1].clear();
         self.current_scan_idx = 0;
@@ -1128,7 +1133,6 @@ impl SlamEngine for OnlineSlam {
         self.num_scans = 0;
         self.is_lost = false;
         self.last_match_score = 1.0;
-        self.last_finished_submaps = 0;
         // Reset loop closure state
         if let Some(detector) = &mut self.loop_detector {
             detector.clear();

@@ -5,34 +5,20 @@
 //!
 //! # Architecture
 //!
-//! The SLAM system uses a submap-based architecture inspired by Cartographer:
+//! Keyframe SLAM:
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                      LOCAL SLAM                              │
-//! │                                                              │
-//! │  Scan → Preprocess → Match to Submap → Update Submap        │
-//! │                           │                                  │
-//! │                           ▼                                  │
-//! │                   Keyframe Decision                          │
-//! │                           │                                  │
-//! │              ┌────────────┴────────────┐                     │
-//! │              │                         │                     │
-//! │              ▼                         ▼                     │
-//! │      Create Keyframe           Continue in Submap            │
-//! │              │                                               │
-//! │              ▼                                               │
-//! │      Submap Full? ──Yes──▶ Finish Submap, Create New        │
-//! └─────────────────────────────────────────────────────────────┘
-//!                              │
-//!                              ▼
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                     GLOBAL SLAM                              │
-//! │                  (Background Thread)                         │
-//! │                                                              │
-//! │  Finished Submaps → Loop Detection → Graph Optimization      │
-//! └─────────────────────────────────────────────────────────────┘
+//! Scan → Preprocess → Match (local map of recent keyframes, or active submap) → Pose
+//!                                     │
+//!                             Keyframe decision
+//!                                     │
+//!                   Keyframe → pose graph (when loop closure is on)
+//!                                     │
+//!          Global map = keyframe scans ray-traced at their (optimized) poses,
+//!          rebuilt lazily after the graph moves them
 //! ```
+//!
+//! Submaps are only used for matching when `use_submap_matching` is set.
 //!
 //! # Components
 //!
