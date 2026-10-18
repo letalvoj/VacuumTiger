@@ -73,7 +73,7 @@ pub use loop_detector::{LoopClosureCandidate, LoopDetector, LoopDetectorConfig};
 pub use optimizer::{GraphOptimizer, GraphOptimizerConfig};
 
 // Pose graph structure - used by OnlineSlam and optimizer
-pub use pose_graph::{Information2D, PoseGraph, PoseNode};
+pub use pose_graph::{EdgeType, Information2D, PoseEdge, PoseGraph, PoseNode};
 
 #[cfg(test)]
 mod tests {

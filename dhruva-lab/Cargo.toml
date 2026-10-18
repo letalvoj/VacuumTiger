@@ -1,0 +1,15 @@
+[package]
+name = "dhruva-lab"
+version = "0.1.0"
+edition = "2024"
+description = "Offline SLAM lab: replay a recording through dhruva-slam step by step, trace what it believes (Foxglove MCAP), render maps, score against a reference"
+license = "MIT"
+
+[dependencies]
+dhruva-slam = { path = "../dhruva-slam" }
+clap = { version = "4.5", features = ["derive"] }
+foxglove = { version = "0.29", default-features = false, features = ["zstd"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+imageproc = { version = "0.25", default-features = false }
+serde_json = "1.0"
+env_logger = { version = "0.11", default-features = false }
