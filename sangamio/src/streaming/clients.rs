@@ -67,6 +67,22 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A client's TCP telemetry writer thread.
+struct TcpWriter {
+    tx: Sender<Frame>,
+    /// Set when the client goes back to UDP (dropping `tx` alone would let
+    /// the thread drain its whole queue first).
+    cancel: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct TcpTelemetry {
+    active: Option<TcpWriter>,
+    /// The previous writer, joined before a new one starts.
+    retired: Option<std::thread::JoinHandle<()>>,
+}
+
 /// One connected client.
 pub struct Client {
     pub id: ClientId,
@@ -77,13 +93,13 @@ pub struct Client {
     pub alive: Arc<AtomicBool>,
     /// Write-clone of the command socket, cloned again for each TCP switch.
     socket: Option<TcpStream>,
-    /// `Some` while telemetry goes over TCP (the writer thread's queue).
-    tcp: Mutex<Option<Sender<Frame>>>,
+    /// The TCP telemetry writer, while telemetry goes over TCP.
+    tcp: Mutex<TcpTelemetry>,
 }
 
 impl Client {
     pub fn transport(&self) -> Transport {
-        if lock(&self.tcp).is_some() {
+        if lock(&self.tcp).active.is_some() {
             Transport::Tcp
         } else {
             Transport::Udp
@@ -101,7 +117,7 @@ impl Client {
         udp: &UdpSocket,
         udp_sent: &mut Vec<SocketAddr>,
     ) {
-        if let Some(tx) = lock(&self.tcp).as_ref() {
+        if let Some(TcpWriter { tx, .. }) = lock(&self.tcp).active.as_ref() {
             let frame = shared.get_or_insert_with(|| Arc::from(buf));
             if let Err(TrySendError::Full(_)) = tx.try_send(Arc::clone(frame)) {
                 log::trace!(
@@ -138,8 +154,8 @@ pub struct ClientHub {
     /// The holder, readable without the lock (accept loop, driver re-check).
     holder: AtomicU64,
     next_id: AtomicU64,
-    /// Bumped when a client connects or switches transport, so the publisher
-    /// resends the one-shot groups (device version) to it.
+    /// Bumped whenever the client set or a transport changes: the publisher
+    /// refreshes its snapshot and resends the one-shot groups (device version).
     generation: AtomicU64,
     max_clients: usize,
 }
@@ -175,7 +191,7 @@ impl ClientHub {
             udp_addr: SocketAddr::new(peer.ip(), udp_port),
             alive: Arc::new(AtomicBool::new(true)),
             socket,
-            tcp: Mutex::new(None),
+            tcp: Mutex::default(),
         });
         let mut clients = lock(&self.clients);
         while clients.len() >= self.max_clients {
@@ -183,6 +199,7 @@ impl ClientHub {
             let pos = clients.iter().position(|c| c.id != holder).unwrap_or(0);
             let old = clients.remove(pos);
             old.alive.store(false, Ordering::Relaxed);
+            self.generation.fetch_add(1, Ordering::Release);
             log::warn!(
                 "Client limit ({}) reached: evicting client #{} ({})",
                 self.max_clients,
@@ -209,6 +226,7 @@ impl ClientHub {
         {
             let mut clients = lock(&self.clients);
             clients.retain(|c| c.id != id);
+            self.generation.fetch_add(1, Ordering::Release);
             log::info!("Client #{} disconnected ({} connected)", id, clients.len());
         }
         let _transition = lock(&self.lease);
@@ -332,10 +350,15 @@ impl ClientHub {
 
     fn set_tcp_telemetry(&self, client: &Client, on: bool) {
         let mut tcp = lock(&client.tcp);
-        if on == tcp.is_some() {
+        if on == tcp.active.is_some() {
             return;
         }
         if on {
+            // A writer retired by a previous switch may still be mid-frame:
+            // two writers on one socket would interleave frames.
+            if let Some(old) = tcp.retired.take() {
+                let _ = old.join();
+            }
             let Some(sock) = client.socket.as_ref() else {
                 log::warn!("Client #{}: no socket for TCP telemetry", client.id);
                 return;
@@ -344,15 +367,18 @@ impl ClientHub {
                 .try_clone()
                 .and_then(|w| spawn_writer(client.id, w, Arc::clone(&client.alive)))
             {
-                Ok(tx) => *tcp = Some(tx),
+                Ok(writer) => tcp.active = Some(writer),
                 Err(e) => {
                     log::error!("Client #{}: TCP telemetry writer: {}", client.id, e);
                     return;
                 }
             }
         } else {
-            // Dropping the sender ends the writer thread.
-            *tcp = None;
+            // The writer finishes its current frame at most, then exits.
+            if let Some(w) = tcp.active.take() {
+                w.cancel.store(true, Ordering::Relaxed);
+                tcp.retired = Some(w.thread);
+            }
         }
         drop(tcp);
         self.generation.fetch_add(1, Ordering::Release);
@@ -395,21 +421,22 @@ pub fn is_stop(id: &str, action: &ComponentAction) -> bool {
     }
 }
 
-fn spawn_writer(
-    id: ClientId,
-    mut w: TcpStream,
-    alive: Arc<AtomicBool>,
-) -> std::io::Result<Sender<Frame>> {
+fn spawn_writer(id: ClientId, mut w: TcpStream, alive: Arc<AtomicBool>) -> std::io::Result<TcpWriter> {
     // A wedged peer must not block the writer forever.
     w.set_write_timeout(Some(Duration::from_millis(500)))?;
     let (tx, rx) = bounded::<Frame>(TCP_QUEUE_FRAMES);
-    std::thread::Builder::new()
+    let cancel = Arc::new(AtomicBool::new(false));
+    let stop = Arc::clone(&cancel);
+    let thread = std::thread::Builder::new()
         .name(format!("tcp-telemetry-{}", id))
         .spawn(move || {
             // Ends when the sender is dropped (disconnect, back to UDP) or a
             // write fails (a partial frame would corrupt the stream: drop the
             // client).
             for frame in rx.iter() {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 if let Err(e) = w.write_all(&frame) {
                     log::info!("Client #{} TCP telemetry write failed: {}", id, e);
                     alive.store(false, Ordering::Relaxed);
@@ -417,7 +444,7 @@ fn spawn_writer(
                 }
             }
         })?;
-    Ok(tx)
+    Ok(TcpWriter { tx, cancel, thread })
 }
 
 #[cfg(test)]

@@ -40,7 +40,7 @@
 //!
 //! - **Reliability**: Commands must not be lost or duplicated
 //! - **Ordering**: Commands must execute in order
-//! - **Acknowledgment**: Caller knows command was received
+//! - **No replies**: there are no acknowledgements; refusals are logged
 //!
 //! # Wire Format
 //!
@@ -68,19 +68,19 @@
 //! # Module Contents
 //!
 //! - [`ClientHub`]: connected clients and the control lease
-//! - [`UdpPublisher`]: fans sensor data out to every client
+//! - [`TelemetryPublisher`]: fans sensor data out to every client
 //! - [`TcpReceiver`]: handles one client's commands
 //! - [`wire`]: Protobuf serialization/deserialization
 
 pub mod clients;
 pub mod net;
 pub mod tcp_receiver;
-pub mod udp_publisher;
+pub mod telemetry;
 pub mod wire;
 
 pub use clients::{Client, ClientHub};
 pub use tcp_receiver::TcpReceiver;
-pub use udp_publisher::UdpPublisher;
+pub use telemetry::TelemetryPublisher;
 pub use wire::create_serializer;
 
 /// Which transport carries sensor telemetry to a client.

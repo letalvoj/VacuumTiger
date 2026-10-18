@@ -41,6 +41,7 @@ ctrlc = "3.5"
 # Unix socket operations (socket buffer configuration)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+socket2 = { version = "0.5", features = ["all"] }
 
 [build-dependencies]
 prost-build = "0.13"

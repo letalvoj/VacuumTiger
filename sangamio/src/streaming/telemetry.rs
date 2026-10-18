@@ -82,7 +82,7 @@ const REPUBLISHED_GROUPS: &[&str] = &["kinematics"];
 const REPUBLISH_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Publisher that fans sensor data out to every connected client
-pub struct UdpPublisher {
+pub struct TelemetryPublisher {
     socket: UdpSocket,
     serializer: Serializer,
     /// Mutex-based sensor data for low-rate polling (lidar, version)
@@ -95,7 +95,7 @@ pub struct UdpPublisher {
     hub: Arc<ClientHub>,
 }
 
-impl UdpPublisher {
+impl TelemetryPublisher {
     /// Create a new publisher
     pub fn new(
         socket: UdpSocket,
@@ -132,15 +132,19 @@ impl UdpPublisher {
         // Hub generation: when a client joins or switches transport, the polled
         // groups (version, lidar) are resent; the others just see them once more.
         let mut generation = u64::MAX;
+        let mut clients = Vec::new();
         let mut outgoing: Vec<SensorGroupData> = Vec::new();
         let mut udp_sent: Vec<SocketAddr> = Vec::new();
         let mut last_republish = Instant::now();
 
         while self.running.load(Ordering::Relaxed) {
-            // Generation first: `connect` adds the client, then bumps it, so a
-            // bump seen here always comes with that client in the snapshot.
+            // Refresh the client snapshot only when the hub changed (this loop
+            // runs ~1 kHz). Generation first: the hub changes the set, then
+            // bumps it, so a bump seen here comes with the change.
             let current_generation = self.hub.generation();
-            let clients = self.hub.clients();
+            if current_generation != generation {
+                clients = self.hub.clients();
+            }
             if clients.is_empty() {
                 // Drain streaming channels so stale telemetry isn't sent on connect
                 for rx in self.stream_receivers.values() {

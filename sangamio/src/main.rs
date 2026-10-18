@@ -15,7 +15,7 @@ use sangamio::devices::create_device;
 use sangamio::error::{Error, Result};
 use sangamio::streaming::net::enable_dead_peer_detection;
 use sangamio::streaming::tcp_receiver::stop_drive;
-use sangamio::streaming::{ClientHub, TcpReceiver, UdpPublisher, create_serializer};
+use sangamio::streaming::{ClientHub, TcpReceiver, TelemetryPublisher, create_serializer};
 use std::env;
 use std::net::{TcpListener, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -173,9 +173,9 @@ fn main() -> Result<()> {
     let udp_running = Arc::clone(&running);
     let pub_hub = Arc::clone(&hub);
     let _udp_handle = thread::Builder::new()
-        .name("udp-publisher".to_string())
+        .name("telemetry".to_string())
         .spawn(move || {
-            let mut publisher = UdpPublisher::new(
+            let mut publisher = TelemetryPublisher::new(
                 udp_socket,
                 udp_serializer,
                 udp_sensor_data,
@@ -184,10 +184,10 @@ fn main() -> Result<()> {
                 pub_hub,
             );
             if let Err(e) = publisher.run() {
-                log::error!("UDP publisher error: {}", e);
+                log::error!("Telemetry publisher error: {}", e);
             }
         })
-        .map_err(|e| Error::Other(format!("Failed to spawn UDP publisher: {}", e)))?;
+        .map_err(|e| Error::Other(format!("Failed to spawn telemetry publisher: {}", e)))?;
 
     // =========================================================================
     // TCP Server Setup (commands only)
@@ -266,7 +266,9 @@ fn main() -> Result<()> {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(e) => {
+                // e.g. EMFILE: back off instead of spinning on the error.
                 log::error!("Accept error: {}", e);
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
     }

@@ -454,7 +454,9 @@ sangam-io/
 │   └── streaming/
 │       ├── mod.rs           # Streaming module docs
 │       ├── wire.rs          # Protobuf serialization
-│       ├── udp_publisher.rs # UDP sensor streaming
+│       ├── clients.rs    # Client hub + control lease
+│       ├── net.rs        # Keepalive socket options
+│       ├── telemetry.rs  # Telemetry fan-out (UDP/TCP)
 │       └── tcp_receiver.rs  # TCP command handling
 │
 ├── proto/
