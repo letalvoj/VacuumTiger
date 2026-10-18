@@ -6,13 +6,17 @@
 //! - `trace.mcap`: the step-by-step trace (see `trace.rs`), for Foxglove/Lichtblick
 //! - `map.png`: final map with the SLAM path, odometry path and pose graph
 //! - `traj.csv`: `t_us,ms,x,y,theta,score,keyframes,points` (DhruvaSLAM's
-//!   `timing.csv` columns, so `tools/py/slam_eval.py` reads it)
+//!   `timing.csv` columns, so `tools/py/slam_eval.py` reads it): the pose the SLAM
+//!   reported online for each scan
+//! - `traj_final.csv`: same columns, each scan moved with its keyframe to where the
+//!   last pose-graph optimisation put it (the trajectory behind the final map)
 //! - `metrics.json`: scores against `--reference` (another run's `traj.csv`)
 
 mod metrics;
 mod render;
 mod trace;
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -78,6 +82,9 @@ pub(crate) struct PoseRow {
     pub score: f32,
     pub keyframes: usize,
     pub points: usize,
+    /// The latest keyframe when the scan was processed: its id and the scan's pose
+    /// relative to it, so the scan can follow the keyframe when closures move it.
+    pub anchor: Option<(u64, Pose2D)>,
 }
 
 fn main() {
@@ -129,6 +136,7 @@ fn run(args: Args) -> Result<(), String> {
                 };
                 let keyframes = pipeline.slam().status().num_keyframes;
                 trace.scan(&step, result, pipeline.slam().pose_graph(), keyframes, ms);
+                let anchor = pipeline.slam().keyframes().keyframes().last();
                 rows.push(PoseRow {
                     t_us: step.timestamp_us,
                     ms,
@@ -137,6 +145,7 @@ fn run(args: Args) -> Result<(), String> {
                     score: result.match_score,
                     keyframes,
                     points: step.cloud.len(),
+                    anchor: anchor.map(|kf| (kf.id, kf.pose.inverse().compose(&result.pose))),
                 });
                 if step.timestamp_us.saturating_sub(last_map_us) >= map_every_us {
                     trace.map(step.timestamp_us, pipeline.slam_mut().global_map());
@@ -154,7 +163,27 @@ fn run(args: Args) -> Result<(), String> {
     }
     trace.finish()?;
 
-    write_traj(&args.out.join("traj.csv"), &rows)?;
+    write_traj(&args.out.join("traj.csv"), &rows, |r| r.slam)?;
+    let final_poses: HashMap<u64, Pose2D> = pipeline
+        .slam()
+        .keyframes()
+        .keyframes()
+        .iter()
+        .map(|kf| (kf.id, kf.pose))
+        .collect();
+    // A scan whose keyframe was pruned keeps its online pose: say how many did.
+    let orphans = rows
+        .iter()
+        .filter(|r| r.anchor.is_some_and(|(id, _)| !final_poses.contains_key(&id)))
+        .count();
+    if orphans > 0 {
+        eprintln!("traj_final.csv: {orphans} scans lost their keyframe, kept online poses");
+    }
+    write_traj(&args.out.join("traj_final.csv"), &rows, |r| {
+        r.anchor
+            .and_then(|(id, rel)| final_poses.get(&id).map(|kf| kf.compose(&rel)))
+            .unwrap_or(r.slam)
+    })?;
     let grid = pipeline.slam_mut().global_map().clone();
     let graph = pipeline.slam().pose_graph();
     render::map_png(&args.out.join("map.png"), &grid, &rows, graph)?;
@@ -205,15 +234,20 @@ fn window_bounds_us(recording: &std::path::Path, (a, b): (f64, f64)) -> Result<(
     Ok((at(a), at(b)))
 }
 
-fn write_traj(path: &std::path::Path, rows: &[PoseRow]) -> Result<(), String> {
+fn write_traj(
+    path: &std::path::Path,
+    rows: &[PoseRow],
+    pose: impl Fn(&PoseRow) -> Pose2D,
+) -> Result<(), String> {
     let err = |e: std::io::Error| format!("{}: {e}", path.display());
     let mut f = std::io::BufWriter::new(std::fs::File::create(path).map_err(err)?);
     writeln!(f, "t_us,ms,x,y,theta,score,keyframes,points").map_err(err)?;
     for r in rows {
+        let p = pose(r);
         writeln!(
             f,
             "{},{:.3},{:.4},{:.4},{:.5},{:.3},{},{}",
-            r.t_us, r.ms, r.slam.x, r.slam.y, r.slam.theta, r.score, r.keyframes, r.points
+            r.t_us, r.ms, p.x, p.y, p.theta, r.score, r.keyframes, r.points
         )
         .map_err(err)?;
     }
