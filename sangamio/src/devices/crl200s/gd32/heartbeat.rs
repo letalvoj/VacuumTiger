@@ -495,6 +495,50 @@ mod tests {
     use crate::devices::crl200s::constants::CMD_MAIN_BRUSH;
     use std::io::Write;
 
+    /// Count 0x08 wake/init frames (`FA FB 01 08`, no checksum) in a byte stream.
+    fn count_wake_frames(bytes: &[u8]) -> usize {
+        bytes.windows(4).filter(|w| *w == [0xFA, 0xFB, 0x01, 0x08]).count()
+    }
+
+    fn run_heartbeat_for(state: &Arc<ComponentState>, ms: u64, feed_status: bool) -> Vec<u8> {
+        let rec = RecordingWriter::default();
+        let bytes = Arc::clone(&rec.bytes);
+        let port = Arc::new(Mutex::new(rec));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let h = {
+            let (port, shutdown, st) = (Arc::clone(&port), Arc::clone(&shutdown), Arc::clone(state));
+            thread::spawn(move || heartbeat_loop(port, shutdown, 20, st))
+        };
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < Duration::from_millis(ms) {
+            if feed_status {
+                state.note_status_packet(); // a live MCU streams 0x15 at 50 Hz
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        shutdown.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+        bytes.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn silent_mcu_gets_wake_frames() {
+        // No 0x15 ever arrives (GD32 asleep): after MCU_SILENCE_MS the heartbeat must
+        // re-send the 0x08 wake frame every ~2 s.
+        let state = Arc::new(ComponentState::new(60, 100_000));
+        let bytes = run_heartbeat_for(&state, 4700, false);
+        let n = count_wake_frames(&bytes);
+        assert!(n >= 1, "expected 0x08 wake frames for a silent MCU, got {n}");
+    }
+
+    #[test]
+    fn streaming_mcu_gets_no_wake_frames() {
+        let state = Arc::new(ComponentState::new(60, 100_000));
+        state.note_status_packet();
+        let bytes = run_heartbeat_for(&state, 3000, true);
+        assert_eq!(count_wake_frames(&bytes), 0, "no wake frames while 0x15 streams");
+    }
+
     #[test]
     fn lidar_pid_converges_to_target() {
         // First-order plant fitted to the v8 unit: PWM 73 -> ~8.1 rev/s, so
