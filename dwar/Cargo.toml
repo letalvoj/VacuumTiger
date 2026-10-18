@@ -1,0 +1,30 @@
+[package]
+name = "dwar"
+version = "0.1.0"
+edition = "2024"
+description = "Web gateway for VacuumTiger: REST + WebSocket API and the robot web UI"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "macros", "io-util", "signal", "fs"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
+prost = { version = "0.13", default-features = false, features = ["std", "derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+basic-toml = "0.1"
+rust-embed = { version = "8", features = ["mime-guess"] }
+form_urlencoded = "1"
+tokio-util = { version = "0.7", default-features = false, features = ["io"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+log = "0.4"
+env_logger = { version = "0.10", default-features = false, features = ["humantime"] }
+
+[build-dependencies]
+prost-build = "0.13"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

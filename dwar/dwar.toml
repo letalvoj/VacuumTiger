@@ -1,0 +1,34 @@
+# dwar: VacuumTiger web gateway. Every key is optional (defaults shown).
+
+[http]
+bind = "0.0.0.0:8080"
+# token = "secret"        # require Authorization: Bearer <token> (or ?token=)
+# allowed_hosts = ["vacuum.lan"]   # without a token: hostnames besides IPs, localhost, *.local
+
+[sangamio]
+address = "127.0.0.1:5555"
+
+[dhruva]
+enabled = true
+address = "127.0.0.1:5557"
+
+[control]
+# Wheels and cleaning actuators stay off unless enabled here. The lidar and
+# the STOP button always work.
+allow_drive = false        # teleop: only with the robot on blocks or supervised
+allow_actuators = false    # vacuum, brushes, water pump, LED
+max_linear = 0.2           # m/s
+max_angular = 1.0          # rad/s
+deadman_ms = 300           # teleop silence -> zero velocity
+
+[recordings]
+dir = "/tmp/v8/cap"        # RAM on the robot
+max_mb = 64               # per recording, uncompressed
+max_total_mb = 128        # no new recording beyond this
+
+[robot]
+name = "VacuumTiger"
+model = "CRL-200S"
+lidar_offset_x = -0.110
+lidar_offset_y = 0.0
+radius = 0.175
