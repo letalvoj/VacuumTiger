@@ -330,7 +330,6 @@ Calibrated values for the CRL-200S robot:
 algorithm = "mahony"
 ticks_per_meter = 4464.0
 wheel_base = 0.233
-gyro_scale = 0.0001745  # 0.01°/s per unit → rad/s
 
 [preprocessing]
 min_range = 0.15        # 15cm minimum (robot radius)
@@ -343,7 +342,7 @@ target_points = 180     # Downsample to 180 points
 | Algorithm | Use Case | CPU | Notes |
 |-----------|----------|-----|-------|
 | `Wheel` | Testing/baseline | Very Low | No gyro needed |
-| `Complementary` | Simple fusion | Low | Requires gyro bias |
+| `Complementary` | Simple fusion | Low | `gyro_weight` 1.0 on the v8; scan matching absorbs the bias |
 | `Eskf` | Uncertainty tracking | Medium | Full covariance |
 | `Mahony` | **Production** | Low | Auto gyro calibration |
 

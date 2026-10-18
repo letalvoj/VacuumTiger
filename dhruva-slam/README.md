@@ -192,6 +192,7 @@ tolerance = 1e-6
 | `odometry.algorithm` | Fusion algorithm | `mahony` (recommended) |
 | `odometry.ticks_per_meter` | Encoder ticks per meter | 4464 (CRL-200S) |
 | `odometry.wheel_base` | Distance between wheel centers | 0.233m |
+| `odometry.gyro_weight` | `complementary`: gyro share of the heading while moving | 0.9 (1.0 on the v8) |
 | `matcher.algorithm` | Scan matching algorithm | `multi_res` (recommended) |
 | `slam.min_range` | Minimum valid lidar range | 0.15m |
 | `slam.max_range` | Maximum valid lidar range | 8.0m |

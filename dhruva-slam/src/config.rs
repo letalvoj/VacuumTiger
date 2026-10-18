@@ -18,7 +18,7 @@ use crate::engine::slam::{
     SubmapManagerConfig,
 };
 use crate::sensors::odometry::{
-    DynOdometryConfig, MahonyConfig, OdometryType, WheelOdometryConfig,
+    ComplementaryConfig, DynOdometryConfig, MahonyConfig, OdometryType, WheelOdometryConfig,
 };
 use crate::sensors::preprocessing::{
     AngularDownsamplerConfig, LidarOffset, OutlierFilterConfig, PreprocessorConfig,
@@ -233,6 +233,9 @@ pub struct OdometryConfig {
     pub ticks_per_meter: f32,
     /// Distance between wheel centers in meters
     pub wheel_base: f32,
+    /// "complementary" only: gyro share (0..=1) of the heading increment while the
+    /// wheels move; while they are still the wheel heading is used.
+    pub gyro_weight: f32,
 }
 
 impl Default for OdometryConfig {
@@ -243,6 +246,7 @@ impl Default for OdometryConfig {
             // 1 tick = 0.2214 mm -> 4516.7 ticks/m; 209 mm wheel base.
             ticks_per_meter: 4516.7,
             wheel_base: 0.209,
+            gyro_weight: ComplementaryConfig::default().alpha,
         }
     }
 }
@@ -696,6 +700,10 @@ pub fn build_slam_thread_config(config: &Config) -> SlamThreadConfig {
         wheel: WheelOdometryConfig {
             ticks_per_meter: config.odometry.ticks_per_meter,
             wheel_base: config.odometry.wheel_base,
+        },
+        complementary: ComplementaryConfig {
+            alpha: config.odometry.gyro_weight,
+            ..Default::default()
         },
         mahony: MahonyConfig::default(),
         ..Default::default()

@@ -32,13 +32,14 @@ pub struct ComplementaryConfig {
     /// Higher values trust the gyroscope more.
     /// - 0.0 = pure encoder (ignores gyro)
     /// - 1.0 = pure gyro (ignores encoder heading)
-    /// - 0.98 = good default for most applications
+    ///
+    /// While the wheels are still, the wheel heading is used whatever the weight.
     pub alpha: f32,
 
     /// Gyroscope scale factor.
     ///
     /// Multiply raw gyro reading by this to get rad/s.
-    /// For CRL-200S: raw units are 0.1 deg/s → use `CRL200S_GYRO_SCALE` (0.001745)
+    /// For CRL-200S: raw units are about 0.01 deg/s → `CRL200S_GYRO_SCALE`.
     pub gyro_scale: f32,
 
     /// Gyroscope yaw (Z axis) bias in raw units (before scaling).
@@ -65,7 +66,7 @@ impl Default for ComplementaryConfig {
             // With alpha=0.90, the filter is more balanced and robust to
             // uncalibrated gyro bias while still benefiting from gyro smoothness.
             alpha: 0.90,
-            gyro_scale: CRL200S_GYRO_SCALE, // CRL-200S: raw units are 0.1 deg/s
+            gyro_scale: CRL200S_GYRO_SCALE,
             gyro_bias_z: 0.0,
             gyro_sign: 1.0, // Sign correction now done in SangamIO frame_transforms
         }

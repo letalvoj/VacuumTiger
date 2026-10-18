@@ -63,6 +63,8 @@ path = "/var/lib/dhruva/maps"
 # - eskf: Error-State Kalman Filter (full IMU fusion)
 # - mahony: Mahony AHRS with auto gyro bias calibration
 algorithm = "wheel"
+# complementary only: gyro share of the heading while the wheels move (0..=1)
+# gyro_weight = 0.9
 
 # Encoder ticks per meter of wheel travel
 # Measured on this unit (2026-09-30) with a tape measure over two runs (1.02 m and

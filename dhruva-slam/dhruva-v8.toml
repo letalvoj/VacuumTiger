@@ -30,7 +30,11 @@ navigation_hz = 5.0
 path = "/tmp/v8/dhruva/maps"
 
 [odometry]
-algorithm = "wheel"
+# Heading from the gyro while moving, distance from the wheels: the gyro heading
+# drifts about half as much as the wheels' (docs/SLAM_LAB.md). Its bias needs no
+# calibration here: scan matching corrects it every sweep.
+algorithm = "complementary"
+gyro_weight = 1.0
 ticks_per_meter = 4516.7
 wheel_base = 0.238
 
