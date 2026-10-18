@@ -52,6 +52,8 @@ encoder_weight = 0.8
 use_submap_matching = false
 max_theta_deviation = 0.35
 max_translation_deviation = 0.5
+reference_update_distance = 0.0
+reference_update_angle = 0.3
 
 [matcher]
 algorithm = "hybrid_p2l"

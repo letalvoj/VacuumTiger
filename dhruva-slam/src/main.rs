@@ -273,6 +273,10 @@ struct SlamConfig {
     max_theta_deviation: f32,
     /// Maximum translation deviation from odometry before rejecting scan match (meters)
     max_translation_deviation: f32,
+    /// Reference-scan matching: move the reference after this distance (m); 0 = scan-to-scan
+    reference_update_distance: f32,
+    /// ... or after this rotation (rad)
+    reference_update_angle: f32,
 }
 
 impl Default for SlamConfig {
@@ -285,6 +289,8 @@ impl Default for SlamConfig {
             use_submap_matching: false,
             max_theta_deviation: 0.35,      // ~20 degrees
             max_translation_deviation: 0.5, // 50cm
+            reference_update_distance: 0.0,
+            reference_update_angle: 0.3,
         }
     }
 }
@@ -907,6 +913,8 @@ fn build_slam_config(config: &Config) -> OnlineSlamConfig {
         min_scan_points: config.slam.min_scan_points,
         max_theta_deviation: config.slam.max_theta_deviation,
         max_translation_deviation: config.slam.max_translation_deviation,
+        reference_update_distance: config.slam.reference_update_distance,
+        reference_update_angle: config.slam.reference_update_angle,
         loop_closure: SlamLoopClosureConfig {
             enabled: config.loop_closure.enabled,
             detection_interval: config.loop_closure.detection_interval,

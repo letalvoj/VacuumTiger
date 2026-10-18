@@ -171,6 +171,12 @@ pub struct OnlineSlamConfig {
     ///
     /// Default: 0.5 meters
     pub max_translation_deviation: f32,
+
+    /// Reference-scan matching: match each scan against a reference scan that is
+    /// replaced only after moving this far (m) from it. 0 = classic scan-to-scan.
+    pub reference_update_distance: f32,
+    /// ... or after turning this much (rad).
+    pub reference_update_angle: f32,
 }
 
 impl Default for OnlineSlamConfig {
@@ -193,6 +199,8 @@ impl Default for OnlineSlamConfig {
             // Sanity check thresholds to reject false positive matches
             max_theta_deviation: 0.35,      // ~20 degrees
             max_translation_deviation: 0.5, // 50cm
+            reference_update_distance: 0.0,
+            reference_update_angle: 0.3,
         }
     }
 }
@@ -239,6 +247,11 @@ pub struct OnlineSlam {
 
     /// Whether we have a valid previous scan.
     has_previous_scan: bool,
+
+    /// Reference scan for reference-scan matching (see `reference_update_distance`).
+    ref_scan: Option<PointCloud2D>,
+    /// Pose of `ref_scan`.
+    ref_pose: Pose2D,
 
     /// Operating mode.
     mode: SlamMode,
@@ -323,6 +336,8 @@ impl OnlineSlam {
             ],
             current_scan_idx: 0,
             has_previous_scan: false,
+            ref_scan: None,
+            ref_pose: Pose2D::identity(),
             current_pose: Pose2D::identity(),
             covariance: Covariance2D::diagonal(0.01, 0.01, 0.01),
             mode: SlamMode::Mapping,
@@ -507,6 +522,20 @@ impl OnlineSlam {
     /// The returned transform represents the robot motion from previous to current.
     /// We pass odom_delta directly as the initial guess since it's exactly the
     /// expected robot motion.
+    /// Match against the reference scan; `guess` is reference -> predicted pose.
+    fn match_to_reference_scan(
+        &mut self,
+        scan: &PointCloud2D,
+        guess: &Pose2D,
+    ) -> Option<ScanMatchResult> {
+        let reference = self.ref_scan.as_ref()?;
+        if reference.len() < self.config.min_scan_points {
+            return None;
+        }
+        let result = self.matcher.match_scans(scan, reference, guess);
+        (result.converged && result.score >= self.config.min_match_score).then_some(result)
+    }
+
     fn match_to_previous_scan(
         &mut self,
         scan: &PointCloud2D,
@@ -595,8 +624,16 @@ impl OnlineSlam {
     /// Also includes a sanity check to reject scan matches that differ too much
     /// from odometry, which can happen in symmetric environments or during
     /// fast rotation where the matcher finds wrong local minima.
-    fn apply_scan_match(&mut self, match_result: &ScanMatchResult, odom_delta: &Pose2D) -> Pose2D {
-        let odom_pose = self.current_pose.compose(odom_delta);
+    /// `base` is the pose of the scan matched against and `odom_delta` the odometry
+    /// guess from it: (current pose, odometry delta) for scan-to-scan, (reference pose,
+    /// reference -> predicted) for reference-scan matching.
+    fn apply_scan_match(
+        &mut self,
+        match_result: &ScanMatchResult,
+        base: &Pose2D,
+        odom_delta: &Pose2D,
+    ) -> Pose2D {
+        let odom_pose = base.compose(odom_delta);
 
         // Sanity check: reject matches that deviate too much from odometry.
         // This prevents false positive matches in symmetric environments where
@@ -632,7 +669,7 @@ impl OnlineSlam {
         // Compute scan-match-corrected pose:
         // match_result.transform is the robot motion from previous to current.
         // Apply it directly to get the new pose.
-        let scan_match_pose = self.current_pose.compose(&match_result.transform);
+        let scan_match_pose = base.compose(&match_result.transform);
 
         if match_result.score >= 0.6 {
             // High confidence: trust scan match fully
@@ -854,6 +891,17 @@ impl SlamEngine for OnlineSlam {
         // Predict pose from odometry
         let predicted_pose = self.current_pose.compose(odom_delta);
 
+        // Reference-scan matching: match against a scan that only moves once the robot
+        // has travelled `reference_update_distance` (or turned `reference_update_angle`)
+        // from it, so a biased matcher cannot integrate its bias every frame
+        // (scan-to-scan p2l drifted 0.5 m in 108 s on a static v8 recording).
+        let use_reference = self.config.reference_update_distance > 0.0 && self.ref_scan.is_some();
+        let (match_base, match_guess) = if use_reference {
+            (self.ref_pose, self.ref_pose.inverse().compose(&predicted_pose))
+        } else {
+            (self.current_pose, *odom_delta)
+        };
+
         // Select matching strategy based on mode and available data
         let (match_result, is_localization_match) =
             if self.mode == SlamMode::Localization && self.reference_pointcloud.is_some() {
@@ -862,6 +910,8 @@ impl SlamEngine for OnlineSlam {
             } else if self.config.use_submap_matching && self.submaps.active_submap().is_some() {
                 // Mapping mode with submap matching
                 (self.match_to_submap(scan, &predicted_pose), false)
+            } else if use_reference {
+                (self.match_to_reference_scan(scan, &match_guess), false)
             } else {
                 // Default: scan-to-scan matching
                 (self.match_to_previous_scan(scan, odom_delta), false)
@@ -880,7 +930,7 @@ impl SlamEngine for OnlineSlam {
                     mr.transform
                 } else {
                     // Mapping mode: apply delta transform
-                    let result_pose = self.apply_scan_match(mr, odom_delta);
+                    let result_pose = self.apply_scan_match(mr, &match_base, &match_guess);
 
                     // Debug: log every 10th scan to track drift
                     if self.num_scans.is_multiple_of(10) {
@@ -914,6 +964,17 @@ impl SlamEngine for OnlineSlam {
 
         self.current_pose = refined_pose;
         result.pose = refined_pose;
+
+        // Move the reference scan once we are far enough from it.
+        if self.config.reference_update_distance > 0.0 {
+            let d = self.ref_pose.inverse().compose(&refined_pose);
+            let far = (d.x * d.x + d.y * d.y).sqrt() > self.config.reference_update_distance
+                || d.theta.abs() > self.config.reference_update_angle;
+            if self.ref_scan.is_none() || far {
+                self.ref_scan = Some(scan.clone());
+                self.ref_pose = refined_pose;
+            }
+        }
 
         // Update covariance (simplified)
         let position_var = 0.01 + (1.0 - result.match_score) * 0.1;
@@ -995,6 +1056,8 @@ impl SlamEngine for OnlineSlam {
         self.scan_buffers[1].clear();
         self.current_scan_idx = 0;
         self.has_previous_scan = false;
+        self.ref_scan = None;
+        self.ref_pose = Pose2D::identity();
         self.num_scans = 0;
         self.is_lost = false;
         self.last_match_score = 1.0;
