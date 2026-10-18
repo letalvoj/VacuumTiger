@@ -685,7 +685,7 @@ impl Default for NavigationConfig {
 
 struct Args {
     config_path: Option<String>,
-    /// Offline replay of an SGIO1 recording instead of running the daemon.
+    /// Offline replay of a recording (MCAP file, run directory, or SGIO1) instead of running the daemon.
     replay: Option<String>,
     /// Output directory for `--replay` (timing.csv, map.pgm, map.yaml).
     out: Option<String>,
@@ -744,7 +744,7 @@ fn print_help() {
     println!();
     println!("OPTIONS:");
     println!("    -c, --config <FILE>     Configuration file (default: dhruva-slam.toml)");
-    println!("        --replay <FILE>     Offline: run SLAM over an SGIO1 recording and exit");
+    println!("        --replay <PATH>     Offline: run SLAM over a recording (.mcap, run dir, .sgio) and exit");
     println!("        --out <DIR>         Output dir for --replay (default: replay_out)");
     println!("    -h, --help              Print help information");
     println!();

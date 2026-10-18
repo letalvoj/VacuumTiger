@@ -710,8 +710,9 @@ pub struct ReplayReport {
     pub scan_ms: Vec<f64>,
 }
 
-/// Replay a recorded SangamIO stream (`SGIO1` file from tools/py/sangam_client.py)
-/// through the same SLAM pipeline the daemon runs, synchronously, as fast as possible.
+/// Replay a recorded SangamIO stream (see `io::recording`: an MCAP file, a run
+/// directory of MCAP segments, or an older SGIO1 file) through the same SLAM
+/// pipeline the daemon runs, synchronously, as fast as possible.
 ///
 /// Writes into `out_dir`: `timing.csv` (per scan: data time, processing ms, pose,
 /// score, keyframes), `map.pgm` + `map.yaml` (ROS map_server format).
@@ -722,16 +723,9 @@ pub fn run_replay(
 ) -> std::io::Result<ReplayReport> {
     use crate::io::sangam_client::proto::sangamio;
     use prost::Message as _;
-    use std::io::{BufRead, BufReader, Read, Write};
+    use std::io::Write;
 
     std::fs::create_dir_all(out_dir)?;
-    let mut rd = BufReader::new(std::fs::File::open(input)?);
-    let mut magic = Vec::new();
-    rd.read_until(b'\n', &mut magic)?;
-    if magic != b"SGIO1\n" {
-        return Err(std::io::Error::other("not an SGIO1 recording"));
-    }
-
     let shared_state = crate::state::create_shared_state();
     let mut ctx = SlamContext::new(&config);
     ctx.slam.reset();
@@ -750,22 +744,12 @@ pub fn run_replay(
     };
     let (mut t_first, mut t_last) = (0u64, 0u64);
     let wall = Instant::now();
-    let mut hdr = [0u8; 12];
-    let mut body = Vec::new();
-    loop {
-        if rd.read_exact(&mut hdr).is_err() {
-            break;
-        }
-        let n = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]) as usize;
-        body.resize(n, 0);
-        if rd.read_exact(&mut body).is_err() {
-            break;
-        }
-        let Ok(msg) = sangamio::Message::decode(&body[..]) else {
-            continue;
+    crate::io::recording::for_each_frame(input, |body| {
+        let Ok(msg) = sangamio::Message::decode(body) else {
+            return Ok(());
         };
         let Some(sangamio::message::Payload::SensorGroup(sg)) = msg.payload else {
-            continue;
+            return Ok(());
         };
         if t_first == 0 {
             t_first = sg.timestamp_us;
@@ -807,7 +791,8 @@ pub fn run_replay(
             }
             _ => {}
         }
-    }
+        Ok(())
+    })?;
     report.wall_s = wall.elapsed().as_secs_f64();
     report.data_span_s = t_last.saturating_sub(t_first) as f64 / 1e6;
     csv.flush()?;

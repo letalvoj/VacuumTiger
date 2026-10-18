@@ -12,6 +12,7 @@
 
 pub mod map_manager;
 pub mod motion_controller;
+pub mod recording;
 pub mod sangam_client;
 pub mod sangam_udp_receiver;
 pub mod streaming;
