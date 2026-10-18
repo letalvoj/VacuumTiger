@@ -4,11 +4,12 @@
 import { render } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { Boundary, Controls, Events, Health, Recordings, Sensors, Slam, Teleop } from "./debug";
-import { api, Link, type Json } from "./link";
+import { api, AuthError, Link, type Json } from "./link";
 import { MapRenderer, MapView, type Robot } from "./mapview";
 import "./style.css";
 
 const MAX_EVENTS = 100;
+const STOP_TIMEOUT_MS = 3000;
 
 function App() {
   const [online, setOnline] = useState(false);
@@ -19,7 +20,10 @@ function App() {
   const [session, setSession] = useState<number | null>(null);
   const [holder, setHolder] = useState(false);
   const [robot, setRobot] = useState<Robot | null>(null);
-  const [caps, setCaps] = useState<string[]>([]);
+  // null until /capabilities answers (panels show "loading", not "disabled").
+  const [caps, setCaps] = useState<string[] | null>(null);
+  const [stopState, setStopState] = useState<"" | "sent" | "failed">("");
+  const [authError, setAuthError] = useState<string | null>(null);
   const [link, setLink] = useState<Link | null>(null);
   const map = useRef<MapRenderer | null>(null);
   const seq = useRef(0);
@@ -35,7 +39,10 @@ function App() {
     clearTimeout(capsRetry.current);
     api("/capabilities").then(
       (c) => setCaps(c.capabilities ?? []),
-      () => (capsRetry.current = window.setTimeout(() => loadCaps(attempt + 1), Math.min(500 * 2 ** attempt, 10_000))),
+      (e) => {
+        if (e instanceof AuthError) return setAuthError(e.message);
+        capsRetry.current = window.setTimeout(() => loadCaps(attempt + 1), Math.min(500 * 2 ** attempt, 10_000));
+      },
     );
   };
 
@@ -44,8 +51,12 @@ function App() {
     const l = new Link({
       online: (up) => {
         setOnline(up);
-        if (!up) setHolder(false);
-        else loadCaps();
+        if (up) return loadCaps();
+        // Offline: nothing on screen may look live.
+        setHolder(false);
+        setHasPose(false);
+        map.current?.setPose(null);
+        map.current?.setScan(null);
       },
       json: (m) => {
         switch (m.type) {
@@ -94,13 +105,34 @@ function App() {
     };
   }, []);
 
-  /** STOP over the socket and REST both (idempotent): a half-open socket
-   *  may still look open. */
+  /** STOP over the socket and REST both (idempotent): a half-open socket may
+   *  still look open. The button shows whether the REST STOP was confirmed. */
   const stop = () => {
     setHolder(false);
-    const sent = link?.send({ type: "stop" }) ?? false;
-    api("/stop", "POST").catch((e) => !sent && addEvent("error", `STOP failed: ${e.message}`));
+    link?.send({ type: "stop" });
+    api("/stop", "POST", undefined, STOP_TIMEOUT_MS).then(
+      () => flashStop("sent"),
+      (e) => {
+        flashStop("failed");
+        addEvent("error", `STOP not confirmed: ${e.message}`);
+      },
+    );
   };
+  const stopTimer = useRef(0);
+  const flashStop = (s: "sent" | "failed") => {
+    setStopState(s);
+    clearTimeout(stopTimer.current);
+    stopTimer.current = window.setTimeout(() => setStopState(""), s === "sent" ? 1500 : 5000);
+  };
+
+  // Escape = STOP, anywhere on the page.
+  const stopRef = useRef(stop);
+  stopRef.current = stop;
+  useEffect(() => {
+    const key = (e: KeyboardEvent) => e.key === "Escape" && stopRef.current();
+    addEventListener("keydown", key);
+    return () => removeEventListener("keydown", key);
+  }, []);
 
   const ctl = status?.control ?? {};
   const max = { linear: ctl.max_linear ?? 0.2, angular: ctl.max_angular ?? 1 };
@@ -111,8 +143,9 @@ function App() {
         <h1>
           <span class="logo">◉</span> VacuumTiger <span class="muted">debug</span>
         </h1>
+        {authError && <span class="error">{authError}</span>}
         <button class="danger big" onClick={stop}>
-          STOP
+          {stopState === "sent" ? "STOP ✓" : stopState === "failed" ? "STOP FAILED" : "STOP"}
         </button>
       </header>
       <main>
@@ -130,12 +163,12 @@ function App() {
         <Boundary title="Hardware">
           <Controls caps={caps} status={status} />
         </Boundary>
-        {caps.includes("slam") && (
+        {caps?.includes("slam") && (
           <Boundary title="SLAM">
             <Slam status={status} />
           </Boundary>
         )}
-        {caps.includes("recordings") && (
+        {caps?.includes("recordings") && (
           <Boundary title="Recordings">
             <Recordings status={status} />
           </Boundary>

@@ -125,7 +125,7 @@ const ACTUATORS = [
   { id: "water_pump", label: "Water pump" },
 ];
 
-export function Controls({ caps, status }: { caps: string[]; status: Json | null }) {
+export function Controls({ caps, status }: { caps: string[] | null; status: Json | null }) {
   const { error, busy, run } = useAction();
   const [speed, setSpeed] = useState(50);
   const act = status?.actuators ?? {};
@@ -142,7 +142,7 @@ export function Controls({ caps, status }: { caps: string[]; status: Json | null
         </button>
       </div>
       <p class="muted">Lidar spin-up takes ~20 s; STOP waits behind it meanwhile.</p>
-      {caps.includes("lease") && (
+      {caps?.includes("lease") && (
         <div class="row">
           <button disabled={busy("lease")} onClick={() => run("lease", () => api("/lease", "POST", { force: true }))}>
             Take control lease
@@ -152,7 +152,9 @@ export function Controls({ caps, status }: { caps: string[]; status: Json | null
           </button>
         </div>
       )}
-      {caps.includes("actuators") ? (
+      {caps === null ? (
+        <p class="muted">loading…</p>
+      ) : caps.includes("actuators") ? (
         <>
           <label class="row">
             Speed {speed}%
@@ -179,6 +181,9 @@ export function Controls({ caps, status }: { caps: string[]; status: Json | null
     </Panel>
   );
 }
+
+/** DhruvaSLAM answers asynchronously: refresh a little later. */
+const later = (f: () => unknown) => () => void setTimeout(f, 1500);
 
 /** Local, filesystem-safe timestamp for map names: 2026-10-18_0931. */
 function stamp() {
@@ -216,7 +221,7 @@ export function Slam({ status }: { status: Json | null }) {
         <button disabled={busy("start")} onClick={() => run("start", () => api("/slam/start_mapping", "POST", { name: `web-${stamp()}` }))}>
           Start mapping
         </button>
-        <button onClick={() => run("stop", () => api("/slam/stop_mapping", "POST", { save: true }))}>
+        <button onClick={() => run("stop", () => api("/slam/stop_mapping", "POST", { save: true }).then(later(refresh)))}>
           Stop + save
         </button>
         <button disabled={busy("clear")} onClick={() => confirm("Clear the map being built?") && run("clear", () => api("/slam/clear_map", "POST"))}>
@@ -236,7 +241,7 @@ export function Slam({ status }: { status: Json | null }) {
           <span class="grow">
             {m.name || m.map_id} <span class="muted">{num(m.area_m2)} m²</span> {m.active && <b>active</b>}
           </span>
-          <button disabled={busy("use")} onClick={() => run("use", () => api(`/maps/${encodeURIComponent(m.map_id)}/enable`, "POST"))}>
+          <button disabled={busy("use")} onClick={() => run("use", () => api(`/maps/${encodeURIComponent(m.map_id)}/enable`, "POST").then(later(refresh)))}>
             Use
           </button>
         </div>
@@ -296,6 +301,10 @@ export function Recordings({ status }: { status: Json | null }) {
 }
 
 const ARM_IDLE_MS = 60_000;
+/** Nothing from the server for this long while driving: the link is suspect, disarm. */
+const LINK_SILENCE_MS = 1500;
+/** Joystick deflection below this is zero (no creeping near the centre). */
+const DEADZONE = 0.1;
 const ZERO = { linear: 0, angular: 0 };
 
 function isTextInput(t: EventTarget | null) {
@@ -307,7 +316,7 @@ function isTextInput(t: EventTarget | null) {
  * Any loss — lease, socket, focus, visibility, STOP — zeroes the command and
  * disarms; re-arming is always a deliberate act.
  */
-export function Teleop(props: { link: Link | null; caps: string[]; holder: boolean; online: boolean; max: { linear: number; angular: number } }) {
+export function Teleop(props: { link: Link | null; caps: string[] | null; holder: boolean; online: boolean; max: { linear: number; angular: number } }) {
   const { link, holder, max } = props;
   const [armed, setArmed] = useState(false);
   const [stick, setStick] = useState({ x: 0, y: 0 });
@@ -316,7 +325,7 @@ export function Teleop(props: { link: Link | null; caps: string[]; holder: boole
   const pad = useRef<HTMLDivElement>(null);
   const keys = useRef(new Set<string>());
 
-  const enabled = props.caps.includes("teleop");
+  const enabled = props.caps?.includes("teleop") ?? false;
   const live = enabled && holder && armed && props.online;
 
   const neutral = () => {
@@ -335,8 +344,13 @@ export function Teleop(props: { link: Link | null; caps: string[]; holder: boole
     if (!live) return;
     lastActive.current = Date.now();
     const t = setInterval(() => {
-      link?.send({ type: "drive", ...cmd.current });
-      if (cmd.current.linear || cmd.current.angular) lastActive.current = Date.now();
+      if ((link?.silentMs() ?? Infinity) > LINK_SILENCE_MS) {
+        setArmed(false); // server unheard: don't drive blind
+        return;
+      }
+      const moving = cmd.current.linear !== 0 || cmd.current.angular !== 0;
+      link?.send({ type: "drive", ...cmd.current }, moving);
+      if (moving) lastActive.current = Date.now();
       else if (Date.now() - lastActive.current > ARM_IDLE_MS) setArmed(false);
     }, 100);
     return () => {
@@ -378,7 +392,13 @@ export function Teleop(props: { link: Link | null; caps: string[]; holder: boole
       setStick({ x: -t, y: -f });
     };
     const down = (e: KeyboardEvent) => {
-      if (isTextInput(e.target)) return;
+      // With a modifier held, macOS never delivers the keyup (Cmd+S would stick
+      // "reverse"): a modifier drops all keys and is otherwise ignored.
+      if (e.metaKey || e.ctrlKey || e.altKey || e.key === "Meta") {
+        neutral();
+        return;
+      }
+      if (isTextInput(e.target) || e.repeat) return;
       const k = e.key.toLowerCase();
       if (!["w", "a", "s", "d", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(k)) return;
       e.preventDefault();
@@ -409,12 +429,14 @@ export function Teleop(props: { link: Link | null; caps: string[]; holder: boole
     const n = Math.hypot(x, y);
     if (n > 1) [x, y] = [x / n, y / n];
     setStick({ x, y });
-    cmd.current = { linear: -y * max.linear, angular: -x * max.angular };
+    cmd.current = n < DEADZONE ? ZERO : { linear: -y * max.linear, angular: -x * max.angular };
   };
 
   return (
     <Panel title="Teleop">
-      {!enabled ? (
+      {props.caps === null ? (
+        <p class="muted">loading…</p>
+      ) : !enabled ? (
         <p class="muted">Disabled in dwar config ([control] allow_drive). Wheels only with the robot on blocks.</p>
       ) : (
         <>
@@ -440,11 +462,12 @@ export function Teleop(props: { link: Link | null; caps: string[]; holder: boole
             onPointerMove={(e) => live && e.buttons && fromPointer(e)}
             onPointerUp={neutral}
             onPointerCancel={neutral}
+            onLostPointerCapture={neutral}
           >
             <div class="knob" style={{ left: `${50 + stick.x * 40}%`, top: `${50 + stick.y * 40}%` }} />
           </div>
           <p class="muted">
-            ≤ {max.linear.toFixed(2)} m/s, {max.angular.toFixed(2)} rad/s · keys WASD · release = stop
+            Wheels only with the robot on blocks. ≤ {max.linear.toFixed(2)} m/s, {max.angular.toFixed(2)} rad/s · keys WASD · release = stop · Esc = STOP
           </p>
         </>
       )}

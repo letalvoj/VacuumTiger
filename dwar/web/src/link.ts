@@ -30,24 +30,35 @@ export function apiUrl(path: string): string {
   return `/api/v1${path}${TOKEN ? `${path.includes("?") ? "&" : "?"}token=${encodeURIComponent(TOKEN)}` : ""}`;
 }
 
+/** Generous default: a lidar enable blocks SangamIO for ~20 s. */
 const API_TIMEOUT_MS = 30_000;
 
-export async function api(path: string, method = "GET", body?: unknown): Promise<Json> {
+/** Thrown for 401: retrying won't help until the token is fixed. */
+export class AuthError extends Error {}
+
+export async function api(path: string, method = "GET", body?: unknown, timeoutMs = API_TIMEOUT_MS): Promise<Json> {
   const headers: Record<string, string> = {};
   if (TOKEN) headers.Authorization = `Bearer ${TOKEN}`;
   if (body !== undefined) headers["Content-Type"] = "application/json";
-  // Generous: a lidar enable blocks SangamIO for ~20 s.
   const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), API_TIMEOUT_MS);
-  const r = await fetch(`/api/v1${path}`, {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-    signal: abort.signal,
-  });
-  const data = await r.json().catch(() => ({})).finally(() => clearTimeout(timer));
-  if (!r.ok) throw new Error(data.error ?? `${r.status} ${r.statusText}`);
-  return data;
+  const timer = setTimeout(() => abort.abort(), timeoutMs);
+  try {
+    const r = await fetch(`/api/v1${path}`, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: abort.signal,
+    });
+    const data = await r.json().catch(() => ({}));
+    if (r.status === 401) throw new AuthError("token rejected: open the page with ?token=…");
+    if (!r.ok) throw new Error(data.error ?? `${r.status} ${r.statusText}`);
+    return data;
+  } catch (e) {
+    if (abort.signal.aborted) throw new Error(`timed out after ${timeoutMs / 1000} s`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export interface Handlers {
@@ -63,6 +74,8 @@ const HIDDEN_RATES = { status: 1, events: 1 };
 /** Status arrives every second; this much silence means a dead link. */
 const SILENCE_MS = 4000;
 const CONNECT_TIMEOUT_MS = 5000;
+/** Bytes queued in the browser beyond which drive commands are dropped. */
+const MAX_BUFFERED = 256;
 
 /** The tab's WebSocket: reconnects with backoff, detects silent links, and
  *  throttles to status-only while the tab is hidden. */
@@ -84,10 +97,20 @@ export class Link {
     this.open();
   }
 
-  send(msg: Json): boolean {
-    if (this.ws?.readyState !== WebSocket.OPEN) return false;
-    this.ws.send(JSON.stringify(msg));
+  /** Send a message. A `droppable` one (a non-zero drive command) is skipped
+   *  when the socket is backed up, so a stalled link never replays a burst
+   *  of motion on recovery; stops and zeroes always go out. */
+  send(msg: Json, droppable = false): boolean {
+    const ws = this.ws;
+    if (ws?.readyState !== WebSocket.OPEN) return false;
+    if (droppable && ws.bufferedAmount > MAX_BUFFERED) return false;
+    ws.send(JSON.stringify(msg));
     return true;
+  }
+
+  /** Milliseconds since the server last sent anything (sensors arrive at 10 Hz). */
+  silentMs(): number {
+    return this.ws ? Date.now() - this.lastRx : Infinity;
   }
 
   close() {
@@ -157,7 +180,7 @@ export class Link {
     if (this.ws !== ws) return;
     clearTimeout(this.connectTimer);
     this.ws = null;
-    ws.onclose = ws.onmessage = null;
+    ws.onopen = ws.onclose = ws.onmessage = null;
     ws.close();
     this.h.online(false);
     if (this.closed) return;

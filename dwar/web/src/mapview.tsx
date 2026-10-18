@@ -127,7 +127,7 @@ export class MapRenderer {
     this.invalidate();
   }
 
-  setScan(s: Scan) {
+  setScan(s: Scan | null) {
     this.scan = s;
     this.invalidate();
   }
