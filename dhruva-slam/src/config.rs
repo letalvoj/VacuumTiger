@@ -22,7 +22,7 @@ use crate::sensors::odometry::{
 };
 use crate::sensors::preprocessing::{
     AngularDownsamplerConfig, LidarOffset, OutlierFilterConfig, PreprocessorConfig,
-    RangeFilterConfig,
+    RangeFilterConfig, Sweep,
 };
 use crate::threads::SlamThreadConfig;
 
@@ -205,6 +205,11 @@ pub struct LidarConfig {
     pub mounting_y: f32,
     pub optical_offset: f32,
     pub angle_offset: f32,
+    /// Angle (rad) of a sweep's first beam, in the frame of the received scan (before
+    /// `angle_offset`). Set it to deskew scans with the odometry (the sweep runs
+    /// clockwise and is stamped at its end, as SangamIO's Delta-2D driver publishes
+    /// it); unset, scans are taken as instantaneous.
+    pub sweep_start_angle: Option<f32>,
 }
 
 impl Default for LidarConfig {
@@ -214,6 +219,7 @@ impl Default for LidarConfig {
             mounting_y: 0.0,
             optical_offset: 0.0258,
             angle_offset: 0.0,
+            sweep_start_angle: None,
         }
     }
 }
@@ -720,6 +726,7 @@ pub fn build_slam_thread_config(config: &Config) -> SlamThreadConfig {
             odometry_type: config.odometry.algorithm_type(),
             odometry_config,
             preprocessor_config,
+            sweep: config.lidar.sweep_start_angle.map(|start_angle| Sweep { start_angle }),
         },
     }
 }

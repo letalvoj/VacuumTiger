@@ -27,11 +27,13 @@
 //! ```
 
 mod converter;
+mod deskew;
 mod downsampler;
 mod outlier;
 mod range_filter;
 
 pub use converter::ScanConverter;
+pub use deskew::Sweep;
 pub use downsampler::{AngularDownsampler, AngularDownsamplerConfig};
 pub use outlier::{OutlierFilter, OutlierFilterConfig};
 pub use range_filter::{RangeFilter, RangeFilterConfig};
