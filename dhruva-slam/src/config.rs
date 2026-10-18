@@ -175,6 +175,10 @@ pub struct SlamConfig {
     pub reference_update_distance: f32,
     /// ... or after this rotation (rad)
     pub reference_update_angle: f32,
+    /// Local-map matching: the last this many keyframes; 0 = off
+    pub local_map_keyframes: usize,
+    /// ... within this distance (m) of the predicted pose
+    pub local_map_max_distance: f32,
 }
 
 impl Default for SlamConfig {
@@ -189,6 +193,8 @@ impl Default for SlamConfig {
             max_translation_deviation: 0.5, // 50cm
             reference_update_distance: 0.0,
             reference_update_angle: 0.3,
+            local_map_keyframes: 0,
+            local_map_max_distance: 8.0,
         }
     }
 }
@@ -707,6 +713,8 @@ pub fn build_slam_config(config: &Config) -> OnlineSlamConfig {
         max_translation_deviation: config.slam.max_translation_deviation,
         reference_update_distance: config.slam.reference_update_distance,
         reference_update_angle: config.slam.reference_update_angle,
+        local_map_keyframes: config.slam.local_map_keyframes,
+        local_map_max_distance: config.slam.local_map_max_distance,
         loop_closure: SlamLoopClosureConfig {
             enabled: config.loop_closure.enabled,
             detection_interval: config.loop_closure.detection_interval,

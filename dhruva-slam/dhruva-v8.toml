@@ -57,9 +57,15 @@ encoder_weight = 0.8
 use_submap_matching = false
 max_theta_deviation = 0.35
 max_translation_deviation = 0.5
-# Reference-scan matching (0 = scan-to-scan, which drifts with p2l): see docs/SLAM_BENCH.md
+# Reference-scan matching (0 = scan-to-scan, which drifts with p2l): see docs/SLAM_BENCH.md.
+# Not used while local-map matching is on.
 reference_update_distance = 0.2
 reference_update_angle = 0.3
+# Local-map matching: each scan against the last 20 keyframes (one per 0.2 m or
+# 0.2 rad, [keyframe]). Measured on the first real floor run and the mock benches:
+# docs/SLAM_LAB.md in the parent project.
+local_map_keyframes = 20
+local_map_max_distance = 8.0
 
 [matcher]
 # p2l against a reference scan ([slam] reference_update_distance = 0.2): ATE 1.1/1.6 cm
@@ -92,10 +98,11 @@ multires_window_theta = 0.2
 multires_levels = 3
 
 [keyframe]
-min_translation = 0.5
-min_rotation = 0.5
+# Dense keyframes: they are the local map (see [slam] local_map_keyframes).
+min_translation = 0.2
+min_rotation = 0.2
 max_keyframes = 1000
-min_interval_ms = 500
+min_interval_ms = 0
 
 [submap]
 scans_per_submap = 100

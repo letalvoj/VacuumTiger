@@ -177,6 +177,16 @@ pub struct OnlineSlamConfig {
     pub reference_update_distance: f32,
     /// ... or after turning this much (rad).
     pub reference_update_angle: f32,
+
+    /// Local-map matching (Karto's scan buffer): while mapping, match each scan
+    /// against the union of the this-many most recent keyframe scans (within
+    /// `local_map_max_distance`), at their current poses. 0 = off. Precedence:
+    /// localization against a reference map, then (broken) submap matching, then
+    /// local map, then reference scan, then scan-to-scan.
+    pub local_map_keyframes: usize,
+    /// Keyframes farther than this (m) from the predicted pose are left out of
+    /// the local map. A safety net after a jump: recent keyframes are nearby anyway.
+    pub local_map_max_distance: f32,
 }
 
 impl Default for OnlineSlamConfig {
@@ -201,6 +211,8 @@ impl Default for OnlineSlamConfig {
             max_translation_deviation: 0.5, // 50cm
             reference_update_distance: 0.0,
             reference_update_angle: 0.3,
+            local_map_keyframes: 0,
+            local_map_max_distance: 8.0,
         }
     }
 }
@@ -252,6 +264,9 @@ pub struct OnlineSlam {
     ref_scan: Option<PointCloud2D>,
     /// Pose of `ref_scan`.
     ref_pose: Pose2D,
+
+    /// Buffer for the local map cloud (see `local_map_keyframes`), reused per scan.
+    local_map: PointCloud2D,
 
     /// Operating mode.
     mode: SlamMode,
@@ -338,6 +353,7 @@ impl OnlineSlam {
             has_previous_scan: false,
             ref_scan: None,
             ref_pose: Pose2D::identity(),
+            local_map: PointCloud2D::with_capacity(4096),
             current_pose: Pose2D::identity(),
             covariance: Covariance2D::diagonal(0.01, 0.01, 0.01),
             mode: SlamMode::Mapping,
@@ -516,12 +532,6 @@ impl OnlineSlam {
         }
     }
 
-    /// Match scan to previous scan (scan-to-scan matching).
-    ///
-    /// The scan matcher aligns source (current scan) to target (previous scan).
-    /// The returned transform represents the robot motion from previous to current.
-    /// We pass odom_delta directly as the initial guess since it's exactly the
-    /// expected robot motion.
     /// Match against the reference scan; `guess` is reference -> predicted pose.
     fn match_to_reference_scan(
         &mut self,
@@ -536,6 +546,45 @@ impl OnlineSlam {
         (result.converged && result.score >= self.config.min_match_score).then_some(result)
     }
 
+    /// Match against the local map: the `local_map_keyframes` most recent keyframe
+    /// scans within `local_map_max_distance` of the predicted pose, in the map
+    /// frame. The result's transform is the robot pose in the map frame.
+    fn match_to_local_map(
+        &mut self,
+        scan: &PointCloud2D,
+        predicted_pose: &Pose2D,
+    ) -> Option<ScanMatchResult> {
+        let max_d2 = self.config.local_map_max_distance.powi(2);
+        let mut local = std::mem::take(&mut self.local_map);
+        local.clear();
+        for kf in self
+            .keyframes
+            .keyframes()
+            .iter()
+            .rev()
+            .filter(|kf| {
+                (kf.pose.x - predicted_pose.x).powi(2) + (kf.pose.y - predicted_pose.y).powi(2)
+                    <= max_d2
+            })
+            .take(self.config.local_map_keyframes)
+        {
+            let (s, c) = kf.pose.theta.sin_cos();
+            for (x, y) in kf.scan.xs.iter().zip(&kf.scan.ys) {
+                local.push_xy(kf.pose.x + c * x - s * y, kf.pose.y + s * x + c * y);
+            }
+        }
+        let result = (local.len() >= self.config.min_scan_points)
+            .then(|| self.matcher.match_scans(scan, &local, predicted_pose));
+        self.local_map = local;
+        result.filter(|r| r.converged && r.score >= self.config.min_match_score)
+    }
+
+    /// Match scan to previous scan (scan-to-scan matching).
+    ///
+    /// The scan matcher aligns source (current scan) to target (previous scan).
+    /// The returned transform represents the robot motion from previous to current.
+    /// We pass odom_delta directly as the initial guess since it's exactly the
+    /// expected robot motion.
     fn match_to_previous_scan(
         &mut self,
         scan: &PointCloud2D,
@@ -626,7 +675,8 @@ impl OnlineSlam {
     /// fast rotation where the matcher finds wrong local minima.
     /// `base` is the pose of the scan matched against and `odom_delta` the odometry
     /// guess from it: (current pose, odometry delta) for scan-to-scan, (reference pose,
-    /// reference -> predicted) for reference-scan matching.
+    /// reference -> predicted) for reference-scan matching, (identity, predicted pose)
+    /// for local-map matching.
     fn apply_scan_match(
         &mut self,
         match_result: &ScanMatchResult,
@@ -895,9 +945,21 @@ impl SlamEngine for OnlineSlam {
         // has travelled `reference_update_distance` (or turned `reference_update_angle`)
         // from it, so a biased matcher cannot integrate its bias every frame
         // (scan-to-scan p2l drifted 0.5 m in 108 s on a static v8 recording).
-        let use_reference = self.config.reference_update_distance > 0.0 && self.ref_scan.is_some();
-        let (match_base, match_guess) = if use_reference {
-            (self.ref_pose, self.ref_pose.inverse().compose(&predicted_pose))
+        // Keyframes only grow while mapping: elsewhere they would be a stale map.
+        let use_local_map = self.mode == SlamMode::Mapping
+            && self.config.local_map_keyframes > 0
+            && !self.keyframes.keyframes().is_empty();
+        let use_reference = !use_local_map
+            && self.config.reference_update_distance > 0.0
+            && self.ref_scan.is_some();
+        // The pose the match is relative to, and the odometry guess from it.
+        let (match_base, match_guess) = if use_local_map {
+            (Pose2D::identity(), predicted_pose)
+        } else if use_reference {
+            (
+                self.ref_pose,
+                self.ref_pose.inverse().compose(&predicted_pose),
+            )
         } else {
             (self.current_pose, *odom_delta)
         };
@@ -910,6 +972,8 @@ impl SlamEngine for OnlineSlam {
             } else if self.config.use_submap_matching && self.submaps.active_submap().is_some() {
                 // Mapping mode with submap matching
                 (self.match_to_submap(scan, &predicted_pose), false)
+            } else if use_local_map {
+                (self.match_to_local_map(scan, &predicted_pose), false)
             } else if use_reference {
                 (self.match_to_reference_scan(scan, &match_guess), false)
             } else {
@@ -934,15 +998,16 @@ impl SlamEngine for OnlineSlam {
 
                     // Debug: log every 10th scan to track drift
                     if self.num_scans.is_multiple_of(10) {
-                        let odom_theta_deg = odom_delta.theta.to_degrees();
-                        let match_theta_deg = mr.transform.theta.to_degrees();
-                        let diff_theta_deg = (mr.transform.theta - odom_delta.theta).to_degrees();
+                        // The match and its odometry guess are relative to the same
+                        // base (previous scan, reference scan or map origin).
+                        let correction = crate::core::math::normalize_angle(
+                            mr.transform.theta - match_guess.theta,
+                        );
                         log::debug!(
-                            "Scan {}: odom_dθ={:.2}° match_dθ={:.2}° diff={:.2}° score={:.2}",
+                            "Scan {}: odom_dθ={:.2}° match correction={:.2}° score={:.2}",
                             self.num_scans,
-                            odom_theta_deg,
-                            match_theta_deg,
-                            diff_theta_deg,
+                            odom_delta.theta.to_degrees(),
+                            correction.to_degrees(),
                             mr.score
                         );
                     }
@@ -993,9 +1058,11 @@ impl SlamEngine for OnlineSlam {
                 .keyframes
                 .should_create_keyframe(&refined_pose, timestamp_us)
             {
-                self.keyframes
-                    .create_keyframe(refined_pose, scan.clone(), timestamp_us, submap_id);
-                let kf_id = self.keyframes.len() as u64 - 1;
+                // The id, not the index: the oldest keyframes are dropped at the cap.
+                let kf_id = self
+                    .keyframes
+                    .create_keyframe(refined_pose, scan.clone(), timestamp_us, submap_id)
+                    .id;
                 self.submaps.add_keyframe_to_active(kf_id);
                 result.keyframe_created = true;
 
@@ -1098,6 +1165,64 @@ mod tests {
             scan.push(Point2D::new(5.0 + x_noise, y));
         }
         scan
+    }
+
+    /// A 360-ray scan from `pose` inside the box [0, w] x [0, h], in the robot frame.
+    fn box_scan(pose: &Pose2D, w: f32, h: f32) -> PointCloud2D {
+        let mut scan = PointCloud2D::new();
+        for i in 0..360 {
+            let a = (i as f32).to_radians();
+            let (s, c) = (pose.theta + a).sin_cos();
+            let mut t = f32::INFINITY;
+            for (d, lo, hi, p) in [(c, 0.0, w, pose.x), (s, 0.0, h, pose.y)] {
+                if d.abs() > 1e-6 {
+                    let bound = if d > 0.0 { hi } else { lo };
+                    t = t.min((bound - p) / d);
+                }
+            }
+            scan.push(Point2D::new(t * a.cos(), t * a.sin()));
+        }
+        scan
+    }
+
+    #[test]
+    fn local_map_matching_holds_the_pose_against_biased_odometry() {
+        let config = OnlineSlamConfig {
+            local_map_keyframes: 5,
+            keyframe: KeyframeManagerConfig {
+                min_translation: 0.2,
+                min_rotation: 0.2,
+                min_interval_us: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut slam = OnlineSlam::new(config);
+        // The map frame starts at the robot: truth (1.0, 1.5) in the box is map (0, 0).
+        let start = Pose2D::new(1.0, 1.5, 0.0);
+        let mut truth = start;
+        for i in 0..20 {
+            let step = Pose2D::new(0.1, 0.0, 0.01);
+            truth = truth.compose(&step);
+            // Odometry over-reports the distance by 20% and the turn by half.
+            let odom = Pose2D::new(0.12, 0.0, 0.015);
+            slam.process_scan(&box_scan(&truth, 4.0, 3.0), &odom, i * 200_000);
+        }
+        let p = slam.current_pose();
+        let truth = start.inverse().compose(&truth);
+        assert!(
+            slam.keyframes().len() > 5,
+            "{} keyframes",
+            slam.keyframes().len()
+        );
+        assert!(
+            (p.x - truth.x).abs() < 0.03 && (p.y - truth.y).abs() < 0.03,
+            "pose {p:?} vs truth {truth:?}"
+        );
+        assert!(
+            (p.theta - truth.theta).abs() < 0.01,
+            "pose {p:?} vs truth {truth:?}"
+        );
     }
 
     #[test]
