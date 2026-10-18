@@ -6,7 +6,6 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::algorithms::descriptors::LidarIrisConfig;
 use crate::algorithms::mapping::{MapIntegratorConfig, OccupancyGridConfig};
 use crate::algorithms::matching::{
     CorrelativeConfig, DynMatcherConfig, IcpConfig, MatcherType, MultiResolutionConfig,
@@ -386,14 +385,10 @@ impl Default for MapConfig {
 #[serde(default)]
 pub struct LoopClosureConfig {
     pub enabled: bool,
+    /// Look for a closure on every N-th keyframe.
     pub detection_interval: usize,
-    pub min_keyframe_gap: usize,
-    pub optimization_threshold: usize,
-    pub max_candidates: usize,
-    #[serde(default)]
-    pub iris: IrisConfig,
-    #[serde(default)]
-    pub matching: LoopMatchingConfig,
+    #[serde(flatten)]
+    pub detector: LoopDetectorConfig,
 }
 
 impl Default for LoopClosureConfig {
@@ -401,47 +396,7 @@ impl Default for LoopClosureConfig {
         Self {
             enabled: true,
             detection_interval: 5,
-            min_keyframe_gap: 20,
-            optimization_threshold: 3,
-            max_candidates: 5,
-            iris: IrisConfig::default(),
-            matching: LoopMatchingConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-pub struct IrisConfig {
-    pub num_rows: usize,
-    pub num_cols: usize,
-    pub max_range: f32,
-    pub signature_bits: usize,
-}
-
-impl Default for IrisConfig {
-    fn default() -> Self {
-        Self {
-            num_rows: 80,
-            num_cols: 360,
-            max_range: 8.0,
-            signature_bits: 640,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-pub struct LoopMatchingConfig {
-    pub max_hamming_distance: u32,
-    pub min_icp_score: f32,
-}
-
-impl Default for LoopMatchingConfig {
-    fn default() -> Self {
-        Self {
-            max_hamming_distance: 100,
-            min_icp_score: 0.5,
+            detector: LoopDetectorConfig::default(),
         }
     }
 }
@@ -718,21 +673,7 @@ pub fn build_slam_config(config: &Config) -> OnlineSlamConfig {
         loop_closure: SlamLoopClosureConfig {
             enabled: config.loop_closure.enabled,
             detection_interval: config.loop_closure.detection_interval,
-            optimization_threshold: config.loop_closure.optimization_threshold,
-            detector: LoopDetectorConfig {
-                min_node_distance: config.loop_closure.min_keyframe_gap,
-                max_hamming_distance: config.loop_closure.matching.max_hamming_distance,
-                min_match_score: config.loop_closure.matching.min_icp_score,
-                max_candidates: config.loop_closure.max_candidates,
-                iris_config: LidarIrisConfig {
-                    num_rows: config.loop_closure.iris.num_rows,
-                    num_cols: config.loop_closure.iris.num_cols,
-                    max_range: config.loop_closure.iris.max_range,
-                    signature_bits: config.loop_closure.iris.signature_bits,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
+            detector: config.loop_closure.detector.clone(),
             optimizer: GraphOptimizerConfig {
                 max_iterations: config.optimization.max_iterations as u32,
                 convergence_threshold: config.optimization.tolerance,
@@ -780,5 +721,23 @@ pub fn build_slam_thread_config(config: &Config) -> SlamThreadConfig {
             odometry_config,
             preprocessor_config,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loop_closure_keys_are_flat_and_optional() {
+        let config: LoopClosureConfig =
+            basic_toml::from_str("enabled = false\nsearch_radius = 2.5\nmin_score = 0.7\n")
+                .unwrap();
+        let defaults = LoopDetectorConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.detection_interval, 5);
+        assert_eq!(config.detector.search_radius, 2.5);
+        assert_eq!(config.detector.min_score, 0.7);
+        assert_eq!(config.detector.area_keyframes, defaults.area_keyframes);
     }
 }

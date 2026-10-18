@@ -42,6 +42,14 @@ impl Keyframe {
             submap_id,
         }
     }
+
+    /// Append the scan, placed at the keyframe pose, to a world-frame cloud.
+    pub fn push_world_points(&self, into: &mut PointCloud2D) {
+        let (s, c) = self.pose.theta.sin_cos();
+        for (x, y) in self.scan.xs.iter().zip(&self.scan.ys) {
+            into.push_xy(self.pose.x + c * x - s * y, self.pose.y + s * x + c * y);
+        }
+    }
 }
 
 /// Scan context descriptor for place recognition.
@@ -65,9 +73,8 @@ pub struct ScanContext {
     ring_key: Vec<f32>,
 }
 
-// Note: ScanContext is currently used only by loop_detector.rs but kept here
-// for potential future use. The descriptor() and ring_key() public getters
-// were removed as they were unused.
+// Note: ScanContext is currently unused (the proximity loop detector needs no
+// descriptor); to be removed with the IRIS descriptors.
 
 impl ScanContext {
     /// Default number of sectors (angular divisions).

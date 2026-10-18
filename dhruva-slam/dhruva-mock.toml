@@ -101,21 +101,19 @@ occupied_threshold = 0.5
 free_threshold = -0.5
 
 [loop_closure]
+# Proximity closures: every detection_interval-th keyframe is matched (wide
+# correlative search, then the fine matcher) against old keyframes near it.
+# See src/engine/graph/loop_detector.rs.
 enabled = true
 detection_interval = 5
-min_keyframe_gap = 20
-optimization_threshold = 3
-max_candidates = 5
-
-[loop_closure.iris]
-num_rows = 80
-num_cols = 360
-max_range = 6.0
-signature_bits = 640
-
-[loop_closure.matching]
-max_hamming_distance = 100
-min_icp_score = 0.5
+min_keyframe_gap = 30
+search_radius = 1.5
+area_keyframes = 10
+search_window_xy = 0.5
+search_window_theta = 0.35
+min_score = 0.6
+std_xy = 0.03
+std_theta = 0.015
 
 [optimization]
 solver = "sparse_cg"

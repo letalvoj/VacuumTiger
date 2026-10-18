@@ -32,7 +32,7 @@
 //! # Components
 //!
 //! - [`PoseGraph`]: Graph data structure with nodes (poses) and edges (constraints)
-//! - [`LoopDetector`]: Detects potential loop closures using scan context
+//! - [`LoopDetector`]: Proximity loop closures verified by scan matching
 //! - [`GraphOptimizer`]: Optimizes the pose graph to minimize constraint errors
 //!
 //! # Example
@@ -67,7 +67,7 @@ mod optimizer;
 mod pose_graph;
 
 // Loop closure detection - used by OnlineSlam
-pub use loop_detector::{LoopClosureCandidate, LoopDetector, LoopDetectorConfig};
+pub use loop_detector::{LoopClosure, LoopDetector, LoopDetectorConfig};
 
 // Graph optimization - used by OnlineSlam
 pub use optimizer::{GraphOptimizer, GraphOptimizerConfig};

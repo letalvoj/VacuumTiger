@@ -260,51 +260,19 @@ free_threshold = -0.5
 # ============================================================================
 
 [loop_closure]
-# Enable loop closure detection and pose graph optimization
+# Proximity closures: every detection_interval-th keyframe is matched (wide
+# correlative search, then the fine matcher) against old keyframes near it.
+# See src/engine/graph/loop_detector.rs.
 enabled = true
-
-# Check for loop closures every N keyframes
 detection_interval = 5
-
-# Minimum keyframe gap before considering loop closure (in graph nodes)
-# Prevents detecting loops with recent poses
-min_keyframe_gap = 20
-
-# Number of loop closures required to trigger optimization
-optimization_threshold = 3
-
-# Maximum candidates to verify with ICP per detection
-max_candidates = 5
-
-# ============================================================================
-# LiDAR-IRIS Descriptor Configuration
-# ============================================================================
-
-[loop_closure.iris]
-# Number of radial bins (distance divisions)
-num_rows = 80
-
-# Number of angular bins (360° divisions, 1° resolution)
-num_cols = 360
-
-# Maximum range to consider (meters)
-max_range = 6.0
-
-# Number of bits in binary signature (must be multiple of 64)
-# 640 bits = 80 bytes per keyframe
-signature_bits = 640
-
-# ============================================================================
-# Loop Closure Matching Configuration
-# ============================================================================
-
-[loop_closure.matching]
-# Maximum Hamming distance for IRIS matching (out of 640 bits)
-# Lower = stricter matching. 100 = ~15% bit difference
-max_hamming_distance = 100
-
-# Minimum ICP score to accept a loop closure (0.0 - 1.0)
-min_icp_score = 0.5
+min_keyframe_gap = 30
+search_radius = 1.5
+area_keyframes = 10
+search_window_xy = 0.5
+search_window_theta = 0.35
+min_score = 0.6
+std_xy = 0.03
+std_theta = 0.015
 
 # ============================================================================
 # Pose Graph Optimization Configuration

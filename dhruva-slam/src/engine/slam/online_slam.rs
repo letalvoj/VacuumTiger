@@ -7,10 +7,10 @@
 //!
 //! When loop closure is enabled, the system:
 //! 1. Builds a pose graph as keyframes are created
-//! 2. Uses LiDAR-IRIS descriptors for fast place recognition
-//! 3. Verifies candidates with ICP scan matching
-//! 4. Optimizes the pose graph when closures are detected
-//! 5. Corrects keyframe poses after optimization
+//! 2. On every `detection_interval`-th keyframe, matches it against nearby old
+//!    keyframes (see [`LoopDetector`])
+//! 3. Optimizes the pose graph on every closure
+//! 4. Moves keyframes, the current pose and the map onto the optimized graph
 
 use crate::algorithms::mapping::{
     MapIntegrator, MapIntegratorConfig, OccupancyGrid, OccupancyGridConfig,
@@ -20,8 +20,8 @@ use crate::algorithms::matching::{
 };
 use crate::core::types::{Covariance2D, PointCloud2D, Pose2D};
 use crate::engine::graph::{
-    GraphOptimizer, GraphOptimizerConfig, Information2D, LoopClosureCandidate, LoopDetector,
-    LoopDetectorConfig, PoseGraph, PoseNode,
+    GraphOptimizer, GraphOptimizerConfig, Information2D, LoopDetector, LoopDetectorConfig,
+    PoseGraph, PoseNode,
 };
 
 use super::SlamEngine;
@@ -93,9 +93,6 @@ pub struct LoopClosureConfig {
     /// Check for loop closures every N keyframes.
     pub detection_interval: usize,
 
-    /// Number of loop closures required to trigger optimization.
-    pub optimization_threshold: usize,
-
     /// Loop detector configuration.
     pub detector: LoopDetectorConfig,
 
@@ -108,7 +105,6 @@ impl Default for LoopClosureConfig {
         Self {
             enabled: true,
             detection_interval: 5,
-            optimization_threshold: 3,
             detector: LoopDetectorConfig::default(),
             optimizer: GraphOptimizerConfig::default(),
         }
@@ -293,7 +289,7 @@ pub struct OnlineSlam {
     // ========================================================================
     // Loop Closure Components
     // ========================================================================
-    /// Loop closure detector (uses LiDAR-IRIS descriptors).
+    /// Proximity loop closure detector.
     loop_detector: Option<LoopDetector>,
 
     /// Pose graph for loop closure optimization.
@@ -301,9 +297,6 @@ pub struct OnlineSlam {
 
     /// Graph optimizer for pose graph.
     graph_optimizer: GraphOptimizer,
-
-    /// Pending loop closure candidates waiting for optimization.
-    pending_closures: Vec<LoopClosureCandidate>,
 
     /// Previous keyframe pose (for computing odometry edges).
     prev_keyframe_pose: Option<Pose2D>,
@@ -372,7 +365,6 @@ impl OnlineSlam {
             loop_detector,
             pose_graph: PoseGraph::new(),
             graph_optimizer,
-            pending_closures: Vec::new(),
             prev_keyframe_pose: None,
             total_loop_closures: 0,
             total_optimizations: 0,
@@ -578,10 +570,7 @@ impl OnlineSlam {
             })
             .take(self.config.local_map_keyframes)
         {
-            let (s, c) = kf.pose.theta.sin_cos();
-            for (x, y) in kf.scan.xs.iter().zip(&kf.scan.ys) {
-                local.push_xy(kf.pose.x + c * x - s * y, kf.pose.y + s * x + c * y);
-            }
+            kf.push_world_points(&mut local);
         }
         let result = (local.len() >= self.config.min_scan_points)
             .then(|| self.matcher.match_scans(scan, &local, predicted_pose));
@@ -761,29 +750,13 @@ impl OnlineSlam {
     // Loop Closure Methods
     // ========================================================================
 
-    /// Process a new keyframe for loop closure detection.
-    ///
-    /// This method:
-    /// 1. Adds the keyframe to the pose graph
-    /// 2. Adds an odometry edge from the previous keyframe
-    /// 3. Adds the scan to the descriptor database
-    /// 4. Detects loop closures (every N keyframes)
-    /// 5. Triggers optimization when enough closures are found
-    fn process_keyframe_for_loop_closure(
-        &mut self,
-        kf_id: u64,
-        scan: &PointCloud2D,
-        pose: &Pose2D,
-        timestamp_us: u64,
-    ) {
-        // 1. Add node to pose graph
+    /// Add a new keyframe to the pose graph and look for a loop closure.
+    fn process_keyframe_for_loop_closure(&mut self, kf_id: u64, pose: &Pose2D, timestamp_us: u64) {
         let node = PoseNode::new(kf_id, *pose, timestamp_us).with_keyframe(kf_id);
         self.pose_graph.add_node_full(node);
 
-        // 2. Add odometry edge from previous keyframe
         if let Some(prev_pose) = self.prev_keyframe_pose {
             let odom_delta = prev_pose.inverse().compose(pose);
-            // Use information matrix based on scan match quality
             let info = Information2D::from_std_dev(0.05, 0.05, 0.03); // ~5cm, ~2deg
             self.pose_graph
                 .add_odometry_edge(kf_id - 1, kf_id, odom_delta, info);
@@ -793,61 +766,46 @@ impl OnlineSlam {
         }
         self.prev_keyframe_pose = Some(*pose);
 
-        // 3. Add scan to descriptor database
-        if let Some(detector) = &mut self.loop_detector {
-            detector.add_keyframe(kf_id, scan);
-        }
-
-        // 4. Detect loop closures (every detection_interval keyframes)
-        let detection_interval = self.config.loop_closure.detection_interval;
-        if kf_id > 0 && (kf_id as usize).is_multiple_of(detection_interval) {
-            self.detect_loop_closures(kf_id, scan, pose);
-        }
-
-        // 5. Trigger optimization if enough closures pending
-        let optimization_threshold = self.config.loop_closure.optimization_threshold;
-        if self.pending_closures.len() >= optimization_threshold {
-            self.optimize_pose_graph();
+        if (kf_id as usize).is_multiple_of(self.config.loop_closure.detection_interval) {
+            self.detect_loop_closure(kf_id);
         }
     }
 
-    /// Detect loop closures for a keyframe.
-    fn detect_loop_closures(&mut self, query_id: u64, scan: &PointCloud2D, pose: &Pose2D) {
+    /// Match keyframe `kf_id` against nearby old keyframes; optimize on a closure.
+    fn detect_loop_closure(&mut self, kf_id: u64) {
+        let Some(detector) = &mut self.loop_detector else {
+            return;
+        };
         let keyframes = self.keyframes.keyframes();
-
-        // Use the detector to find candidates
-        if let Some(detector) = &mut self.loop_detector {
-            let candidates = detector.detect(query_id, scan, pose, keyframes);
-
-            for candidate in candidates {
-                log::info!(
-                    "Loop closure detected: {} -> {} (score: {:.2})",
-                    candidate.query_id,
-                    candidate.match_id,
-                    candidate.confidence
-                );
-
-                // Add loop closure edge to pose graph
-                self.pose_graph.add_loop_closure_edge(
-                    candidate.query_id,
-                    candidate.match_id,
-                    candidate.relative_pose,
-                    candidate.information,
-                    candidate.confidence,
-                );
-
-                self.total_loop_closures += 1;
-                self.pending_closures.push(candidate);
-            }
-        }
+        let Some(query) = keyframes.last().filter(|kf| kf.id == kf_id) else {
+            return;
+        };
+        let Some(closure) = detector.detect(query, keyframes, &mut self.matcher) else {
+            return;
+        };
+        let r = closure.relative_pose;
+        log::info!(
+            "Loop closure {} -> {}: ({:.2}, {:.2}, {:.1}°) score {:.2}",
+            closure.match_id,
+            closure.query_id,
+            r.x,
+            r.y,
+            r.theta.to_degrees(),
+            closure.confidence
+        );
+        self.pose_graph.add_loop_closure_edge(
+            closure.match_id,
+            closure.query_id,
+            closure.relative_pose,
+            closure.information,
+            closure.confidence,
+        );
+        self.total_loop_closures += 1;
+        self.optimize_pose_graph();
     }
 
     /// Optimize the pose graph and apply corrections.
     fn optimize_pose_graph(&mut self) {
-        if self.pose_graph.num_nodes() < 3 {
-            return;
-        }
-
         log::info!(
             "Optimizing pose graph: {} nodes, {} edges ({} loop closures)",
             self.pose_graph.num_nodes(),
@@ -856,7 +814,8 @@ impl OnlineSlam {
         );
 
         let result = self.graph_optimizer.optimize(&mut self.pose_graph);
-
+        // The optimizer rejects steps that blow the error up, so an unconverged
+        // graph is still a usable (partial) correction: always apply it.
         if result.converged {
             log::info!(
                 "Optimization converged in {} iterations (error: {:.4} -> {:.4})",
@@ -864,24 +823,20 @@ impl OnlineSlam {
                 result.initial_error,
                 result.final_error
             );
-
-            // Apply corrections to keyframes and current pose
-            self.apply_pose_corrections();
-            self.total_optimizations += 1;
         } else {
             log::warn!(
-                "Optimization did not converge: {:?}",
-                result.termination_reason
+                "Optimization stopped ({:?}), error {:.4} -> {:.4}",
+                result.termination_reason,
+                result.initial_error,
+                result.final_error
             );
         }
-
-        // Clear pending closures after optimization
-        self.pending_closures.clear();
+        self.apply_pose_corrections();
+        self.total_optimizations += 1;
     }
 
-    /// Apply pose corrections from optimized graph to keyframes.
+    /// Move keyframes, the current pose and the map onto the optimized graph.
     fn apply_pose_corrections(&mut self) {
-        // Update keyframe poses from optimized graph
         for node in self.pose_graph.nodes() {
             if let Some(kf_id) = node.keyframe_id
                 && let Some(kf) = self.keyframes.get_mut(kf_id)
@@ -890,13 +845,15 @@ impl OnlineSlam {
             }
         }
 
-        // Update current pose if we have a latest node
+        // Closures are only searched when a keyframe is created, where the current
+        // pose is that keyframe's pose.
         if let Some(latest) = self.pose_graph.latest_node() {
             self.current_pose = latest.pose;
             self.prev_keyframe_pose = Some(latest.pose);
         }
 
-        // Invalidate global map cache (will be rebuilt with corrected poses)
+        // Both were placed with the old poses.
+        self.ref_scan = None;
         self.invalidate_global_map();
 
         log::debug!(
@@ -915,7 +872,7 @@ impl OnlineSlam {
         self.total_loop_closures
     }
 
-    /// Get total optimizations performed.
+    /// Get total optimizations run (converged or not).
     pub fn total_optimizations(&self) -> usize {
         self.total_optimizations
     }
@@ -1078,12 +1035,7 @@ impl SlamEngine for OnlineSlam {
 
                 // Loop closure integration
                 if self.loop_detector.is_some() {
-                    self.process_keyframe_for_loop_closure(
-                        kf_id,
-                        scan,
-                        &refined_pose,
-                        timestamp_us,
-                    );
+                    self.process_keyframe_for_loop_closure(kf_id, &refined_pose, timestamp_us);
                 }
             }
         }
@@ -1134,11 +1086,7 @@ impl SlamEngine for OnlineSlam {
         self.is_lost = false;
         self.last_match_score = 1.0;
         // Reset loop closure state
-        if let Some(detector) = &mut self.loop_detector {
-            detector.clear();
-        }
         self.pose_graph.clear();
-        self.pending_closures.clear();
         self.prev_keyframe_pose = None;
         self.total_loop_closures = 0;
         self.total_optimizations = 0;

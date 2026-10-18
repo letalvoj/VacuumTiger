@@ -248,41 +248,25 @@ let info = Information2D::scaled(100.0);
 
 ### LoopDetector
 
-Detects loop closures using LiDAR-IRIS descriptors:
+Proximity loop closure (Karto / slam_toolbox style). A query keyframe is matched against
+the old keyframes near it: a wide multi-resolution correlative search, then the SLAM's
+fine matcher; the closure is kept only if both agree and score above `min_score`.
 
 ```rust
-use crate::engine::graph::{LoopDetector, LoopDetectorConfig, LoopClosureCandidate};
+use crate::engine::graph::{LoopDetector, LoopDetectorConfig};
 
-let config = LoopDetectorConfig {
-    min_keyframe_gap: 20,        // Skip recent poses
-    max_candidates: 5,           // Top-K candidates for ICP
-    max_hamming_distance: 100,   // IRIS threshold
-    min_icp_score: 0.5,          // ICP verification threshold
-};
-
-let mut detector = LoopDetector::new(config);
-
-// Add keyframe to database
-detector.add_keyframe(kf_id, &scan, &pose);
-
-// Detect loop closures
-let candidates: Vec<LoopClosureCandidate> = detector.detect(
-    query_id,
-    &query_scan,
-    &query_pose,
-    &keyframes,
-);
-
-for candidate in candidates {
-    println!("Loop: {} -> {} (confidence: {:.2})",
-        candidate.query_id, candidate.match_id, candidate.confidence);
+let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+if let Some(closure) = detector.detect(&query_keyframe, keyframes, &mut fine_matcher) {
+    // closure.relative_pose = T_match⁻¹ · T_query
+    graph.add_loop_closure_edge(closure.match_id, closure.query_id,
+        closure.relative_pose, closure.information, closure.confidence);
 }
 ```
 
-### LoopClosureCandidate
+### LoopClosure
 
 ```rust
-pub struct LoopClosureCandidate {
+pub struct LoopClosure {
     pub query_id: u64,           // Current keyframe
     pub match_id: u64,           // Matched keyframe
     pub relative_pose: Pose2D,   // Transform from match to query
@@ -426,6 +410,6 @@ loop {
 | Scan matching | 20-50ms | Depends on matcher |
 | Map integration | 5-10ms | Per scan |
 | Keyframe creation | <1ms | Bookkeeping only |
-| Loop detection | 2-5ms | IRIS + ICP verify |
+| Loop detection | ~2ms (Mac) | correlative + fine matcher, every 5th keyframe |
 | Graph optimization (100 nodes) | 10ms | Sparse CG |
 | Graph optimization (1000 nodes) | 50ms | Sparse CG |

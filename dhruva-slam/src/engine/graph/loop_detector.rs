@@ -1,278 +1,175 @@
-//! Loop closure detection for pose graph SLAM.
+//! Proximity loop closure detection (Karto / slam_toolbox style).
 //!
-//! Detects when the robot revisits a previously mapped area by comparing
-//! current scan data with historical keyframes.
+//! When a new keyframe lands near keyframes recorded long ago, its scan is
+//! matched against those old keyframes stitched in the world frame:
 //!
-//! # Detection Strategy
+//! 1. **Candidates**: keyframes at least `min_keyframe_gap` ids older than the
+//!    query and within `search_radius` of its (drifted) pose.
+//! 2. **Coarse match**: a wide multi-resolution correlative search, so drift of
+//!    tens of centimetres and degrees is recovered without a good initial guess.
+//! 3. **Refinement**: the SLAM's own fine matcher from the coarse pose; a
+//!    closure is accepted only if both agree.
 //!
-//! 1. **Distance-based trigger**: Only check for loops near previous poses
-//! 2. **Descriptor matching**: Use LiDAR-IRIS (default) or ScanContext for place recognition
-//! 3. **Geometric verification**: Validate matches with scan matching
-//!
-//! # Descriptor Options
-//!
-//! | Descriptor | Size | Matching Speed | Memory (1000 KF) |
-//! |------------|------|----------------|------------------|
-//! | LiDAR-IRIS | 80 bytes | ~0.5ms (Hamming) | 80 KB |
-//! | ScanContext | 4.8 KB | ~30ms (cosine) | 4.8 MB |
+//! The constraint links the nearest candidate to the query, so the pose graph
+//! can pull the drifted chain of keyframes back onto the old ones.
 
-use crate::algorithms::descriptors::{LidarIris, LidarIrisConfig};
-use crate::algorithms::matching::{IcpConfig, PointToPointIcp, ScanMatcher};
+use crate::algorithms::matching::{MultiResolutionConfig, MultiResolutionMatcher, ScanMatcher};
+use crate::core::math::normalize_angle;
 use crate::core::types::{PointCloud2D, Pose2D};
 use crate::engine::slam::keyframe::Keyframe;
 
 use super::pose_graph::Information2D;
 
-/// A potential loop closure between two poses.
+/// A verified loop closure: `relative_pose` is `T_match⁻¹ · T_query`.
 #[derive(Debug, Clone)]
-pub struct LoopClosureCandidate {
+pub struct LoopClosure {
     /// ID of the query keyframe (current).
     pub query_id: u64,
 
-    /// ID of the matching keyframe (historical).
+    /// ID of the old keyframe the query was matched to.
     pub match_id: u64,
 
-    /// Relative pose from query to match.
+    /// Pose of the query in the frame of the matched keyframe.
     pub relative_pose: Pose2D,
 
     /// Information matrix for the constraint.
     pub information: Information2D,
 
-    /// Confidence score (0-1).
+    /// Fine match score (0-1).
     pub confidence: f32,
 }
 
 /// Configuration for loop detection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
 pub struct LoopDetectorConfig {
-    /// Minimum distance (in graph nodes) before considering loop closure.
-    ///
-    /// Prevents detecting loops with recent poses.
-    pub min_node_distance: usize,
+    /// Only keyframes at least this many ids older than the query are candidates
+    /// (ids, not metres: with v8 keyframes every 0.2 m / 0.2 rad, 30 ids is a few metres
+    /// of travel or a turn on the spot).
+    pub min_keyframe_gap: u64,
 
-    /// Maximum Euclidean distance (meters) to search for loop candidates.
-    pub max_search_distance: f32,
+    /// Candidates must lie within this distance (m) of the query pose.
+    pub search_radius: f32,
 
-    /// Maximum Hamming distance threshold for IRIS matching (out of 640 bits).
-    ///
-    /// Lower = stricter matching. Default 100 = ~15% bit difference.
-    pub max_hamming_distance: u32,
+    /// At most this many nearest candidates are stitched into the match target.
+    pub area_keyframes: usize,
 
-    /// Minimum scan match score to accept a loop closure.
-    pub min_match_score: f32,
+    /// Coarse search half-width in x and y (m).
+    pub search_window_xy: f32,
 
-    /// Maximum number of candidates to verify per detection.
-    pub max_candidates: usize,
+    /// Coarse search half-width in heading (rad).
+    pub search_window_theta: f32,
 
-    /// ICP configuration for verification.
-    pub icp_config: IcpConfig,
+    /// Minimum coarse and fine match score.
+    pub min_score: f32,
 
-    /// Information matrix scale for loop closure constraints.
-    ///
-    /// Lower = less confident = wider covariance.
-    pub information_scale: f32,
+    /// The fine match may differ from the coarse one by at most this much (m)...
+    pub max_refine_translation: f32,
 
-    /// LiDAR-IRIS configuration.
-    pub iris_config: LidarIrisConfig,
+    /// ...and this much (rad).
+    pub max_refine_rotation: f32,
+
+    /// Standard deviation of a closure constraint in x and y (m).
+    pub std_xy: f32,
+
+    /// Standard deviation of a closure constraint in heading (rad).
+    pub std_theta: f32,
 }
 
 impl Default for LoopDetectorConfig {
     fn default() -> Self {
         Self {
-            min_node_distance: 20,
-            max_search_distance: 10.0,
-            max_hamming_distance: 100,
-            min_match_score: 0.5,
-            max_candidates: 5,
-            icp_config: IcpConfig {
-                max_iterations: 30,
-                translation_epsilon: 0.001,
-                rotation_epsilon: 0.001,
-                max_correspondence_distance: 1.0,
-                ..Default::default()
-            },
-            information_scale: 50.0,
-            iris_config: LidarIrisConfig::default(),
+            min_keyframe_gap: 30,
+            search_radius: 1.5,
+            area_keyframes: 10,
+            search_window_xy: 0.5,
+            search_window_theta: 0.35,
+            min_score: 0.6,
+            max_refine_translation: 0.1,
+            max_refine_rotation: 0.05,
+            std_xy: 0.03,
+            std_theta: 0.015,
         }
     }
 }
 
-/// Internal descriptor storage.
-enum Descriptor {
-    Iris(LidarIris),
-}
-
-/// Loop closure detector using LiDAR-IRIS or ScanContext with geometric verification.
+/// Proximity-based loop closure detector with correlative verification.
 pub struct LoopDetector {
     config: LoopDetectorConfig,
 
-    /// Scan matcher for geometric verification.
-    matcher: PointToPointIcp,
+    /// Wide coarse matcher.
+    coarse: MultiResolutionMatcher,
 
-    /// Descriptor database (keyframe_id -> descriptor).
-    descriptors: Vec<(u64, Descriptor)>,
+    /// Candidate keyframes stitched in the world frame (reused buffer).
+    area: PointCloud2D,
 }
 
 impl LoopDetector {
     /// Create a new loop detector.
     pub fn new(config: LoopDetectorConfig) -> Self {
-        let matcher = PointToPointIcp::new(config.icp_config.clone());
-
+        let coarse = MultiResolutionMatcher::new(MultiResolutionConfig {
+            coarse_search_window_xy: config.search_window_xy,
+            coarse_search_window_theta: config.search_window_theta,
+            min_score: config.min_score,
+            ..MultiResolutionConfig::default()
+        });
         Self {
             config,
-            matcher,
-            descriptors: Vec::new(),
+            coarse,
+            area: PointCloud2D::new(),
         }
     }
 
-    /// Add a keyframe to the database.
-    pub fn add_keyframe(&mut self, keyframe_id: u64, scan: &PointCloud2D) {
-        let descriptor = Descriptor::Iris(LidarIris::from_scan(scan, &self.config.iris_config));
-        self.descriptors.push((keyframe_id, descriptor));
-    }
-
-    /// Clear all keyframes.
-    pub fn clear(&mut self) {
-        self.descriptors.clear();
-    }
-
-    /// Detect loop closures for a new keyframe.
+    /// Look for a closure between `query` and the older `keyframes`.
     ///
-    /// # Arguments
-    ///
-    /// * `query_id` - ID of the query keyframe
-    /// * `query_scan` - Point cloud for the query keyframe
-    /// * `query_pose` - Current pose estimate for the query
-    /// * `keyframes` - All keyframes for geometric verification
-    ///
-    /// # Returns
-    ///
-    /// Vector of verified loop closure candidates.
+    /// `refine` is the fine matcher used for the final alignment.
     pub fn detect(
         &mut self,
-        query_id: u64,
-        query_scan: &PointCloud2D,
-        query_pose: &Pose2D,
+        query: &Keyframe,
         keyframes: &[Keyframe],
-    ) -> Vec<LoopClosureCandidate> {
-        // Skip if not enough keyframes in database
-        if self.descriptors.len() < self.config.min_node_distance {
-            return Vec::new();
+        refine: &mut impl ScanMatcher,
+    ) -> Option<LoopClosure> {
+        let cfg = &self.config;
+        let dist2 =
+            |kf: &Keyframe| (kf.pose.x - query.pose.x).powi(2) + (kf.pose.y - query.pose.y).powi(2);
+        let mut candidates: Vec<&Keyframe> = keyframes
+            .iter()
+            .filter(|kf| kf.id + cfg.min_keyframe_gap <= query.id)
+            .filter(|kf| dist2(kf) <= cfg.search_radius.powi(2))
+            .collect();
+        candidates.sort_by(|a, b| dist2(a).total_cmp(&dist2(b)));
+        candidates.truncate(cfg.area_keyframes);
+        // The anchor is only the edge endpoint; heading does not matter since the match
+        // is against the stitched cloud.
+        let anchor = *candidates.first()?;
+
+        self.area.clear();
+        for kf in &candidates {
+            kf.push_world_points(&mut self.area);
         }
 
-        self.detect_iris(query_id, query_scan, query_pose, keyframes)
-    }
-
-    /// Detect using LiDAR-IRIS descriptors.
-    fn detect_iris(
-        &mut self,
-        query_id: u64,
-        query_scan: &PointCloud2D,
-        query_pose: &Pose2D,
-        keyframes: &[Keyframe],
-    ) -> Vec<LoopClosureCandidate> {
-        let mut candidates = Vec::new();
-
-        // Compute IRIS descriptor for query
-        let query_iris = LidarIris::from_scan(query_scan, &self.config.iris_config);
-
-        // Find candidate matches using Hamming distance
-        let mut potential_matches: Vec<(u64, u32, usize)> = Vec::new(); // (id, distance, rotation)
-
-        for (kf_id, descriptor) in &self.descriptors {
-            // Skip recent keyframes
-            if query_id.saturating_sub(*kf_id) < self.config.min_node_distance as u64 {
-                continue;
-            }
-
-            let Descriptor::Iris(iris) = descriptor;
-            let (distance, rotation) = query_iris.match_with_rotation(iris);
-
-            if distance <= self.config.max_hamming_distance {
-                potential_matches.push((*kf_id, distance, rotation));
-            }
+        let coarse = self
+            .coarse
+            .match_scans(&query.scan, &self.area, &query.pose);
+        if coarse.score < cfg.min_score {
+            return None;
         }
-
-        // Sort by distance (ascending - lower is better)
-        potential_matches.sort_by_key(|(_, d, _)| *d);
-
-        // Limit candidates
-        potential_matches.truncate(self.config.max_candidates);
-
-        // Geometric verification
-        for (match_id, hamming_distance, _rotation) in potential_matches {
-            // Find the matching keyframe
-            let match_kf = match keyframes.iter().find(|kf| kf.id == match_id) {
-                Some(kf) => kf,
-                None => continue,
-            };
-
-            // Check spatial distance
-            let dx = query_pose.x - match_kf.pose.x;
-            let dy = query_pose.y - match_kf.pose.y;
-            let distance = (dx * dx + dy * dy).sqrt();
-
-            if distance > self.config.max_search_distance {
-                continue;
-            }
-
-            // Convert Hamming distance to similarity score (0-1)
-            let descriptor_similarity =
-                1.0 - (hamming_distance as f32 / self.config.iris_config.signature_bits as f32);
-
-            // Geometric verification using scan matching
-            if let Some(candidate) = self.verify_candidate(
-                query_id,
-                query_scan,
-                query_pose,
-                match_kf,
-                descriptor_similarity,
-            ) {
-                candidates.push(candidate);
-            }
-        }
-
-        candidates
-    }
-
-    /// Verify a loop closure candidate using scan matching.
-    fn verify_candidate(
-        &mut self,
-        query_id: u64,
-        query_scan: &PointCloud2D,
-        query_pose: &Pose2D,
-        match_kf: &Keyframe,
-        descriptor_similarity: f32,
-    ) -> Option<LoopClosureCandidate> {
-        // Compute initial guess for relative pose
-        let initial_guess = query_pose.inverse().compose(&match_kf.pose);
-
-        // Run scan matching
-        let result = self
-            .matcher
-            .match_scans(query_scan, &match_kf.scan, &initial_guess);
-
-        if !result.converged || result.score < self.config.min_match_score {
+        let fine = refine.match_scans(&query.scan, &self.area, &coarse.transform);
+        let shift = coarse.transform.inverse().compose(&fine.transform);
+        if !fine.converged
+            || fine.score < cfg.min_score
+            || shift.x.hypot(shift.y) > cfg.max_refine_translation
+            || normalize_angle(shift.theta).abs() > cfg.max_refine_rotation
+        {
             return None;
         }
 
-        // Compute confidence from both descriptor similarity and ICP score
-        let confidence = (descriptor_similarity * result.score).sqrt();
-
-        // Compute information matrix (scaled by confidence)
-        let scale = self.config.information_scale * confidence;
-        let information = Information2D::from_std_dev(
-            0.1 / scale.sqrt(), // ~10cm / sqrt(scale)
-            0.1 / scale.sqrt(),
-            0.05 / scale.sqrt(), // ~3 degrees / sqrt(scale)
-        );
-
-        Some(LoopClosureCandidate {
-            query_id,
-            match_id: match_kf.id,
-            relative_pose: result.transform,
-            information,
-            confidence,
+        Some(LoopClosure {
+            query_id: query.id,
+            match_id: anchor.id,
+            relative_pose: anchor.pose.inverse().compose(&fine.transform),
+            information: Information2D::from_std_dev(cfg.std_xy, cfg.std_xy, cfg.std_theta),
+            confidence: fine.score,
         })
     }
 }
@@ -280,116 +177,58 @@ impl LoopDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::Point2D;
+    use crate::algorithms::matching::{PointToLineIcp, PointToLineIcpConfig};
 
-    fn create_wall_scan(offset_x: f32, offset_y: f32) -> PointCloud2D {
-        let mut scan = PointCloud2D::new();
-        // Create a distinctive L-shaped pattern
-        for i in 0..50 {
-            let x = offset_x + i as f32 * 0.1;
-            scan.push(Point2D::new(x, offset_y + 2.0)); // Horizontal wall
+    /// A 4 x 3 m room with a box in one corner, seen from `pose`.
+    /// Points carry a little jitter: the k-d tree rejects many identical coordinates.
+    fn room_scan(pose: &Pose2D) -> PointCloud2D {
+        let mut world = PointCloud2D::new();
+        for i in 0..=80 {
+            let t = i as f32 / 80.0;
+            let e = (i % 7) as f32 * 1e-3;
+            world.push_xy(t * 4.0, e);
+            world.push_xy(t * 4.0, 3.0 + e);
+            world.push_xy(e, t * 3.0);
+            world.push_xy(4.0 + e, t * 3.0);
+            world.push_xy(3.0 + t * 0.5, 2.0 + e);
+            world.push_xy(3.0 + e, 2.0 + t);
         }
-        for i in 0..30 {
-            let y = offset_y + i as f32 * 0.1;
-            scan.push(Point2D::new(offset_x, y)); // Vertical wall
-        }
-        scan
+        world.transform(&pose.inverse())
     }
 
-    fn create_different_scan() -> PointCloud2D {
-        let mut scan = PointCloud2D::new();
-        // Create a completely different pattern (circle)
-        for i in 0..50 {
-            let angle = i as f32 * 0.126; // ~2π/50
-            scan.push(Point2D::new(3.0 * angle.cos(), 3.0 * angle.sin()));
-        }
-        scan
+    fn keyframe(id: u64, believed: Pose2D, truth: Pose2D) -> Keyframe {
+        Keyframe::new(id, believed, room_scan(&truth), 0, 0)
     }
 
     #[test]
-    fn test_loop_detector_creation() {
-        let config = LoopDetectorConfig::default();
-        let _detector = LoopDetector::new(config);
+    fn closes_a_drifted_revisit() {
+        let truth = Pose2D::new(2.0, 1.5, 0.0);
+        let old = keyframe(0, truth, truth);
+        // Back at the same spot, but odometry believes it is 0.3 m and 8° off.
+        let drifted = Pose2D::new(2.25, 1.35, 0.14);
+        let query = keyframe(100, drifted, truth);
+
+        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        let mut fine = PointToLineIcp::new(PointToLineIcpConfig::default());
+        let closure = detector
+            .detect(&query, &[old], &mut fine)
+            .expect("revisit should close");
+
+        assert_eq!((closure.match_id, closure.query_id), (0, 100));
+        let r = closure.relative_pose;
+        assert!(r.x.hypot(r.y) < 0.03, "relative translation {r:?}");
+        assert!(r.theta.abs() < 0.02, "relative rotation {r:?}");
     }
 
     #[test]
-    fn test_add_keyframe() {
-        let config = LoopDetectorConfig::default();
-        let mut detector = LoopDetector::new(config);
+    fn ignores_recent_and_distant_keyframes() {
+        let pose = Pose2D::new(2.0, 1.5, 0.0);
+        let recent = keyframe(90, pose, pose);
+        let far = keyframe(0, Pose2D::new(-5.0, 0.0, 0.0), pose);
+        let query = keyframe(100, pose, pose);
 
-        let scan = create_wall_scan(0.0, 0.0);
-        detector.add_keyframe(0, &scan);
-    }
-
-    #[test]
-    fn test_no_loop_with_few_keyframes() {
-        let config = LoopDetectorConfig {
-            min_node_distance: 10,
-            ..Default::default()
-        };
-        let mut detector = LoopDetector::new(config);
-
-        // Add just a few keyframes
-        for i in 0..5 {
-            let scan = create_wall_scan(i as f32, 0.0);
-            detector.add_keyframe(i, &scan);
-        }
-
-        // Should not detect loops with too few keyframes
-        let query_scan = create_wall_scan(0.0, 0.0);
-        let keyframes: Vec<Keyframe> = Vec::new();
-        let candidates = detector.detect(10, &query_scan, &Pose2D::identity(), &keyframes);
-
-        assert!(candidates.is_empty());
-    }
-
-    #[test]
-    fn test_iris_similarity() {
-        let config = LidarIrisConfig::default();
-
-        let scan1 = create_wall_scan(0.0, 0.0);
-        let scan2 = create_wall_scan(0.0, 0.0); // Same pattern
-        let scan3 = create_different_scan(); // Different pattern
-
-        let iris1 = LidarIris::from_scan(&scan1, &config);
-        let iris2 = LidarIris::from_scan(&scan2, &config);
-        let iris3 = LidarIris::from_scan(&scan3, &config);
-
-        // Same scan should have zero distance
-        let dist_same = iris1.distance(&iris2);
-        assert_eq!(dist_same, 0, "Same scan should have distance 0");
-
-        // Different scan should have higher distance
-        let dist_diff = iris1.distance(&iris3);
-        assert!(
-            dist_diff > dist_same,
-            "Different scan should have higher distance"
-        );
-    }
-
-    #[test]
-    fn test_loop_closure_candidate() {
-        let candidate = LoopClosureCandidate {
-            query_id: 100,
-            match_id: 10,
-            relative_pose: Pose2D::new(1.0, 2.0, 0.1),
-            information: Information2D::default(),
-            confidence: 0.8,
-        };
-
-        assert_eq!(candidate.query_id, 100);
-        assert_eq!(candidate.match_id, 10);
-        assert!(candidate.confidence > 0.7);
-    }
-
-    #[test]
-    fn test_config_defaults() {
-        let config = LoopDetectorConfig::default();
-
-        assert!(config.min_node_distance > 0);
-        assert!(config.max_search_distance > 0.0);
-        assert!(config.max_hamming_distance > 0);
-        assert!(config.min_match_score > 0.0);
-        assert!(config.min_match_score < 1.0);
+        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        let mut fine = PointToLineIcp::new(PointToLineIcpConfig::default());
+        assert!(detector.detect(&query, &[far, recent], &mut fine).is_none());
     }
 }
