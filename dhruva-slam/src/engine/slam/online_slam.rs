@@ -221,7 +221,7 @@ impl Default for OnlineSlamConfig {
 /// - Scan matching for pose refinement
 /// - Submap-based local mapping
 /// - Keyframe selection for loop closure
-/// - Loop closure detection with LiDAR-IRIS descriptors
+/// - Proximity loop closure detection verified by scan matching
 /// - Pose graph optimization for global consistency
 pub struct OnlineSlam {
     config: OnlineSlamConfig,

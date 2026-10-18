@@ -6,7 +6,7 @@
 //! - **Matcher**: Configurable scan matching (MultiRes, ICP, Correlative, Hybrid)
 //! - **Odometry**: Configurable fusion (Mahony, ESKF, Complementary, Wheel-only)
 //! - **Maps**: Dual representation (Occupancy Grid + Feature-based)
-//! - **Loop Closure**: LiDAR-IRIS descriptor + Sparse CG optimization
+//! - **Loop Closure**: proximity search + scan-match verification, sparse pose-graph optimization
 //!
 //! # Architecture
 //!

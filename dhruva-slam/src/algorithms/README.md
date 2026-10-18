@@ -1,6 +1,6 @@
 # Algorithms Module
 
-Core SLAM algorithm implementations: scan matching, mapping, localization, and descriptors.
+Core SLAM algorithm implementations: scan matching, mapping and localization.
 
 ## Overview
 
@@ -8,7 +8,6 @@ The algorithms module provides:
 - **Matching** - Align laser scans to estimate relative transforms
 - **Mapping** - Build and update occupancy grid maps
 - **Localization** - Motion and sensor models for particle filter
-- **Descriptors** - Place recognition for loop closure
 
 ## Module Structure
 
@@ -42,13 +41,10 @@ algorithms/
 │   ├── ray_tracer.rs   # Bresenham ray tracing
 │   ├── integrator.rs   # Scan-to-map integration
 │   └── features.rs     # Line/corner extraction
-├── localization/       # Particle filter components
-│   ├── mod.rs          # Exports
-│   ├── motion_model.rs # Odometry-based motion model
-│   └── sensor_model.rs # Likelihood field sensor model
-└── descriptors/        # Place recognition
+└── localization/       # Particle filter components
     ├── mod.rs          # Exports
-    └── lidar_iris.rs   # LiDAR-IRIS binary descriptor
+    ├── motion_model.rs # Odometry-based motion model
+    └── sensor_model.rs # Likelihood field sensor model
 ```
 
 ## Matching
@@ -279,39 +275,6 @@ let model = SensorModel::new(
 let likelihood = model.likelihood(&pose, &scan, &map);
 ```
 
-## Descriptors
-
-Place recognition for loop closure detection.
-
-### LidarIris
-
-Binary descriptor for fast scan comparison:
-
-```rust
-use crate::algorithms::descriptors::{LidarIris, LidarIrisConfig};
-
-let config = LidarIrisConfig {
-    num_rows: 80,
-    num_cols: 360,
-    max_range: 8.0,
-    signature_bits: 640,
-};
-
-// Generate descriptor from scan
-let iris = LidarIris::from_scan(&point_cloud, &config);
-
-// Compare descriptors (Hamming distance)
-let distance = iris.distance(&other_iris);
-
-// Rotation-invariant matching
-let (distance, rotation_offset) = iris.match_with_rotation(&other_iris);
-```
-
-**Properties:**
-- 80-byte binary signature (640 bits)
-- ~30x faster than cosine similarity (ScanContext)
-- Rotation-invariant matching via bit rotation
-
 ## Algorithm Selection Guide
 
 ### By Environment
@@ -351,4 +314,3 @@ let (distance, rotation_offset) = iris.match_with_rotation(&other_iris);
 | Multi-resolution | ~20ms | 3 levels |
 | Map integration | ~5ms | Ray tracing |
 | Feature extraction | ~20ms | Hough transform |
-| IRIS descriptor | ~2ms | 80-byte output |

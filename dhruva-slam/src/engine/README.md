@@ -346,60 +346,18 @@ let config = GraphOptimizerConfig {
 
 ## Integration Example
 
-Complete SLAM with loop closure:
+`OnlineSlam` runs loop closure itself when `[loop_closure] enabled = true`: every
+keyframe becomes a graph node with a sequential edge, every `detection_interval`-th one
+is passed to `LoopDetector::detect`, and each closure is optimized and applied at once
+(`OnlineSlam::process_keyframe_for_loop_closure`). Callers only feed scans:
 
 ```rust
 use crate::engine::slam::{OnlineSlam, SlamEngine};
-use crate::engine::graph::{PoseGraph, LoopDetector, GraphOptimizer};
 
 let mut slam = OnlineSlam::new(slam_config);
-let mut graph = PoseGraph::new();
-let mut detector = LoopDetector::new(detector_config);
-let optimizer = GraphOptimizer::new(optimizer_config);
-
-let mut pending_closures = Vec::new();
-
 loop {
-    // Process scan
     let result = slam.process_scan(&scan, &odom_delta, timestamp_us);
-
-    if result.keyframe_created {
-        let kf = slam.latest_keyframe();
-
-        // Add to pose graph
-        graph.add_node(kf.pose, kf.timestamp_us);
-        if kf.id > 0 {
-            graph.add_odometry_edge(kf.id - 1, kf.id, odom_delta, odom_info);
-        }
-
-        // Add to loop detector
-        detector.add_keyframe(kf.id, &kf.scan, &kf.pose);
-
-        // Check for loops periodically
-        if kf.id % 5 == 0 && kf.id > 20 {
-            let closures = detector.detect(kf.id, &kf.scan, &kf.pose, &keyframes);
-
-            for closure in closures {
-                graph.add_loop_closure_edge(
-                    closure.query_id,
-                    closure.match_id,
-                    closure.relative_pose,
-                    closure.information,
-                    closure.confidence,
-                );
-                pending_closures.push(closure);
-            }
-
-            // Optimize after accumulating closures
-            if pending_closures.len() >= 3 {
-                let result = optimizer.optimize(&mut graph);
-                if result.converged {
-                    apply_corrections(&mut slam, &graph);
-                    pending_closures.clear();
-                }
-            }
-        }
-    }
+    // result.pose follows the optimized graph after a closure
 }
 ```
 

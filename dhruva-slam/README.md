@@ -36,7 +36,7 @@ DhruvaSLAM is a standalone SLAM daemon that:
 - **Multiple Scan Matchers** - ICP, P2L-ICP, Correlative, Multi-Resolution, Hybrid
 - **Occupancy Grid Mapping** - Log-odds representation with Bresenham ray tracing
 - **Feature Extraction** - Line and corner detection from occupancy maps
-- **Loop Closure** - LiDAR-IRIS binary descriptors with sparse CG optimization
+- **Loop Closure** - proximity search verified by scan matching, sparse Cholesky pose-graph optimization
 - **Bag Recording/Playback** - Record sensor data for offline development
 
 ### Specifications
@@ -70,7 +70,7 @@ DhruvaSLAM is organized as a binary crate (not a library) with 5 logical layers:
                          │
 ┌─────────────────────────────────────────────────────┐
 │                  algorithms/                         │  ← Core algorithms
-│      (matching, mapping, localization, descriptors)  │
+│      (matching, mapping, localization)               │
 └─────────────────────────────────────────────────────┘
                          │
 ┌─────────────────────────────────────────────────────┐
@@ -87,7 +87,7 @@ DhruvaSLAM is organized as a binary crate (not a library) with 5 logical layers:
 See individual module READMEs for details:
 - [core/](src/core/README.md) - Foundation types (Pose2D, PointCloud2D, LaserScan) and SIMD
 - [sensors/](src/sensors/README.md) - Odometry fusion and lidar preprocessing
-- [algorithms/](src/algorithms/README.md) - Matching, mapping, localization, descriptors
+- [algorithms/](src/algorithms/README.md) - Matching, mapping, localization
 - [engine/](src/engine/README.md) - SLAM orchestration, keyframes, pose graph
 - [io/](src/io/README.md) - SangamIO client, TCP streaming
 
@@ -174,9 +174,10 @@ algorithm = "multi_res"       # icp, p2l, correlative, multi_res, hybrid_icp, hy
 
 [loop_closure]
 enabled = true
-detection_interval = 5        # Check every N keyframes
-min_keyframe_gap = 20         # Skip recent poses
-optimization_threshold = 3    # Optimize after N loop closures
+detection_interval = 5        # Look for a closure on every N-th keyframe
+min_keyframe_gap = 30         # Candidates are at least this many keyframes older
+search_radius = 1.5           # ... and within this distance (m)
+min_score = 0.6               # Coarse and fine match score to accept
 
 [optimization]
 solver = "sparse_cg"          # dense_cholesky, sparse_cg
@@ -237,8 +238,7 @@ dhruva-slam/
 │   ├── algorithms/           # Core algorithms
 │   │   ├── matching/         # ICP, P2L-ICP, Correlative, Multi-Resolution
 │   │   ├── mapping/          # OccupancyGrid, RayTracer, MapIntegrator
-│   │   ├── planning/         # A* path planning
-│   │   └── descriptors/      # LiDAR-IRIS for loop closure
+│   │   └── planning/         # A* path planning
 │   │
 │   ├── engine/               # SLAM orchestration
 │   │   ├── slam/             # OnlineSlam, Keyframe, Submap, Recovery
@@ -418,7 +418,6 @@ See [IMPROVEMENTS.md](IMPROVEMENTS.md) for detailed roadmap:
 ## Related Documents
 
 - [IMPROVEMENTS.md](IMPROVEMENTS.md) - Technical improvement roadmap
-- [docs/LOOP_CLOSURE_PROPOSAL.md](docs/LOOP_CLOSURE_PROPOSAL.md) - LiDAR-IRIS implementation plan
 
 ## License
 
