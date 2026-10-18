@@ -20,15 +20,17 @@
 //! |---------|-----------------|
 //! | `lease` Enable (config `force: true` to take it over) / Disable | anyone |
 //! | `telemetry` Enable/Disable | anyone (affects only the sender) |
-//! | stop: `drive` Disable/Reset, actuator Disable | anyone (not lease-gated) |
-//! | everything else | the lease holder |
+//! | stop: `drive` Disable/Reset, actuator Disable; `lidar` | anyone, always |
+//! | cleaning actuators, LED | anyone while the lease is free (not taken), else the holder |
+//! | everything else (`drive`, calibration, power, `Shutdown`, ...) | the holder; taken implicitly when free |
 //!
-//! A client that sends a controlling command while nobody holds the lease
-//! gets it implicitly, so single-client tools keep working unchanged. Whenever
-//! the lease changes hands (release, forced takeover, holder disconnect) the
-//! drive is zeroed first: the GD32 holds the last velocity forever, and a new
-//! holder must not inherit motion. The receiver re-checks the holder after it
-//! has the driver, so a command authorized just before a takeover is dropped.
+//! A client that drives while nobody holds the lease gets it implicitly, so
+//! single-client tools keep working unchanged. Whenever the lease changes hands
+//! (release, forced takeover, holder disconnect) the drive is zeroed: the GD32
+//! holds the last velocity forever, and a new holder must not inherit motion.
+//! The holder changes before the stop, and the receiver re-checks the lease
+//! once it has the driver, so a command authorized before a takeover is
+//! dropped instead of running after the stop.
 //!
 //! Limits: stops still queue behind a driver command in progress (a lidar
 //! enable blocks the driver for ~20 s); the GD32 heartbeat dead-man is the
@@ -50,6 +52,9 @@ const TCP_QUEUE_FRAMES: usize = 32;
 
 /// Components whose `Disable` counts as a stop and is accepted from anyone.
 const STOPPABLE: &[&str] = &["drive", "vacuum", "main_brush", "side_brush", "water_pump"];
+
+/// Actuators any client may switch while the lease is free.
+const UNLEASED_ACTUATORS: &[&str] = &["vacuum", "main_brush", "side_brush", "water_pump", "led"];
 
 /// Client ids start at 1; 0 means "no lease holder".
 pub type ClientId = u64;
@@ -208,8 +213,10 @@ impl ClientHub {
         }
         let _transition = lock(&self.lease);
         if self.holder.load(Ordering::Acquire) == id {
-            stop();
+            // Hand over first: a command of the old holder still waiting for
+            // the driver then fails its re-check instead of running after the stop.
             self.holder.store(NOBODY, Ordering::Release);
+            stop();
             log::info!("Lease released: holder #{} disconnected", id);
         }
     }
@@ -261,8 +268,24 @@ impl ClientHub {
                 );
                 Verdict::Handled
             }
-            _ if is_stop(id, action) => Verdict::Execute,
-            _ => self.require_lease(client.id),
+            _ => match lease_rule(cmd) {
+                LeaseRule::Free => Verdict::Execute,
+                LeaseRule::IfUnheld => match self.lease_holder() {
+                    Some(h) if h != client.id => Verdict::Refused(h),
+                    _ => Verdict::Execute,
+                },
+                LeaseRule::Acquire => self.require_lease(client.id),
+            },
+        }
+    }
+
+    /// Whether `client` may still run `cmd` now (re-checked once the driver is
+    /// free: the lease may have changed hands while it waited).
+    pub fn still_allowed(&self, client: &Client, cmd: &Command) -> bool {
+        match lease_rule(cmd) {
+            LeaseRule::Free => true,
+            LeaseRule::IfUnheld => self.lease_holder().is_none_or(|h| h == client.id),
+            LeaseRule::Acquire => self.lease_holder() == Some(client.id),
         }
     }
 
@@ -289,10 +312,10 @@ impl ClientHub {
                 log::info!("Lease request from #{} refused: held by #{}", id, h);
             }
             prev => {
+                self.holder.store(id, Ordering::Release);
                 if prev != NOBODY {
                     stop();
                 }
-                self.holder.store(id, Ordering::Release);
                 log::info!("Lease taken by client #{} (was #{})", id, prev);
             }
         }
@@ -301,8 +324,8 @@ impl ClientHub {
     fn release(&self, id: ClientId, stop: impl FnOnce()) {
         let _transition = lock(&self.lease);
         if self.holder.load(Ordering::Acquire) == id {
-            stop();
             self.holder.store(NOBODY, Ordering::Release);
+            stop();
             log::info!("Lease released by client #{}", id);
         }
     }
@@ -338,6 +361,28 @@ impl ClientHub {
             client.id,
             if on { "TCP" } else { "UDP" }
         );
+    }
+}
+
+/// What a command needs from the lease.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LeaseRule {
+    /// Anyone, always: stops, and the lidar (a sensor every client relies on).
+    Free,
+    /// Anyone while nobody holds the lease, without taking it (cleaning
+    /// actuators, LED): a UI toggling the vacuum must not lock out the SLAM
+    /// controller.
+    IfUnheld,
+    /// Motion, calibration, power and daemon control: the holder only; taken
+    /// implicitly when free so single-client tools keep working.
+    Acquire,
+}
+
+pub fn lease_rule(cmd: &Command) -> LeaseRule {
+    match cmd {
+        Command::ComponentControl { id, action } if is_stop(id, action) || id == "lidar" => LeaseRule::Free,
+        Command::ComponentControl { id, .. } if UNLEASED_ACTUATORS.contains(&id.as_str()) => LeaseRule::IfUnheld,
+        _ => LeaseRule::Acquire,
     }
 }
 
@@ -432,9 +477,27 @@ mod tests {
         ] {
             assert_eq!(hub.authorize(&b, &stop, || {}), Verdict::Execute);
         }
-        // Switching the lidar off is not a stop: it needs the lease.
-        let lidar_off = cc("lidar", ComponentAction::Disable { config: None });
-        assert_eq!(hub.authorize(&b, &lidar_off, || {}), Verdict::Refused(a.id));
+        // The lidar is a shared sensor: anyone may switch it.
+        let lidar_on = cc("lidar", ComponentAction::Enable { config: None });
+        assert_eq!(hub.authorize(&b, &lidar_on, || {}), Verdict::Execute);
+        // Actuators need the lease while someone holds it...
+        let vacuum_on = cc("vacuum", ComponentAction::Enable { config: None });
+        assert_eq!(hub.authorize(&b, &vacuum_on, || {}), Verdict::Refused(a.id));
+        // ...and calibration always does.
+        let imu_reset = cc("imu", ComponentAction::Reset { config: None });
+        assert_eq!(hub.authorize(&b, &imu_reset, || {}), Verdict::Refused(a.id));
+    }
+
+    #[test]
+    fn actuators_run_without_taking_a_free_lease() {
+        let hub = ClientHub::new(8);
+        let ui = hub.connect(addr(1), 5556, None);
+        let slam = hub.connect(addr(2), 5556, None);
+        let vacuum_on = cc("vacuum", ComponentAction::Enable { config: None });
+        assert_eq!(hub.authorize(&ui, &vacuum_on, || {}), Verdict::Execute);
+        assert_eq!(hub.lease_holder(), None, "the UI didn't take the lease");
+        assert_eq!(hub.authorize(&slam, &drive(), || {}), Verdict::Execute);
+        assert!(!hub.still_allowed(&ui, &vacuum_on), "now held by the SLAM client");
     }
 
     #[test]
@@ -457,7 +520,11 @@ mod tests {
             (Some(a.id), 0),
             "no takeover without force"
         );
-        hub.authorize(&b, &take(true), stop);
+        hub.authorize(&b, &take(true), || {
+            // Handed over before the stop: a's queued commands fail the re-check.
+            assert_eq!(hub.lease_holder(), Some(b.id));
+            stop()
+        });
         assert_eq!(
             (hub.lease_holder(), stops.get()),
             (Some(b.id), 1),
@@ -497,6 +564,7 @@ mod tests {
         // stop() runs under the lease lock, so no new holder can slip in.
         hub.disconnect(a.id, || {
             assert!(hub.lease.try_lock().is_err(), "lease locked while stopping");
+            assert_ne!(hub.lease_holder(), Some(a.id), "handed over before the stop");
             stopped.set(true)
         });
         assert!(stopped.get());

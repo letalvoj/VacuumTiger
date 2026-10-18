@@ -61,7 +61,7 @@
 use crate::core::driver::DeviceDriver;
 use crate::core::types::{Command, ComponentAction};
 use crate::error::{Error, Result};
-use crate::streaming::clients::{Client, ClientHub, Verdict, is_stop};
+use crate::streaming::clients::{Client, ClientHub, Verdict};
 use crate::streaming::wire::Serializer;
 use std::io::Read;
 use std::net::TcpStream;
@@ -269,7 +269,7 @@ impl TcpReceiver {
         let mut driver = self.driver.lock().map_err(|_| Error::ThreadPanic)?;
         // The lease may have changed hands while we waited for the driver
         // (a forced takeover zeroes the drive first): don't undo that.
-        if !is_stop_command(&cmd) && self.hub.lease_holder() != Some(self.client.id) {
+        if !self.hub.still_allowed(&self.client, &cmd) {
             log::warn!(
                 "Client #{} lost the lease before '{}' ran: dropped",
                 self.client.id,
@@ -283,10 +283,6 @@ impl TcpReceiver {
         }
         result
     }
-}
-
-fn is_stop_command(cmd: &Command) -> bool {
-    matches!(cmd, Command::ComponentControl { id, action } if is_stop(id, action))
 }
 
 /// Zero and disable the drive. The GD32 holds the last velocity forever, so
