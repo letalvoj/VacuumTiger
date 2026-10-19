@@ -25,6 +25,8 @@ mod serialization;
 
 pub use config::{CellState, OccupancyGridConfig};
 
+use image::{GrayImage, Luma};
+
 use super::MapRegion;
 
 /// Minimum growth step when the grid has to expand (meters).
@@ -204,6 +206,22 @@ impl OccupancyGrid {
         } else {
             CellState::Unknown
         }
+    }
+
+    /// Distance (m) from every cell to the nearest cell that is not free, row by row from
+    /// cell (0, 0); 0 on cells that are not free. Unknown space and the grid's border count as
+    /// blocked.
+    pub fn clearance(&self) -> Vec<f32> {
+        let (w, h) = (self.width as u32, self.height as u32);
+        let blocked = GrayImage::from_fn(w, h, |x, y| {
+            let border = x == 0 || y == 0 || x + 1 == w || y + 1 == h;
+            let free = !border && self.get_state(x as usize, y as usize) == CellState::Free;
+            Luma([if free { 0 } else { 255 }])
+        });
+        imageproc::distance_transform::euclidean_squared_distance_transform(&blocked)
+            .pixels()
+            .map(|d| d[0].sqrt() as f32 * self.config.resolution)
+            .collect()
     }
 
     /// Update a cell with an observation.

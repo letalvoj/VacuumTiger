@@ -1,10 +1,12 @@
 //! Final map as a PNG: occupancy (free space tinted per room when segmented), 1 m grid,
-//! odometry path (orange), SLAM path (blue), loop closures (red), start (green) and end
-//! (red) markers.
+//! cleaning route (edge passes green, section zigzags violet, hops grey, dots at starts),
+//! odometry path (orange), SLAM path (blue), loop closures (red), start (green) and end (red)
+//! markers.
 
 use std::path::Path;
 
 use dhruva_slam::algorithms::mapping::{CellState, OccupancyGrid, Rooms};
+use dhruva_slam::algorithms::planning::{PathKind, RoomCoverage};
 use dhruva_slam::engine::graph::{EdgeType, PoseGraph};
 use image::{Rgb, RgbImage};
 use imageproc::drawing::{draw_filled_circle_mut, draw_line_segment_mut};
@@ -23,6 +25,9 @@ const GRID: Rgb<u8> = Rgb([190, 205, 225]);
 const ODOM: Rgb<u8> = Rgb([255, 150, 30]);
 const SLAM: Rgb<u8> = Rgb([40, 110, 255]);
 const CLOSURE: Rgb<u8> = Rgb([230, 20, 20]);
+const EDGE: Rgb<u8> = Rgb([0, 140, 70]);
+const LANE: Rgb<u8> = Rgb([150, 120, 200]);
+const HOP: Rgb<u8> = Rgb([120, 120, 120]);
 
 /// Free space in a light tint per room, from `rooms` (made from `grid`).
 const ROOM_TINTS: [Rgb<u8>; 6] = [
@@ -40,6 +45,7 @@ pub fn map_png(
     rows: &[PoseRow],
     graph: &PoseGraph,
     rooms: Option<&Rooms>,
+    coverage: &[RoomCoverage],
 ) -> Result<(), String> {
     let (w, h) = grid.dimensions();
     // Crop to the observed cells.
@@ -97,6 +103,24 @@ pub fn map_png(
         draw_dashed(&mut img, to_px(wx0, m as f32), to_px(wx1, m as f32));
     }
 
+    // The cleaning route: edge passes, section zigzags, and the hops between them.
+    let mut end: Option<(f32, f32)> = None;
+    for room in coverage {
+        for path in &room.paths {
+            let points = &path.points;
+            let start = to_px(points[0].x, points[0].y);
+            if let Some(end) = end {
+                draw_line_segment_mut(&mut img, end, start, HOP);
+            }
+            let color = match path.kind {
+                PathKind::Wall | PathKind::Furniture => EDGE,
+                PathKind::Lanes => LANE,
+            };
+            polyline(&mut img, points.iter().map(|p| to_px(p.x, p.y)), color);
+            draw_filled_circle_mut(&mut img, (start.0 as i32, start.1 as i32), 3, color);
+            end = points.last().map(|p| to_px(p.x, p.y));
+        }
+    }
     polyline(
         &mut img,
         rows.iter().map(|r| to_px(r.odom.x, r.odom.y)),

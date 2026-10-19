@@ -26,9 +26,10 @@ use clap::Parser;
 use dhruva_slam::algorithms::mapping::{
     FloorPlan, FloorPlanConfig, OccupancyGrid, Rooms, RoomsConfig,
 };
+use dhruva_slam::algorithms::planning::{CoverageConfig, CoveragePlanner};
 use dhruva_slam::algorithms::relocalisation::{Placement, Relocaliser, RelocaliserConfig};
 use dhruva_slam::config::{Config, build_slam_thread_config};
-use dhruva_slam::core::types::{LaserScan, Pose2D};
+use dhruva_slam::core::types::{LaserScan, Point2D, Pose2D};
 use dhruva_slam::engine::graph::PoseGraph;
 use dhruva_slam::engine::pipeline::SlamPipeline;
 use dhruva_slam::engine::slam::{SlamEngine, SlamMode};
@@ -214,7 +215,7 @@ fn run(args: Args) -> Result<(), String> {
     })?;
     let grid = pipeline.slam_mut().global_map().clone();
     let graph = pipeline.slam().pose_graph();
-    render::map_png(&args.out.join("map.png"), &grid, &rows, graph, None)?;
+    render::map_png(&args.out.join("map.png"), &grid, &rows, graph, None, &[])?;
     // The run goes into the plan where relocalisation put it; a new plan starts in its frame.
     let to_plan = match (&relocaliser, placement.0) {
         (None, _) => Some(Pose2D::identity()),
@@ -273,7 +274,8 @@ fn load_floor_plan(path: &Path) -> Result<FloorPlan, String> {
 }
 
 /// Merges `session` into `plan` through `to_plan`, saves it to `path` and renders it,
-/// split into rooms, to `png`.
+/// split into rooms with the cleaning route from the plan's origin (the first run's start),
+/// to `png`.
 fn update_floor_plan(
     plan: &mut FloorPlan,
     path: &Path,
@@ -286,7 +288,9 @@ fn update_floor_plan(
         .map_err(|e| format!("{}: {e}", path.display()))?;
     let grid = plan.to_grid();
     let rooms = Rooms::segment(&grid, RoomsConfig::default());
-    render::map_png(png, &grid, &[], &PoseGraph::new(), Some(&rooms))
+    let planner = CoveragePlanner::new(&grid, &rooms, CoverageConfig::default());
+    let coverage = planner.plan(Point2D::new(0.0, 0.0));
+    render::map_png(png, &grid, &[], &PoseGraph::new(), Some(&rooms), &coverage)
 }
 
 /// The inclusive data-time bounds (us) of a window given as fractions of the

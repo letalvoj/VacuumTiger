@@ -1,6 +1,7 @@
 //! Path planning algorithms.
 //!
-//! This module provides the A* path planner used for navigation.
+//! This module provides the A* path planner used for navigation and the coverage planner
+//! that turns a floor plan's rooms into the paths of a cleaning run.
 //!
 //! # Architecture
 //!
@@ -22,5 +23,7 @@
 //! ```
 
 mod astar;
+mod coverage;
 
 pub use astar::{AStarConfig, AStarPlanner, PlanningError};
+pub use coverage::{CoverageConfig, CoveragePath, CoveragePlanner, PathKind, RoomCoverage};
