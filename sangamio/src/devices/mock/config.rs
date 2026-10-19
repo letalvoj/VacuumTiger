@@ -61,6 +61,7 @@ use std::f32::consts::PI;
 
 /// Noise configuration for lidar measurements
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LidarNoiseConfig {
     /// Range measurement noise standard deviation (meters)
     #[serde(default = "default_lidar_range_stddev")]
@@ -118,6 +119,7 @@ impl Default for LidarNoiseConfig {
 
 /// 3D noise configuration (for IMU axes)
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Noise3DConfig {
     /// Standard deviation per axis [x, y, z]
     #[serde(default = "default_noise_stddev")]
@@ -143,6 +145,7 @@ impl Default for Noise3DConfig {
 
 /// Gyroscope noise configuration with drift
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GyroNoiseConfig {
     /// Standard deviation per axis [x, y, z] (raw i16 units)
     #[serde(default = "default_gyro_stddev")]
@@ -173,6 +176,7 @@ impl Default for GyroNoiseConfig {
 
 /// Encoder noise configuration
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EncoderNoiseConfig {
     /// Wheel slip noise standard deviation (multiplicative, 0.0-1.0)
     #[serde(default = "default_slip_stddev")]
@@ -210,6 +214,7 @@ impl Default for EncoderNoiseConfig {
 
 /// Robot physical parameters (CRL-200S specifications)
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RobotConfig {
     /// Distance between wheel centers (meters)
     #[serde(default = "default_wheel_base")]
@@ -282,6 +287,7 @@ impl Default for RobotConfig {
 /// The mock simulator generates lidar data as if measured from robot center,
 /// matching the transformed output of real hardware.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LidarConfig {
     /// Number of rays per 360° scan
     #[serde(default = "default_num_rays")]
@@ -331,6 +337,7 @@ impl Default for LidarConfig {
 
 /// IMU sensor configuration
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImuConfig {
     /// Gyroscope noise configuration
     #[serde(default)]
@@ -363,6 +370,7 @@ impl Default for ImuConfig {
 
 /// Encoder configuration
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct EncoderConfig {
     /// Noise configuration
     #[serde(default)]
@@ -371,6 +379,7 @@ pub struct EncoderConfig {
 
 /// Single bumper zone configuration
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BumperZoneConfig {
     /// Start angle relative to robot forward (radians, CCW positive)
     pub start_angle: f32,
@@ -381,6 +390,7 @@ pub struct BumperZoneConfig {
 
 /// Bumper sensor configuration
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BumpersConfig {
     /// Bumper trigger distance from robot edge (meters)
     #[serde(default = "default_bumper_trigger_distance")]
@@ -423,6 +433,7 @@ impl Default for BumpersConfig {
 
 /// Single cliff sensor position
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CliffSensorConfig {
     /// Sensor name (for output mapping)
     pub name: String,
@@ -436,6 +447,7 @@ pub struct CliffSensorConfig {
 
 /// Cliff sensors configuration
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CliffsConfig {
     /// Enable cliff detection
     #[serde(default = "default_true")]
@@ -482,6 +494,7 @@ impl Default for CliffsConfig {
 
 /// Battery simulation configuration
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BatteryConfig {
     /// Battery voltage (volts)
     #[serde(default = "default_battery_voltage")]
@@ -515,6 +528,7 @@ impl Default for BatteryConfig {
 
 /// Binary sensors configuration
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SensorsConfig {
     /// Battery configuration
     #[serde(default)]
@@ -551,6 +565,7 @@ impl Default for SensorsConfig {
 
 /// Actuator logging configuration
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActuatorsConfig {
     /// Log actuator state changes
     #[serde(default = "default_true")]
@@ -573,6 +588,7 @@ impl Default for ActuatorsConfig {
 ///
 /// Contains all parameters needed to simulate CRL-200S hardware.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SimulationConfig {
     /// Map file path (YAML file referencing PGM)
     pub map_file: String,
