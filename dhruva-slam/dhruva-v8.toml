@@ -156,11 +156,15 @@ max_iterations = 50
 tolerance = 1e-6
 
 [exploration]
-# Off: enabling it lets start_mapping drive the robot.
+# Off: enabling it lets start_mapping drive the robot. The household's
+# `scripts/robot/run_web.sh 0 <tag> sweep` (outside this repo) turns it on in a
+# RAM copy of this file.
 enabled = false
 # The corner sweep: follow the walls around the room once, touching them every ~2.5 m.
 strategy = "wall_follow"
 loop_rate_hz = 10.0
+# Not leaving a 1 m circle for this long (s) ends the sweep with "Stuck: ...".
+stuck_after_s = 180.0
 
 [exploration.wall_follow]
 side = "right"
