@@ -7,6 +7,9 @@
 //! is wrong about the distance (glass, mirrors, dark surfaces); the lidar only gives the
 //! wall's direction. Obstacles are the latest scan plus remembered contacts (bumps and
 //! cliffs), so an obstacle the lidar misses is followed like a wall once it has been touched.
+//! A fence (virtual wall points, e.g. across a room's doorways) is followed too, though it is
+//! never touched. Contacts and the fence are in the world frame of when they were made and do
+//! not move with loop closures.
 //!
 //! The control logic is written for a wall on the right; a wall on the left mirrors the
 //! robot-frame inputs (y → -y) and the turn direction.
@@ -174,10 +177,18 @@ pub struct WallFollower {
     /// Where following started (world frame, not moved by loop closures) and the distance
     /// travelled by then.
     lap_start: Option<(Point2D, f32)>,
+    /// Virtual wall points (world frame), followed like real ones.
+    fence: Vec<Point2D>,
 }
 
 impl WallFollower {
     pub fn new(config: WallFollowConfig) -> Self {
+        Self::fenced(config, Vec::new())
+    }
+
+    /// A sweep that also follows the virtual wall through `fence` (world points), e.g. across
+    /// the doorways of the room it sweeps.
+    pub fn fenced(config: WallFollowConfig, fence: Vec<Point2D>) -> Self {
         Self {
             config,
             phase: Phase::Seek,
@@ -186,6 +197,7 @@ impl WallFollower {
             travelled: 0.0,
             touch_due: 0.0,
             lap_start: None,
+            fence,
         }
     }
 
@@ -203,7 +215,7 @@ impl WallFollower {
         Point2D::new(p.x, self.mirror() * p.y)
     }
 
-    /// Scan points and remembered contacts, in the (mirrored) robot frame.
+    /// Scan points, remembered contacts and the fence, in the (mirrored) robot frame.
     fn obstacles(&self, pose: &Pose2D, scan: &PointCloud2D) -> Vec<Point2D> {
         let m = self.mirror();
         let scan_points = scan
@@ -211,8 +223,9 @@ impl WallFollower {
             .iter()
             .zip(&scan.ys)
             .map(|(&x, &y)| Point2D::new(x, m * y));
-        let contacts = self.contacts.iter().map(|c| self.to_robot(pose, c.x, c.y));
-        scan_points.chain(contacts).collect()
+        let remembered = (self.contacts.iter()).chain(&self.fence);
+        let remembered = remembered.map(|c| self.to_robot(pose, c.x, c.y));
+        scan_points.chain(remembered).collect()
     }
 
     /// Updates the distance travelled; returns the heading change since the last tick.
@@ -416,7 +429,7 @@ impl ExplorationStrategy for WallFollower {
     }
 
     fn reset(&mut self) {
-        *self = Self::new(self.config);
+        *self = Self::fenced(self.config, std::mem::take(&mut self.fence));
     }
 }
 
@@ -617,11 +630,12 @@ mod tests {
     }
 
     /// Runs the follower at 10 Hz. `walls` are seen by the lidar and solid; `glass` is
-    /// solid only.
+    /// solid only; the `fence` is neither.
     fn simulate(
         side: WallSide,
         walls: &[Segment],
         glass: &[Segment],
+        fence: Vec<Point2D>,
         start: Pose2D,
         seconds: f32,
     ) -> Run {
@@ -630,7 +644,7 @@ mod tests {
             ..WallFollowConfig::default()
         };
         let r = config.robot_radius;
-        let mut follower = WallFollower::new(config);
+        let mut follower = WallFollower::fenced(config, fence);
         let map = no_map();
         let solid: Vec<Segment> = walls.iter().chain(glass).copied().collect();
         let mut pose = start;
@@ -771,8 +785,53 @@ mod tests {
     #[test]
     fn sweeps_every_corner_of_an_l_shaped_room() {
         let start = Pose2D::new(1.5, 1.2, 0.3);
-        let run = simulate(WallSide::Right, &l_room(), &[], start, 300.0);
+        let run = simulate(WallSide::Right, &l_room(), &[], vec![], start, 300.0);
         assert_swept(&run, 1.0);
+    }
+
+    #[test]
+    fn a_fenced_doorway_is_followed_like_a_wall() {
+        // The L room's left wall opens at y 1..2 into a 1 m deep closet, fenced off.
+        let left_wall = ((0.0, 3.0), (0.0, 0.0));
+        let mut walls: Vec<Segment> = l_room().into_iter().filter(|&s| s != left_wall).collect();
+        walls.extend([
+            ((0.0, 3.0), (0.0, 2.0)),
+            ((0.0, 2.0), (-1.0, 2.0)),
+            ((-1.0, 2.0), (-1.0, 1.0)),
+            ((-1.0, 1.0), (0.0, 1.0)),
+            ((0.0, 1.0), (0.0, 0.0)),
+        ]);
+        let fence = (0..=20)
+            .map(|i| Point2D::new(-0.025, 1.0 + i as f32 * 0.05))
+            .collect();
+        let start = Pose2D::new(1.5, 1.2, 0.3);
+        let run = simulate(WallSide::Right, &walls, &[], fence, start, 300.0);
+        assert_swept(&run, 1.0);
+        let deepest = run.path.iter().map(|p| p.0).fold(f32::INFINITY, f32::min);
+        assert!(deepest > 0.1, "went {deepest:.2} m into the closet");
+    }
+
+    #[test]
+    fn a_long_fence_is_not_crept_across() {
+        // An 8 x 3 m room fenced at x = 4 along its whole height: the lean that keeps
+        // touching real walls must not carry the robot over the fence.
+        let corners = [(0.0, 0.0), (8.0, 0.0), (8.0, 3.0), (0.0, 3.0)];
+        let walls: Vec<Segment> = (0..4).map(|i| (corners[i], corners[(i + 1) % 4])).collect();
+        let fence = (0..=60)
+            .map(|i| Point2D::new(4.0, i as f32 * 0.05))
+            .collect();
+        let start = Pose2D::new(2.0, 1.2, 0.3);
+        let run = simulate(WallSide::Right, &walls, &[], fence, start, 300.0);
+        assert!(run.completed, "lap not closed");
+        let farthest = run
+            .path
+            .iter()
+            .map(|p| p.0)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            farthest < 3.9,
+            "reached x = {farthest:.2} past the fence's body line"
+        );
     }
 
     #[test]
@@ -782,7 +841,7 @@ mod tests {
             .map(|((ax, ay), (bx, by))| ((ax, -ay), (bx, -by)))
             .collect();
         let start = Pose2D::new(1.5, -1.2, -0.3);
-        let run = simulate(WallSide::Left, &room, &[], start, 300.0);
+        let run = simulate(WallSide::Left, &room, &[], vec![], start, 300.0);
         assert_swept(&run, -1.0);
     }
 
@@ -791,7 +850,7 @@ mod tests {
         // A 0.6 m glass fin out of the left wall.
         let glass = [((0.0, 1.5), (0.6, 1.5))];
         let start = Pose2D::new(1.5, 1.2, 0.3);
-        let run = simulate(WallSide::Right, &l_room(), &glass, start, 400.0);
+        let run = simulate(WallSide::Right, &l_room(), &glass, vec![], start, 400.0);
         assert!(run.completed, "lap not closed after {} bumps", run.bumps);
         assert!(run.bumps >= 1, "never touched the glass");
         // It went around the fin's tip rather than giving up on the wall.

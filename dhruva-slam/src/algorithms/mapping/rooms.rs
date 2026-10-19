@@ -166,6 +166,28 @@ impl Rooms {
         neighbours
     }
 
+    /// Where `room` opens into its neighbours: the cells (x, y) of other rooms side by side
+    /// with one of its cells.
+    pub fn doorways(&self, room: u16) -> Vec<(usize, usize)> {
+        let (w, h) = (self.width, self.height);
+        let of = |x: usize, y: usize| self.labels[y * w + x];
+        (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let label = of(x, y);
+                let beside = [
+                    (x > 0).then(|| (x - 1, y)),
+                    (x + 1 < w).then(|| (x + 1, y)),
+                    (y > 0).then(|| (x, y - 1)),
+                    (y + 1 < h).then(|| (x, y + 1)),
+                ];
+                label > 0
+                    && label != room
+                    && beside.into_iter().flatten().any(|(a, b)| of(a, b) == room)
+            })
+            .collect()
+    }
+
     /// Floor area per room (m²), indexed by room - 1.
     pub fn areas(&self) -> Vec<f32> {
         let mut cells = vec![0usize; self.count as usize];
@@ -258,6 +280,17 @@ mod tests {
             a.abs_diff(80 * 60) <= 16 && b.abs_diff(60 * 60) <= 16,
             "{cells:?}"
         );
+        // The doorway is a line of the other room's cells across the opening (rows 23..=38
+        // counted from the bottom).
+        for (room, other) in [(left, right), (right, left)] {
+            let door = rooms.doorways(room);
+            assert_eq!(door.len(), 16, "{door:?}");
+            assert!(
+                door.iter()
+                    .all(|&(x, y)| rooms.room(x, y) == Some(other) && (23..39).contains(&y)),
+                "{door:?}"
+            );
+        }
     }
 
     #[test]
