@@ -24,10 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use dhruva_slam::algorithms::planning::AStarConfig;
-use dhruva_slam::config::{Config, build_slam_thread_config};
-use dhruva_slam::exploration::{
-    ExplorationStrategy, FrontierConfig, FrontierExploration, WallFollowConfig, WallFollower,
-};
+use dhruva_slam::config::{Config, build_exploration, build_slam_thread_config};
 use dhruva_slam::io::map_manager::MapManager;
 use dhruva_slam::io::motion_controller::{MotionConfig, create_shared_motion_controller};
 use dhruva_slam::navigation::NavigatorConfig;
@@ -35,9 +32,8 @@ use dhruva_slam::state::{
     CommandReceiver, CommandSender, SharedStateHandle, create_command_channel, create_shared_state,
 };
 use dhruva_slam::threads::{
-    ExplorationConfig, ExplorationThread, NavigationThread, NavigationThreadConfig,
-    PublisherThread, SlamThread, SlamThreadConfig, StreamConfig as ThreadStreamConfig,
-    create_nav_channel, run_replay,
+    ExplorationThread, NavigationThread, NavigationThreadConfig, PublisherThread, SlamThread,
+    SlamThreadConfig, StreamConfig as ThreadStreamConfig, create_nav_channel, run_replay,
 };
 
 // ============================================================================
@@ -431,36 +427,10 @@ fn run_threaded_mode_rest(
 
     // Exploration Thread - autonomous mapping (optional)
     let exploration_thread = if config.exploration.enabled {
-        let exploration_config = ExplorationConfig {
-            motion: MotionConfig {
-                max_linear_vel: config.exploration.motion.max_linear_vel,
-                max_angular_vel: config.exploration.motion.max_angular_vel,
-                linear_vel: config.exploration.motion.linear_vel,
-                angular_vel: config.exploration.motion.angular_vel,
-            },
-            loop_rate_hz: config.exploration.loop_rate_hz,
-            stuck_after: Duration::from_secs_f32(config.exploration.stuck_after_s.max(1.0)),
-        };
-        let strategy: Box<dyn ExplorationStrategy> = match config.exploration.strategy.as_str() {
-            "frontier" => Box::new(FrontierExploration::new(FrontierConfig {
-                min_frontier_size: config.exploration.frontier.min_frontier_size,
-                frontier_detection_range: config.exploration.frontier.detection_range,
-                blocked_radius: config.exploration.frontier.blocked_radius,
-                clustering_threshold: config.exploration.frontier.clustering_threshold,
-                // Use same robot_radius and safety_margin as navigation for consistent path planning
-                robot_radius: config.navigation.robot_radius,
-                safety_margin: config.navigation.safety_margin,
-                ..FrontierConfig::default()
-            })),
-            "wall_follow" => Box::new(WallFollower::new(WallFollowConfig {
-                robot_radius: config.navigation.robot_radius,
-                ..config.exploration.wall_follow
-            })),
-            other => {
-                log::error!("Unknown exploration strategy {other:?} (frontier, wall_follow)");
-                std::process::exit(1);
-            }
-        };
+        let (exploration_config, strategy) = build_exploration(&config).unwrap_or_else(|e| {
+            log::error!("{e}");
+            std::process::exit(1);
+        });
 
         let thread = ExplorationThread::spawn(
             exploration_config,

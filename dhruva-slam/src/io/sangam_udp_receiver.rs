@@ -111,6 +111,10 @@ pub struct SensorStatusData {
     pub cliff_right_front: bool,
     /// Cliff sensor: right side.
     pub cliff_right_side: bool,
+    /// Charging (on the dock, or the DC jack).
+    pub is_charging: bool,
+    /// On the dock's contacts.
+    pub is_docked: bool,
 }
 
 /// A single LiDAR point: (angle_rad, distance_m, quality).
@@ -327,6 +331,8 @@ impl SangamUdpReceiver {
             cliff_left_front: Self::get_bool(values, "cliff_left_front").unwrap_or(false),
             cliff_right_front: Self::get_bool(values, "cliff_right_front").unwrap_or(false),
             cliff_right_side: Self::get_bool(values, "cliff_right_side").unwrap_or(false),
+            is_charging: Self::get_bool(values, "is_charging").unwrap_or(false),
+            is_docked: Self::get_bool(values, "is_dock_connected").unwrap_or(false),
         })
     }
 

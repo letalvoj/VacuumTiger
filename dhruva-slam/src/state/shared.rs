@@ -150,14 +150,30 @@ pub struct SensorStatus {
     pub lidar_angles: Vec<f32>,
     /// Latest lidar scan ranges (meters).
     pub lidar_ranges: Vec<f32>,
-    /// Latest preprocessed scan as the SLAM engine saw it (robot frame, deskewed).
-    pub scan_cloud: Timestamped<PointCloud2D>,
+    /// Latest preprocessed scan as the SLAM engine saw it.
+    pub scan_cloud: Timestamped<PlacedScan>,
     /// Timestamp of last update (microseconds).
     pub timestamp_us: u64,
     /// Bumper state.
     pub bumper: BumperState,
     /// Cliff sensor state.
     pub cliff: CliffState,
+}
+
+/// A scan where SLAM placed it: the deskewed cloud in the robot frame at `pose`.
+#[derive(Debug, Clone, Default)]
+pub struct PlacedScan {
+    pub cloud: PointCloud2D,
+    pub pose: Pose2D,
+}
+
+impl PlacedScan {
+    /// The cloud from the robot at `pose`: it moves on between scans (up to 166 ms at
+    /// 0.2 m/s and 1 rad/s is 3 cm and 10°), and what it steers by must agree with
+    /// where it believes it is.
+    pub fn seen_from(&self, pose: &Pose2D) -> PointCloud2D {
+        self.cloud.transform(&pose.inverse().compose(&self.pose))
+    }
 }
 
 /// Current map data for visualization.
@@ -277,8 +293,6 @@ pub struct ExplorationState {
     pub status: String,
     /// Number of frontiers remaining to explore.
     pub frontiers_remaining: usize,
-    /// Whether a bumper obstacle was detected (triggers re-route).
-    pub bumper_obstacle_detected: bool,
     /// Total area explored so far (square meters).
     pub explored_area_m2: f32,
     /// Estimated completion percentage (0-100).

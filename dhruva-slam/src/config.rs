@@ -3,6 +3,7 @@
 //! Shared by the daemon (`main.rs`), `--replay` and offline tools built on the library.
 
 use std::path::Path;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -17,7 +18,10 @@ use crate::engine::slam::{
     KeyframeManagerConfig, LoopClosureConfig as SlamLoopClosureConfig, OnlineSlamConfig,
     SubmapManagerConfig,
 };
-use crate::exploration::WallFollowConfig;
+use crate::exploration::{
+    ExplorationStrategy, FrontierConfig, FrontierExploration, WallFollowConfig, WallFollower,
+};
+use crate::io::motion_controller::MotionConfig;
 use crate::sensors::odometry::{
     ComplementaryConfig, DynOdometryConfig, MahonyConfig, OdometryType, WheelOdometryConfig,
 };
@@ -25,7 +29,7 @@ use crate::sensors::preprocessing::{
     AngularDownsamplerConfig, LidarOffset, OutlierFilterConfig, PreprocessorConfig,
     RangeFilterConfig, Sweep,
 };
-use crate::threads::SlamThreadConfig;
+use crate::threads::{ExplorationConfig, SlamThreadConfig};
 
 #[derive(Debug, Deserialize, Default)]
 pub struct Config {
@@ -745,6 +749,46 @@ pub fn build_slam_thread_config(config: &Config) -> SlamThreadConfig {
             sweep: config.lidar.sweep_start_angle.map(|start_angle| Sweep { start_angle }),
         },
     }
+}
+
+/// Exploration thread config and strategy from the TOML config (shared by the daemon and the
+/// lab's sweep bench). Errors on an unknown strategy name.
+pub fn build_exploration(
+    config: &Config,
+) -> Result<(ExplorationConfig, Box<dyn ExplorationStrategy>), String> {
+    let exploration = &config.exploration;
+    let thread = ExplorationConfig {
+        motion: MotionConfig {
+            max_linear_vel: exploration.motion.max_linear_vel,
+            max_angular_vel: exploration.motion.max_angular_vel,
+            linear_vel: exploration.motion.linear_vel,
+            angular_vel: exploration.motion.angular_vel,
+        },
+        loop_rate_hz: exploration.loop_rate_hz,
+        stuck_after: Duration::from_secs_f32(exploration.stuck_after_s.max(1.0)),
+    };
+    // Strategies plan with the same robot footprint as navigation.
+    let strategy: Box<dyn ExplorationStrategy> = match exploration.strategy.as_str() {
+        "frontier" => Box::new(FrontierExploration::new(FrontierConfig {
+            min_frontier_size: exploration.frontier.min_frontier_size,
+            frontier_detection_range: exploration.frontier.detection_range,
+            blocked_radius: exploration.frontier.blocked_radius,
+            clustering_threshold: exploration.frontier.clustering_threshold,
+            robot_radius: config.navigation.robot_radius,
+            safety_margin: config.navigation.safety_margin,
+            ..FrontierConfig::default()
+        })),
+        "wall_follow" => Box::new(WallFollower::new(WallFollowConfig {
+            robot_radius: config.navigation.robot_radius,
+            ..exploration.wall_follow
+        })),
+        other => {
+            return Err(format!(
+                "unknown exploration strategy {other:?} (frontier, wall_follow)"
+            ));
+        }
+    };
+    Ok((thread, strategy))
 }
 
 #[cfg(test)]

@@ -16,7 +16,7 @@ pub use navigation_thread::{
     NavCommand, NavCommandSender, NavigationThread, NavigationThreadConfig, create_nav_channel,
 };
 pub use publisher_thread::PublisherThread;
-pub use slam_thread::{ReplayReport, SlamThread, SlamThreadConfig, run_replay};
+pub use slam_thread::{ReplayReport, SlamContext, SlamThread, SlamThreadConfig, run_replay};
 
 /// Configuration for stream publishing rates.
 #[derive(Debug, Clone)]

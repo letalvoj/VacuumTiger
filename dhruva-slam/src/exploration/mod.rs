@@ -5,14 +5,14 @@
 //! - [`strategy`]: Exploration strategy trait for extensibility
 //! - [`frontier`]: Frontier-based exploration implementation
 //! - [`wall_follow`]: Corner sweep: follow the walls around the room
+//! - [`session`]: one session tick by tick: contacts, the SLAM gate, undocking, the
+//!   stuck watch, the strategy's actions as commands
 //!
 //! # Architecture
 //!
-//! The exploration system runs as a separate thread that:
-//! 1. Reads the current map and pose from SharedState
-//! 2. Computes the next target using the active strategy
-//! 3. Sends velocity commands to the motion controller
-//! 4. Handles bumper events for obstacle avoidance
+//! The exploration thread reads a [`session::Inputs`] snapshot of the SharedState each
+//! loop, ticks the [`session::Session`] and sends its command to SangamIO (or the
+//! navigation thread). Benches tick the same session against a simulated robot.
 //!
 //! # Example
 //!
@@ -32,6 +32,7 @@
 //! ```
 
 mod frontier;
+pub mod session;
 mod strategy;
 mod wall_follow;
 

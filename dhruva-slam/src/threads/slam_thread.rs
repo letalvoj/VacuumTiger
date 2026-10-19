@@ -25,12 +25,12 @@ use std::time::Instant;
 use crate::core::types::{LaserScan, Pose2D, Timestamped};
 use crate::engine::pipeline::{PipelineConfig, SlamPipeline};
 use crate::engine::slam::{SlamEngine, SlamMode};
-use crate::io::sangam_client::Message as SangamMessage;
 use crate::io::sangam_udp_receiver::{
     LidarData, ReceiverConfig, SangamUdpReceiver, SensorStatusData,
 };
 use crate::state::{
-    CommandReceiver, CommandResponse, CommandResult, RobotState, SharedStateHandle, SlamCommand,
+    CommandReceiver, CommandResponse, CommandResult, PlacedScan, RobotState, SharedStateHandle,
+    SlamCommand,
 };
 
 /// Configuration for the SLAM thread.
@@ -181,8 +181,9 @@ fn run_live_loop(
 const ROBOT_RADIUS: f32 = 0.18;
 
 /// The SLAM thread's state: the processing pipeline plus what the daemon
-/// publishes about it.
-struct SlamContext {
+/// publishes about it. The thread feeds it from the UDP receiver; `run_replay` and the
+/// lab's sweep bench feed it the same messages from a recording or the simulator.
+pub struct SlamContext {
     /// Odometry, preprocessing and SLAM engine.
     pipeline: SlamPipeline,
     /// Whether SLAM is in mapping mode.
@@ -200,7 +201,8 @@ struct SlamContext {
 }
 
 impl SlamContext {
-    fn new(config: &SlamThreadConfig) -> Self {
+    /// Idle until a `StartMapping` or `EnableMap` command.
+    pub(crate) fn new(config: &SlamThreadConfig) -> Self {
         Self {
             pipeline: SlamPipeline::new(&config.pipeline),
             is_mapping: false,
@@ -210,6 +212,14 @@ impl SlamContext {
             last_map_update_us: 0,
             prev_bumper_state: (false, false),
         }
+    }
+
+    /// Mapping from the first message on, as `StartMapping` leaves it.
+    pub fn mapping(config: &SlamThreadConfig) -> Self {
+        let mut ctx = Self::new(config);
+        ctx.pipeline.slam_mut().set_mode(SlamMode::Mapping);
+        ctx.is_mapping = true;
+        ctx
     }
 
     /// Process commands from command channel (non-blocking).
@@ -321,81 +331,6 @@ impl SlamContext {
                 }
 
                 Ok(CommandResponse::EmergencyStopped)
-            }
-        }
-    }
-
-    /// Process sensor status from live SangamIO message.
-    fn process_sensor_status(
-        &mut self,
-        msg: &SangamMessage,
-        timestamp_us: u64,
-        shared_state: &SharedStateHandle,
-    ) {
-        let (left, right) = match msg.encoder_ticks() {
-            Some(ticks) => ticks,
-            None => return,
-        };
-        let gyro_yaw = msg.gyro_yaw_raw().unwrap_or(0);
-
-        // Extract bumper state
-        let bumper_state = msg.bumper_state();
-
-        // Extract cliff sensor state
-        let cliff_state = msg.cliff_state();
-
-        self.process_odometry(left, right, gyro_yaw, timestamp_us, shared_state);
-
-        // Handle bumper obstacle marking (detect rising edge)
-        if let Some((bumper_left, bumper_right)) = bumper_state {
-            let bumper_left_rising = bumper_left && !self.prev_bumper_state.0;
-            let bumper_right_rising = bumper_right && !self.prev_bumper_state.1;
-
-            if (bumper_left_rising || bumper_right_rising) && self.is_mapping {
-                let pose = self.pipeline.slam().current_pose();
-                log::info!(
-                    "Bumper triggered (left={}, right={}) at pose ({:.2}, {:.2}, {:.2}°) - marking obstacle",
-                    bumper_left,
-                    bumper_right,
-                    pose.x,
-                    pose.y,
-                    pose.theta.to_degrees()
-                );
-
-                self.pipeline.slam_mut().mark_bumper_obstacle(
-                    pose.x,
-                    pose.y,
-                    pose.theta,
-                    bumper_left,
-                    bumper_right,
-                    ROBOT_RADIUS,
-                );
-            }
-
-            // Update previous bumper state
-            self.prev_bumper_state = (bumper_left, bumper_right);
-        }
-
-        // Update bumper and cliff states in shared state
-        if let Ok(mut state) = shared_state.write() {
-            // Update bumper state
-            if let Some((left_bumper, right_bumper)) = bumper_state {
-                state.sensor_status.bumper.left_pressed = left_bumper;
-                state.sensor_status.bumper.right_pressed = right_bumper;
-                if left_bumper || right_bumper {
-                    state.sensor_status.bumper.last_trigger_us = Some(timestamp_us);
-                }
-            }
-
-            // Update cliff state
-            if let Some((left_side, left_front, right_front, right_side)) = cliff_state {
-                state.sensor_status.cliff.left_side = left_side;
-                state.sensor_status.cliff.left_front = left_front;
-                state.sensor_status.cliff.right_front = right_front;
-                state.sensor_status.cliff.right_side = right_side;
-                if left_side || left_front || right_front || right_side {
-                    state.sensor_status.cliff.last_trigger_us = Some(timestamp_us);
-                }
             }
         }
     }
@@ -523,7 +458,11 @@ impl SlamContext {
                 // Apply lidar angle_offset to transform from lidar frame to robot frame
                 let angle_offset = self.pipeline.preprocessor().lidar_offset().total_theta();
                 let laser_scan = &step.laser;
-                state.sensor_status.scan_cloud = Timestamped::new(step.cloud.clone(), timestamp_us);
+                let placed = PlacedScan {
+                    cloud: step.cloud.clone(),
+                    pose: result.pose,
+                };
+                state.sensor_status.scan_cloud = Timestamped::new(placed, timestamp_us);
                 state.sensor_status.lidar_ranges = laser_scan.ranges.clone();
                 state.sensor_status.lidar_angles = (0..laser_scan.ranges.len())
                     .map(|i| {
@@ -549,7 +488,7 @@ impl SlamContext {
     }
 
     /// Process sensor status from UDP receiver.
-    fn process_udp_sensor_status(
+    pub fn process_udp_sensor_status(
         &mut self,
         data: &SensorStatusData,
         shared_state: &SharedStateHandle,
@@ -617,11 +556,14 @@ impl SlamContext {
             {
                 state.sensor_status.cliff.last_trigger_us = Some(timestamp_us);
             }
+
+            state.robot_status.is_charging = data.is_charging;
+            state.robot_status.is_docked = data.is_docked;
         }
     }
 
     /// Process lidar data from UDP receiver.
-    fn process_udp_lidar(&mut self, data: &LidarData, shared_state: &SharedStateHandle) {
+    pub fn process_udp_lidar(&mut self, data: &LidarData, shared_state: &SharedStateHandle) {
         let timestamp_us = data.timestamp_us;
 
         // Log scans at debug level (high frequency diagnostic data)
@@ -677,10 +619,7 @@ pub fn run_replay(
 
     std::fs::create_dir_all(out_dir)?;
     let shared_state = crate::state::create_shared_state();
-    let mut ctx = SlamContext::new(&config);
-    ctx.pipeline.slam_mut().reset();
-    ctx.pipeline.slam_mut().set_mode(SlamMode::Mapping);
-    ctx.is_mapping = true;
+    let mut ctx = SlamContext::mapping(&config);
 
     let mut csv = std::io::BufWriter::new(std::fs::File::create(out_dir.join("timing.csv"))?);
     writeln!(csv, "t_us,ms,x,y,theta,score,keyframes,points")?;

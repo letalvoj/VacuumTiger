@@ -1,38 +1,21 @@
 //! Exploration thread for autonomous mapping.
 //!
-//! This thread coordinates the exploration process:
-//! 1. Reads current map and pose from SharedState
-//! 2. Uses exploration strategy to determine next action
-//! 3. Sends velocity commands via MotionController
-//! 4. Handles bumper events for obstacle avoidance
+//! Each loop it reads a snapshot of the SharedState, ticks the exploration
+//! [`Session`] and carries out its command: through SangamIO (the MotionController),
+//! or by handing a target to the navigation thread. The decisions are the session's;
+//! this thread does the talking: turning the lidar and motors on, yielding to
+//! navigation, publishing the status.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::core::types::{Point2D, Pose2D};
-use crate::exploration::{ExplorationAction, ExplorationStrategy, HazardEvent, HazardType};
-use crate::io::motion_controller::{
-    MotionConfig, SharedMotionController, compute_velocity_to_target,
-};
-use crate::navigation::NavState;
-use crate::navigation::NavTarget;
-use crate::state::{CliffState, ExplorationMode, SharedStateHandle};
-
-/// A SLAM scan (and so pose) older than this stops the robot: strategies steer by them.
-const SCAN_TIMEOUT: Duration = Duration::from_secs(1);
-
-/// State for initial scanning behavior when no map exists yet.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum InitialScanState {
-    /// Not yet started initial scan.
-    NotStarted,
-    /// Currently rotating to build initial map.
-    Rotating { start_time: Instant },
-    /// Initial scan complete, have map data.
-    Complete,
-}
+use crate::exploration::ExplorationStrategy;
+use crate::exploration::session::{Command, Inputs, Session};
+use crate::io::motion_controller::{MotionConfig, SharedMotionController};
+use crate::navigation::{NavState, NavTarget};
+use crate::state::{ExplorationMode, SharedStateHandle};
 
 /// Configuration for exploration thread.
 #[derive(Debug, Clone)]
@@ -55,58 +38,8 @@ impl Default for ExplorationConfig {
     }
 }
 
-/// Leaving a circle of this radius (m) around where the robot was counts as progress.
-const STUCK_RADIUS: f32 = 1.0;
-/// A longer gap between two exploring ticks was a pause (navigation active, waiting for
-/// SLAM), not time spent stuck: the watch starts over.
-const STUCK_PAUSE: Duration = Duration::from_secs(1);
-
-/// Notices a robot that stays in one spot while exploring: wedged with the wheels
-/// spinning (the SLAM pose holds still while the odometry runs on), or circling among
-/// chair legs. Time-based, so it also covers a strategy that keeps turning in place.
-struct StuckWatch {
-    timeout: Duration,
-    /// Where the robot last left the circle around the previous anchor, and when.
-    anchor: Option<(Point2D, Instant)>,
-    /// The last tick it was told about.
-    last: Option<Instant>,
-}
-
-impl StuckWatch {
-    fn new(timeout: Duration) -> Self {
-        Self {
-            timeout,
-            anchor: None,
-            last: None,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.anchor = None;
-    }
-
-    /// Notes the robot at `pose`; true once it has stayed within `STUCK_RADIUS` of one
-    /// spot for `timeout`.
-    fn update(&mut self, pose: &Pose2D, now: Instant) -> bool {
-        if self
-            .last
-            .replace(now)
-            .is_some_and(|last| now.duration_since(last) > STUCK_PAUSE)
-        {
-            self.reset();
-        }
-        let here = Point2D::new(pose.x, pose.y);
-        match self.anchor {
-            Some((anchor, since)) if anchor.distance(&here) <= STUCK_RADIUS => {
-                now.duration_since(since) > self.timeout
-            }
-            _ => {
-                self.anchor = Some((here, now));
-                false
-            }
-        }
-    }
-}
+/// After a stop for a contact, before the next command: the motors' time to stop.
+const HALT_PAUSE: Duration = Duration::from_millis(50);
 
 /// Handle to the exploration thread.
 pub struct ExplorationThread {
@@ -151,7 +84,7 @@ impl ExplorationThread {
 /// Main exploration loop.
 fn run_exploration_loop(
     config: ExplorationConfig,
-    mut strategy: Box<dyn ExplorationStrategy>,
+    strategy: Box<dyn ExplorationStrategy>,
     shared_state: SharedStateHandle,
     motion_controller: SharedMotionController,
     running: Arc<AtomicBool>,
@@ -165,27 +98,15 @@ fn run_exploration_loop(
     };
 
     let loop_duration = Duration::from_secs_f32(1.0 / config.loop_rate_hz);
-    let mut last_bumper_state = (false, false);
-    let mut last_cliff_state = CliffState::default();
+    let mut session = Session::new(strategy, config.motion.clone(), config.stuck_after);
     let mut motion_enabled = false;
     let mut lidar_enabled = false;
-    let mut initial_scan_state = InitialScanState::NotStarted;
-    // The latest scan stamp and when it arrived.
-    let mut scan_seen = (0, Instant::now());
-    // A contact the strategy has not been told about yet (e.g. while waiting for SLAM).
-    let mut pending_hazard: Option<HazardEvent> = None;
     let mut was_exploring = false;
-    let mut stuck_watch = StuckWatch::new(config.stuck_after);
-
-    // Duration to rotate in place to build initial map (full 360° rotation)
-    let initial_scan_duration =
-        Duration::from_secs_f32((2.0 * std::f32::consts::PI) / config.motion.angular_vel);
 
     while running.load(Ordering::Relaxed) {
         let loop_start = Instant::now();
 
-        // Read current state
-        let (exploration_mode, current_pose, current_map, scan, bumper_state, cliff_state) = {
+        let (exploration_mode, inputs, nav_has_targets, nav_state, current_target_pos) = {
             let state = match shared_state.read() {
                 Ok(s) => s,
                 Err(e) => {
@@ -194,108 +115,32 @@ fn run_exploration_loop(
                     continue;
                 }
             };
-
+            let navigation = &state.navigation_state;
             (
                 state.exploration_state.mode,
-                state.robot_status.pose,
-                state.current_map.clone(),
-                state.sensor_status.scan_cloud.clone(),
-                state.sensor_status.bumper.clone(),
-                state.sensor_status.cliff.clone(),
+                Inputs::snapshot(&state),
+                navigation.has_targets(),
+                navigation.nav_state,
+                navigation
+                    .current_target()
+                    .map(|t| (t.position.x, t.position.y)),
             )
         };
 
-        // Every exploration session starts afresh (also after one completed).
+        // Every exploration session starts afresh (also after one completed); one that
+        // ends leaves the robot standing.
         let exploring = exploration_mode == ExplorationMode::Exploring;
         if exploring && !was_exploring {
-            strategy.reset();
-            stuck_watch.reset();
+            session.start(inputs.scan.timestamp_us);
+        }
+        if !exploring
+            && was_exploring
+            && motion_enabled
+            && let Err(e) = motion_controller.lock().unwrap().set_velocity(0.0, 0.0)
+        {
+            log::warn!("Failed to stop after exploring: {}", e);
         }
         was_exploring = exploring;
-
-        // Detect hazard events (rising edge detection for bumpers and cliff sensors)
-        let hazard_event: Option<HazardEvent> = {
-            // Check bumpers first (higher priority - physical collision)
-            let bumper_left_triggered = bumper_state.left_pressed && !last_bumper_state.0;
-            let bumper_right_triggered = bumper_state.right_pressed && !last_bumper_state.1;
-
-            // Check cliff sensors (also high priority - fall hazard)
-            let cliff_left_side_triggered = cliff_state.left_side && !last_cliff_state.left_side;
-            let cliff_left_front_triggered = cliff_state.left_front && !last_cliff_state.left_front;
-            let cliff_right_front_triggered =
-                cliff_state.right_front && !last_cliff_state.right_front;
-            let cliff_right_side_triggered = cliff_state.right_side && !last_cliff_state.right_side;
-
-            // Determine hazard type (prioritize bumpers, then front cliffs, then side cliffs)
-            if bumper_left_triggered && bumper_right_triggered {
-                Some(HazardEvent::new(HazardType::BumperBoth, &current_pose))
-            } else if bumper_left_triggered {
-                Some(HazardEvent::new(HazardType::BumperLeft, &current_pose))
-            } else if bumper_right_triggered {
-                Some(HazardEvent::new(HazardType::BumperRight, &current_pose))
-            } else if cliff_left_front_triggered {
-                Some(HazardEvent::new(HazardType::CliffLeftFront, &current_pose))
-            } else if cliff_right_front_triggered {
-                Some(HazardEvent::new(HazardType::CliffRightFront, &current_pose))
-            } else if cliff_left_side_triggered {
-                Some(HazardEvent::new(HazardType::CliffLeftSide, &current_pose))
-            } else if cliff_right_side_triggered {
-                Some(HazardEvent::new(HazardType::CliffRightSide, &current_pose))
-            } else {
-                None
-            }
-        };
-
-        // Kept until the strategy hears of it, unless something else drives meanwhile.
-        pending_hazard = hazard_event.or(pending_hazard);
-
-        // Update last states for edge detection
-        last_bumper_state = (bumper_state.left_pressed, bumper_state.right_pressed);
-        last_cliff_state = cliff_state.clone();
-
-        // Handle hazard emergency stop (bumper or cliff)
-        let any_hazard_active =
-            bumper_state.left_pressed || bumper_state.right_pressed || cliff_state.any_triggered();
-
-        if any_hazard_active {
-            if let Err(e) = motion_controller.lock().unwrap().emergency_stop() {
-                log::warn!("Emergency stop failed: {}", e);
-            }
-
-            // Update shared state with hazard detection
-            if let Ok(mut state) = shared_state.write() {
-                state.exploration_state.bumper_obstacle_detected = true;
-            }
-
-            // Don't wait - let the strategy handle the hazard event
-            // but do a brief pause to let motors stop
-            thread::sleep(Duration::from_millis(50));
-        } else {
-            // Clear hazard flag when all sensors are clear
-            if let Ok(mut state) = shared_state.write()
-                && state.exploration_state.bumper_obstacle_detected
-            {
-                state.exploration_state.bumper_obstacle_detected = false;
-            }
-        }
-
-        // Check if navigation has active targets - yield to navigation
-        let (nav_has_targets, nav_state, current_target_pos) = {
-            match shared_state.read() {
-                Ok(s) => {
-                    let target_pos = s
-                        .navigation_state
-                        .current_target()
-                        .map(|t| (t.position.x, t.position.y));
-                    (
-                        s.navigation_state.has_targets(),
-                        s.navigation_state.nav_state,
-                        target_pos,
-                    )
-                }
-                Err(_) => (false, NavState::Idle, None),
-            }
-        };
 
         // Handle navigation failure - clear target and notify strategy
         if nav_state == NavState::Failed && nav_has_targets {
@@ -303,7 +148,7 @@ fn run_exploration_loop(
 
             // Get and notify strategy about blocked target before clearing
             if let Some((tx, ty)) = current_target_pos {
-                strategy.mark_target_blocked(tx, ty);
+                session.target_blocked(tx, ty);
             }
 
             // Clear the failed target from navigation state
@@ -323,7 +168,7 @@ fn run_exploration_loop(
             log::info!("Navigation completed successfully, notifying exploration strategy");
 
             // Notify strategy that target was reached (clears internal state)
-            strategy.mark_target_reached();
+            session.target_reached();
 
             // Clear the TargetReached state
             if let Ok(mut state) = shared_state.write() {
@@ -337,8 +182,7 @@ fn run_exploration_loop(
         }
 
         // Only explore if in exploration mode AND navigation is not active
-        if exploration_mode != ExplorationMode::Exploring || nav_has_targets {
-            pending_hazard = None;
+        if !exploring || nav_has_targets {
             // Only disable motors/lidar if exploration mode changed to Disabled
             // When yielding to navigation (nav_has_targets), keep motors enabled!
             if exploration_mode == ExplorationMode::Disabled && (motion_enabled || lidar_enabled) {
@@ -355,13 +199,11 @@ fn run_exploration_loop(
                     }
                     lidar_enabled = false;
                 }
-                // Reset initial scan state for next exploration session
-                initial_scan_state = InitialScanState::NotStarted;
             }
 
             // If yielding to navigation, update status (but keep motors enabled!)
             if nav_has_targets
-                && exploration_mode == ExplorationMode::Exploring
+                && exploring
                 && let Ok(mut state) = shared_state.write()
             {
                 state.exploration_state.status = "Paused: Navigation active".to_string();
@@ -391,204 +233,63 @@ fn run_exploration_loop(
             }
         }
 
-        // Enable motors if not already enabled
-        if !motion_enabled && motion_available {
-            let result = motion_controller.lock().unwrap().enable();
-            match result {
+        let now = Instant::now();
+        let tick = session.tick(&inputs, now);
+
+        if tick.halt {
+            if let Err(e) = motion_controller.lock().unwrap().emergency_stop() {
+                log::warn!("Emergency stop failed: {}", e);
+            }
+            thread::sleep(HALT_PAUSE);
+        }
+
+        // Motors go on once SLAM's scans flow; the command waits for the next tick.
+        if !motion_enabled && session.scans_flowing(now) && motion_available {
+            match motion_controller.lock().unwrap().enable() {
                 Ok(()) => {
                     motion_enabled = true;
                     log::debug!("Motors enabled, waiting 3 seconds for controller to settle");
-                    // Wait 3 seconds for motor controller to settle
                     thread::sleep(Duration::from_secs(3));
                     log::debug!("Motors settled, ready for exploration");
+                    continue;
                 }
-                Err(e) => {
-                    // Only log at debug level - MotionController will retry automatically
-                    log::debug!("Motor enable pending: {}", e);
-                }
+                // Only log at debug level - MotionController will retry automatically
+                Err(e) => log::debug!("Motor enable pending: {}", e),
             }
         }
 
-        // Get map data for exploration
-        let map = match current_map {
-            Some(m) => {
-                // We have map data, mark initial scan as complete
-                if initial_scan_state != InitialScanState::Complete {
-                    log::info!("Initial scan complete, map data available");
-                    initial_scan_state = InitialScanState::Complete;
-                }
-                m
-            }
-            None => {
-                // No map yet - need to rotate in place to build initial map
-                match initial_scan_state {
-                    InitialScanState::NotStarted => {
-                        log::info!("No map data yet, starting initial 360° scan rotation");
-                        initial_scan_state = InitialScanState::Rotating {
-                            start_time: Instant::now(),
-                        };
-
-                        // Update status
-                        if let Ok(mut state) = shared_state.write() {
-                            state.exploration_state.status =
-                                "Initial scan: rotating to build map".to_string();
-                        }
-
-                        // Start rotating
-                        if let Err(e) = motion_controller
-                            .lock()
-                            .unwrap()
-                            .set_velocity(0.0, config.motion.angular_vel)
-                        {
-                            log::warn!("Failed to start initial rotation: {}", e);
-                        }
-                    }
-                    InitialScanState::Rotating { start_time } => {
-                        // Check if we've completed the full rotation
-                        if start_time.elapsed() >= initial_scan_duration {
-                            log::info!("Initial rotation complete, waiting for map data");
-                            // Stop rotating
-                            if let Err(e) = motion_controller.lock().unwrap().emergency_stop() {
-                                log::warn!("Failed to stop after initial rotation: {}", e);
-                            }
-
-                            // Update status - still waiting for map
-                            if let Ok(mut state) = shared_state.write() {
-                                state.exploration_state.status =
-                                    "Waiting for map data after initial scan".to_string();
-                            }
-
-                            // Give a brief pause then continue checking
-                            // Don't reset state - keep waiting for map
-                        } else {
-                            // Still rotating - update status with progress
-                            let progress = start_time.elapsed().as_secs_f32()
-                                / initial_scan_duration.as_secs_f32()
-                                * 100.0;
-                            if let Ok(mut state) = shared_state.write() {
-                                state.exploration_state.status =
-                                    format!("Initial scan: {:.0}% complete", progress);
-                            }
-                        }
-                    }
-                    InitialScanState::Complete => {
-                        // Should have map but don't - continue waiting
-                        if let Ok(mut state) = shared_state.write() {
-                            state.exploration_state.status = "Waiting for map data".to_string();
-                        }
-                    }
-                }
-                thread::sleep(loop_duration);
-                continue;
-            }
-        };
-
-        // SLAM publishes every scan it processes, also standing still: no new one is a stall.
-        if scan.timestamp_us != scan_seen.0 {
-            scan_seen = (scan.timestamp_us, Instant::now());
-        }
-        if scan_seen.1.elapsed() > SCAN_TIMEOUT {
-            if let Err(e) = motion_controller.lock().unwrap().set_velocity(0.0, 0.0) {
-                log::warn!("Failed to stop on a stale scan: {}", e);
-            }
-            if let Ok(mut state) = shared_state.write() {
-                state.exploration_state.status = "Waiting for SLAM".to_string();
-            }
-            thread::sleep(loop_duration);
-            continue;
-        }
-
-        // Ends like a completed sweep (the lidar keeps spinning, mapping goes on); only the
-        // status tells it apart (there is no failed mode).
-        if stuck_watch.update(&current_pose, Instant::now()) {
-            let status = format!(
-                "Stuck: did not leave {:.0} m around ({:.1}, {:.1}) in {:.0} s",
-                STUCK_RADIUS,
-                current_pose.x,
-                current_pose.y,
-                config.stuck_after.as_secs_f32()
-            );
-            log::error!("{}", status);
-            if let Err(e) = motion_controller.lock().unwrap().disable() {
-                log::warn!("Failed to disable motors: {}", e);
-            }
-            motion_enabled = false;
-            if let Ok(mut state) = shared_state.write() {
-                state.exploration_state.mode = ExplorationMode::Complete;
-                state.exploration_state.status = status;
-                state.exploration_state.current_target = None;
-            }
-            thread::sleep(loop_duration);
-            continue;
-        }
-
-        // Get next action from strategy
-        let hazard = pending_hazard.take();
-        let action = strategy.next_action(&map, &current_pose, &scan.data, hazard.as_ref());
-
-        // Update shared state with exploration progress
         if let Ok(mut state) = shared_state.write() {
-            state.exploration_state.frontiers_remaining = strategy.frontier_count();
-            state.exploration_state.completion_percent = strategy.completion_percent();
-            state.exploration_state.explored_area_m2 = map.explored_area_m2;
+            let exploration = &mut state.exploration_state;
+            exploration.frontiers_remaining = session.strategy().frontier_count();
+            exploration.completion_percent = session.strategy().completion_percent();
+            if let Some(map) = &inputs.map {
+                exploration.explored_area_m2 = map.explored_area_m2;
+            }
+            exploration.status = tick.status.clone();
         }
 
-        // Execute action
-        match action {
-            ExplorationAction::MoveTo { target, reason } => {
-                // Direct motion - used for hazard recovery (backing up, etc.)
-                log::debug!(
-                    "Direct move to ({:.2}, {:.2}) - {}",
-                    target.x,
-                    target.y,
-                    reason
-                );
-
-                // Compute velocity to reach target
-                let (linear, angular) = compute_velocity_to_target(
-                    current_pose.x,
-                    current_pose.y,
-                    current_pose.theta,
-                    target.x,
-                    target.y,
-                    &config.motion,
-                );
-
-                if let Err(e) = motion_controller
-                    .lock()
-                    .unwrap()
-                    .set_velocity(linear, angular)
+        match tick.command {
+            Command::Drive { linear, angular } => {
+                if motion_enabled
+                    && let Err(e) = motion_controller
+                        .lock()
+                        .unwrap()
+                        .set_velocity(linear, angular)
                 {
                     log::warn!("Failed to set velocity: {}", e);
                 }
-
-                // Update shared state
-                if let Ok(mut state) = shared_state.write() {
-                    state.exploration_state.current_target = Some(target);
-                    state.exploration_state.status = format!("Recovery: {}", reason);
-                }
             }
 
-            ExplorationAction::NavigateTo { target, reason } => {
-                // Path-planned navigation - delegate to navigation system
-                log::info!(
-                    "Navigating to frontier at ({:.2}, {:.2}) - {}",
-                    target.x,
-                    target.y,
-                    reason
-                );
-
-                // Create a frontier target for the navigation system
-                let nav_target = NavTarget::frontier(target.x, target.y);
-
-                // Push target to navigation state (navigation thread will handle path planning)
+            Command::NavigateTo(target) => {
+                log::info!("Navigating to ({:.2}, {:.2})", target.x, target.y);
+                // The navigation thread plans the path and drives it.
                 if let Ok(mut state) = shared_state.write() {
                     // Clear any existing targets first to prevent stale targets
                     state.navigation_state.clear_targets();
-                    state.navigation_state.push_target(nav_target);
-
+                    state
+                        .navigation_state
+                        .push_target(NavTarget::frontier(target.x, target.y));
                     state.exploration_state.current_target = Some(target);
-                    state.exploration_state.status = format!("Navigating: {}", reason);
                 }
 
                 // Set zero velocity - navigation thread will take over control
@@ -598,76 +299,24 @@ fn run_exploration_loop(
                 }
             }
 
-            ExplorationAction::Drive {
-                linear,
-                angular,
-                reason,
-            } => {
-                if let Err(e) = motion_controller
-                    .lock()
-                    .unwrap()
-                    .set_velocity(linear, angular)
-                {
-                    log::warn!("Failed to set velocity: {}", e);
+            Command::Finish { completed } => {
+                if completed {
+                    log::info!("Exploration complete - all areas mapped!");
+                } else {
+                    log::error!("{}", tick.status);
                 }
-                if let Ok(mut state) = shared_state.write() {
-                    state.exploration_state.status = reason.to_string();
-                }
-            }
-
-            ExplorationAction::RotateInPlace { angle_rad } => {
-                log::debug!("Rotating in place: {:.2} rad", angle_rad);
-
-                let angular = angle_rad.signum() * config.motion.angular_vel;
-                if let Err(e) = motion_controller.lock().unwrap().set_velocity(0.0, angular) {
-                    log::warn!("Failed to set rotation velocity: {}", e);
-                }
-
-                // Update shared state
-                if let Ok(mut state) = shared_state.write() {
-                    state.exploration_state.status = "Scanning area".to_string();
-                }
-            }
-
-            ExplorationAction::Complete => {
-                log::info!("Exploration complete - all areas mapped!");
-
+                // Ends like a completed sweep (the lidar keeps spinning, mapping goes on);
+                // only the status tells a stuck one apart (there is no failed mode).
                 if let Err(e) = motion_controller.lock().unwrap().disable() {
                     log::warn!("Failed to disable motors: {}", e);
                 }
                 motion_enabled = false;
-
-                // Update exploration mode to complete
                 if let Ok(mut state) = shared_state.write() {
                     state.exploration_state.mode = ExplorationMode::Complete;
-                    state.exploration_state.status = "Exploration complete".to_string();
                     state.exploration_state.current_target = None;
-                    state.exploration_state.completion_percent = 100.0;
-                }
-            }
-
-            ExplorationAction::Stuck { reason } => {
-                log::warn!("Exploration stuck: {}", reason);
-
-                {
-                    let mut mc = motion_controller.lock().unwrap();
-                    if let Err(e) = mc.emergency_stop() {
-                        log::warn!("Failed to stop: {}", e);
+                    if completed {
+                        state.exploration_state.completion_percent = 100.0;
                     }
-                }
-
-                // Update shared state
-                if let Ok(mut state) = shared_state.write() {
-                    state.exploration_state.status = format!("Stuck: {}", reason);
-                }
-
-                // Try rotating to find new path
-                if let Err(e) = motion_controller
-                    .lock()
-                    .unwrap()
-                    .set_velocity(0.0, config.motion.angular_vel)
-                {
-                    log::warn!("Failed to rotate: {}", e);
                 }
             }
         }
@@ -701,48 +350,5 @@ mod tests {
     fn test_exploration_config_default() {
         let config = ExplorationConfig::default();
         assert_eq!(config.loop_rate_hz, 10.0);
-    }
-
-    /// Ticks the watch at 10 Hz from `from` to `to` (s) along `path`; the first tick that
-    /// reports stuck, in seconds.
-    fn first_stuck(
-        watch: &mut StuckWatch,
-        t0: Instant,
-        (from, to): (f32, f32),
-        path: impl Fn(f32) -> Pose2D,
-    ) -> Option<f32> {
-        (0..)
-            .map(|i| from + i as f32 * 0.1)
-            .take_while(|&s| s <= to)
-            .find(|&s| watch.update(&path(s), t0 + Duration::from_secs_f32(s)))
-    }
-
-    #[test]
-    fn circling_in_one_spot_is_stuck_after_the_timeout() {
-        let timeout = ExplorationConfig::default().stuck_after;
-        let mut watch = StuckWatch::new(timeout);
-        // 0.15 m/s around a 0.5 m circle: it never leaves the 1 m one.
-        let circling = |s: f32| Pose2D::new(0.5 * (0.3 * s).cos(), 0.5 * (0.3 * s).sin(), 0.0);
-        let stuck = first_stuck(&mut watch, Instant::now(), (0.0, 300.0), circling);
-        assert!(
-            stuck
-                .is_some_and(|s| (timeout.as_secs_f32()..timeout.as_secs_f32() + 0.2).contains(&s)),
-            "{stuck:?}"
-        );
-    }
-
-    #[test]
-    fn driving_on_or_pausing_restarts_the_clock() {
-        let mut watch = StuckWatch::new(Duration::from_secs(120));
-        let t0 = Instant::now();
-        let still = |_| Pose2D::new(0.0, 0.0, 0.0);
-        // A wall run: 0.15 m/s in a straight line, never stuck.
-        let run = |s: f32| Pose2D::new(0.15 * s, 0.0, 0.0);
-        assert_eq!(first_stuck(&mut watch, t0, (0.0, 600.0), run), None);
-        // Still for 100 s, then a 60 s pause (navigation, SLAM stall), then still again:
-        // the clock starts over after the pause.
-        assert_eq!(first_stuck(&mut watch, t0, (600.0, 700.0), still), None);
-        let stuck = first_stuck(&mut watch, t0, (760.0, 1000.0), still);
-        assert!(stuck.is_some_and(|s| s > 880.0), "{stuck:?}");
     }
 }

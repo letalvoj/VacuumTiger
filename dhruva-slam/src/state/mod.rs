@@ -13,7 +13,7 @@ pub use commands::{
     create_command_channel, send_command_sync,
 };
 pub use shared::{
-    CliffState, CurrentMapData, ExplorationMode, MapList, MapSummary, MappingProgressState,
-    MappingProgressStateEnum, RobotState, RobotStatus, SensorStatus, SharedStateHandle,
-    create_shared_state,
+    BumperState, CliffState, CurrentMapData, ExplorationMode, MapList, MapSummary,
+    MappingProgressState, MappingProgressStateEnum, PlacedScan, RobotState, RobotStatus,
+    SensorStatus, SharedState, SharedStateHandle, create_shared_state,
 };
