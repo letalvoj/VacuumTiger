@@ -1,0 +1,305 @@
+//! The scenes the corner sweep is scored on, after what the real runs met
+//! (`captures/CATALOG.md`), and their maps for the SangamIO mock.
+
+use std::f32::consts::PI;
+
+use image::{GrayImage, Luma};
+use sangamio::devices::mock::map_loader::SimulationMap;
+
+pub type Point = (f32, f32);
+/// A segment `(a, b)`. For an edge to sweep, the floor is on its left.
+pub type Segment = (Point, Point);
+
+/// Map cell (m): fine, since the mock's ranges come in steps of it. A cell is solid when
+/// its centre is; one on the very edge of a leg is (`TIE`), so a leg spans whole cells
+/// whatever the rounding, at most a cell wider than it is.
+const RES: f32 = 0.01;
+const TIE: f32 = 1e-4;
+/// Wall around the room's bounding box in the map (m).
+const MARGIN: f32 = 0.3;
+/// A curtain's fabric is a band this thick (m)…
+const FABRIC: f32 = 0.02;
+/// …that folds every this far (m).
+const FOLD_PITCH: f32 = 0.15;
+
+/// A curtain: fabric hanging in folds behind `front` (towards its left), bulging up to
+/// `depth` back. A lidar beam crossing it square is returned with probability `seen`
+/// (one crossing the folds at a slant meets more fabric, and is returned more often); the
+/// body drives through it.
+#[derive(Debug, Clone, Copy)]
+pub struct Curtain {
+    pub front: Segment,
+    pub depth: f32,
+    pub seen: f32,
+}
+
+impl Curtain {
+    /// Whether `p` is in the fabric.
+    fn holds(&self, p: Point) -> bool {
+        let ((ax, ay), (bx, by)) = self.front;
+        let len = (bx - ax).hypot(by - ay);
+        let u = ((bx - ax) / len, (by - ay) / len);
+        let (dx, dy) = (p.0 - ax, p.1 - ay);
+        let along = dx * u.0 + dy * u.1;
+        let behind = dy * u.0 - dx * u.1;
+        let fold = self.depth * 0.5 * (1.0 - (along * std::f32::consts::TAU / FOLD_PITCH).cos());
+        (0.0..=len).contains(&along) && (behind - fold).abs() <= FABRIC / 2.0
+    }
+
+    /// The lidar mask's gray for the fabric: a beam crosses about `FABRIC / RES` cells of it.
+    fn gray(&self) -> u8 {
+        let opacity = 1.0 - (1.0 - self.seen).powf(RES / FABRIC);
+        (255.0 * (1.0 - opacity)).round() as u8
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Scene {
+    pub name: &'static str,
+    /// The floor's outline, counter-clockwise: its sides are the edges to sweep, and
+    /// their joints the corners.
+    pub room: Vec<Point>,
+    /// Square legs: centre and side (m).
+    pub legs: Vec<(Point, f32)>,
+    /// Solid but not seen by the lidar: glass, or something below it.
+    pub glass: Vec<Segment>,
+    pub curtains: Vec<Curtain>,
+    /// Where the robot starts: x, y (m), heading (rad).
+    pub start: (f32, f32, f32),
+    pub seconds: f32,
+}
+
+impl Scene {
+    pub fn new(name: &'static str, room: &[Point], start: (f32, f32, f32), seconds: f32) -> Self {
+        Self {
+            name,
+            room: room.to_vec(),
+            legs: Vec::new(),
+            glass: Vec::new(),
+            curtains: Vec::new(),
+            start,
+            seconds,
+        }
+    }
+
+    pub fn edges(&self) -> Vec<Segment> {
+        polygon(&self.room)
+    }
+
+    /// Everything the lidar sees, as segments: the room's sides and the legs' outlines.
+    pub fn walls(&self) -> Vec<Segment> {
+        let legs = self.legs.iter().flat_map(|&((x, y), side)| {
+            let h = side / 2.0;
+            polygon(&[
+                (x - h, y - h),
+                (x + h, y - h),
+                (x + h, y + h),
+                (x - h, y + h),
+            ])
+        });
+        self.edges().into_iter().chain(legs).collect()
+    }
+
+    /// The scene as the mock's map: wall outside the room, in the legs and along the
+    /// glass; a lidar mask that is clear along the glass and gray in the curtains.
+    pub fn map(&self) -> SimulationMap {
+        let (xs, ys): (Vec<f32>, Vec<f32>) = self.room.iter().copied().unzip();
+        let lo = |v: &[f32]| v.iter().copied().fold(f32::INFINITY, f32::min) - MARGIN;
+        let hi = |v: &[f32]| v.iter().copied().fold(f32::NEG_INFINITY, f32::max) + MARGIN;
+        let origin = (lo(&xs), lo(&ys));
+        let w = ((hi(&xs) - origin.0) / RES).ceil() as u32;
+        let h = ((hi(&ys) - origin.1) / RES).ceil() as u32;
+        // Cell centres; image rows run from the top (largest y) down.
+        let centre = |px: u32, py: u32| {
+            (
+                origin.0 + (px as f32 + 0.5) * RES,
+                origin.1 + ((h - 1 - py) as f32 + 0.5) * RES,
+            )
+        };
+        // Glass is the cells it crosses or touches: one or two thick.
+        let glass = |p: Point| self.glass.iter().any(|&g| distance_to_segment(p, g) < RES);
+        let solid = |p: Point| {
+            !inside(&self.room, p)
+                || glass(p)
+                || (self.legs.iter()).any(|&(c, side)| {
+                    (p.0 - c.0).abs() <= side / 2.0 + TIE && (p.1 - c.1).abs() <= side / 2.0 + TIE
+                })
+        };
+        let occupancy = GrayImage::from_fn(w, h, |px, py| {
+            Luma([if solid(centre(px, py)) { 0 } else { 255 }])
+        });
+        let mask = GrayImage::from_fn(w, h, |px, py| {
+            let p = centre(px, py);
+            let gray = if glass(p) {
+                255
+            } else if solid(p) {
+                0
+            } else {
+                (self.curtains.iter().find(|c| c.holds(p))).map_or(255, Curtain::gray)
+            };
+            Luma([gray])
+        });
+        SimulationMap::from_image(occupancy, RES, origin).with_lidar_mask(mask)
+    }
+}
+
+/// A closed polygon's sides, `corners` in order.
+pub fn polygon(corners: &[Point]) -> Vec<Segment> {
+    (0..corners.len())
+        .map(|i| (corners[i], corners[(i + 1) % corners.len()]))
+        .collect()
+}
+
+pub fn distance_to_segment(p: Point, ((ax, ay), (bx, by)): Segment) -> f32 {
+    let (dx, dy) = (bx - ax, by - ay);
+    let t = (((p.0 - ax) * dx + (p.1 - ay) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+    (p.0 - ax - t * dx).hypot(p.1 - ay - t * dy)
+}
+
+/// Whether `p` is inside the polygon (even-odd rule).
+pub fn inside(polygon: &[Point], p: Point) -> bool {
+    let mut odd = false;
+    for (a, b) in self::polygon(polygon) {
+        if (a.1 > p.1) != (b.1 > p.1) && p.0 < a.0 + (p.1 - a.1) * (b.0 - a.0) / (b.1 - a.1) {
+            odd = !odd;
+        }
+    }
+    odd
+}
+
+const BOX: [Point; 4] = [(0.0, 0.0), (3.0, 0.0), (3.0, 2.0), (0.0, 2.0)];
+
+/// The scenes, each a few metres and a few minutes.
+pub fn scenes() -> Vec<Scene> {
+    let start = (1.5, 1.0, 0.3);
+    let mut out = Vec::new();
+
+    // Walls and four inner corners.
+    out.push(Scene::new("box", &BOX, start, 150.0));
+
+    // An L: five inner corners and an outer one.
+    let l = [
+        (0.0, 0.0),
+        (4.0, 0.0),
+        (4.0, 2.0),
+        (2.0, 2.0),
+        (2.0, 3.0),
+        (0.0, 3.0),
+    ];
+    out.push(Scene::new("l_room", &l, (1.5, 1.2, 0.3), 240.0));
+
+    // Just undocked: the dock (35 x 12 cm) on the left wall behind, the robot 30 cm off it
+    // facing away (sweeps 1, 4, 5 and 8 went wrong here).
+    let dock = [
+        (0.0, 0.0),
+        (3.0, 0.0),
+        (3.0, 2.0),
+        (0.0, 2.0),
+        (0.0, 1.18),
+        (0.12, 1.18),
+        (0.12, 0.83),
+        (0.0, 0.83),
+    ];
+    out.push(Scene::new("dock", &dock, (0.6, 1.0, 0.0), 150.0));
+
+    // sweep7: a curtain along the bottom wall, its folds 3-18 cm out, mostly seen by the
+    // lidar; the robot drives through it up to the wall. A cupboard side ends it.
+    let curtain = [
+        (0.0, 0.0),
+        (2.4, 0.0),
+        (2.4, 0.3),
+        (2.5, 0.3),
+        (2.5, 0.0),
+        (3.0, 0.0),
+        (3.0, 2.0),
+        (0.0, 2.0),
+    ];
+    let mut scene = Scene::new("curtain", &curtain, start, 150.0);
+    scene.curtains.push(Curtain {
+        front: ((2.4, 0.18), (0.4, 0.18)),
+        depth: 0.15,
+        seen: 0.85,
+    });
+    out.push(scene);
+
+    // sweep6/7: legs 15 cm off the wall every half metre, too close to it to pass behind.
+    let mut scene = Scene::new("legs_by_wall", &BOX, start, 150.0);
+    scene.legs = (0..4)
+        .map(|i| ((0.75 + 0.5 * i as f32, 0.15), 0.03))
+        .collect();
+    out.push(scene);
+
+    // The dog's bench by the dock: 1.2 x 0.4 m on six 3 cm legs against the bottom wall,
+    // high enough to drive under; the robot starts beside it.
+    let mut scene = Scene::new("dog_bench", &BOX, (0.45, 0.6, -0.3), 200.0);
+    for x in [0.9, 1.5, 2.1] {
+        scene.legs.extend([((x, 0.03), 0.03), ((x, 0.4), 0.03)]);
+    }
+    out.push(scene);
+
+    // sweep8: a chair (39 x 37 cm outside, 2.5 cm legs) 20 cm off the wall: the body
+    // cannot pass behind it but fits under it along its 39 cm side.
+    let mut scene = Scene::new("chair", &BOX, (0.5, 1.2, 0.0), 200.0);
+    for x in [1.3, 1.665] {
+        scene.legs.extend([((x, 0.2), 0.025), ((x, 0.545), 0.025)]);
+    }
+    out.push(scene);
+
+    // sweep6: a round bed against the wall, a half disc of 35 cm radius: an outer curve
+    // between two nooks.
+    let mut bed = vec![(0.0, 0.0)];
+    bed.extend((0..=12).map(|i| {
+        let a = PI - i as f32 * PI / 12.0;
+        (1.5 + 0.35 * a.cos(), 0.35 * a.sin())
+    }));
+    bed.extend([(3.0, 0.0), (3.0, 2.0), (0.0, 2.0)]);
+    out.push(Scene::new("round_bed", &bed, start, 150.0));
+
+    // A 0.6 m glass fin out of the left wall: felt, not seen.
+    let mut scene = Scene::new("glass", &BOX, start, 200.0);
+    scene.glass.push(((0.0, 1.2), (0.6, 1.2)));
+    out.push(scene);
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scene(name: &str) -> Scene {
+        scenes().into_iter().find(|s| s.name == name).unwrap()
+    }
+
+    #[test]
+    fn walls_legs_and_glass_are_solid_and_the_room_is_free() {
+        let map = scene("chair").map();
+        assert!(!map.is_occupied(1.5, 1.0));
+        assert!(map.is_occupied(1.5, -0.005), "beyond the bottom wall");
+        // The leg at (1.3, 0.2) fills the 2 x 2 cells whose centres it covers.
+        for (x, y) in [(1.296, 0.196), (1.304, 0.204)] {
+            assert!(map.is_occupied(x, y), "a 2.5 cm leg at ({x}, {y})");
+        }
+        assert!(!map.is_occupied(1.316, 0.2), "next to it");
+
+        let map = scene("glass").map();
+        assert!(map.is_occupied(0.3, 1.2));
+        assert_eq!(map.lidar_opacity(0.3, 1.2), 0.0, "glass is clear");
+        assert_eq!(map.lidar_opacity(-0.1, 1.0), 1.0, "a wall is not");
+    }
+
+    #[test]
+    fn a_curtain_is_free_and_stops_most_beams_crossing_it() {
+        let scene = scene("curtain");
+        let map = scene.map();
+        // Down a column through the fabric: it is crossed once, about two cells deep.
+        let x = 1.0;
+        let pass: f32 = (0..30)
+            .map(|i| 0.01 * i as f32 + 0.005)
+            .inspect(|&y| assert!(!map.is_occupied(x, y)))
+            .map(|y| 1.0 - map.lidar_opacity(x, y))
+            .product();
+        let seen = 1.0 - pass;
+        assert!((seen - 0.85).abs() < 0.01, "seen {seen}");
+    }
+}

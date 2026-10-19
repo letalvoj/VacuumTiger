@@ -39,7 +39,9 @@ impl Default for ExplorationConfig {
 }
 
 /// After a stop for a contact, before the next command: the motors' time to stop.
-const HALT_PAUSE: Duration = Duration::from_millis(50);
+pub const HALT_PAUSE: Duration = Duration::from_millis(50);
+/// After turning the lidar or the motors on: their controllers' time to settle.
+pub const CONTROLLER_SETTLE: Duration = Duration::from_secs(3);
 
 /// Handle to the exploration thread.
 pub struct ExplorationThread {
@@ -219,11 +221,8 @@ fn run_exploration_loop(
             match result {
                 Ok(()) => {
                     lidar_enabled = true;
-                    log::debug!(
-                        "Lidar enabled for mapping, waiting 3 seconds for controller to settle"
-                    );
-                    // Wait 3 seconds for lidar motor controller to settle
-                    thread::sleep(Duration::from_secs(3));
+                    log::debug!("Lidar enabled, waiting {CONTROLLER_SETTLE:?} to settle");
+                    thread::sleep(CONTROLLER_SETTLE);
                     log::debug!("Lidar controller settled");
                 }
                 Err(e) => {
@@ -248,8 +247,8 @@ fn run_exploration_loop(
             match motion_controller.lock().unwrap().enable() {
                 Ok(()) => {
                     motion_enabled = true;
-                    log::debug!("Motors enabled, waiting 3 seconds for controller to settle");
-                    thread::sleep(Duration::from_secs(3));
+                    log::debug!("Motors enabled, waiting {CONTROLLER_SETTLE:?} to settle");
+                    thread::sleep(CONTROLLER_SETTLE);
                     log::debug!("Motors settled, ready for exploration");
                     continue;
                 }

@@ -11,7 +11,7 @@ mod navigation_thread;
 mod publisher_thread;
 mod slam_thread;
 
-pub use exploration_thread::{ExplorationConfig, ExplorationThread};
+pub use exploration_thread::{CONTROLLER_SETTLE, ExplorationConfig, ExplorationThread, HALT_PAUSE};
 pub use navigation_thread::{
     NavCommand, NavCommandSender, NavigationThread, NavigationThreadConfig, create_nav_channel,
 };

@@ -38,3 +38,26 @@ Open `trace.mcap` in [Foxglove](https://foxglove.dev) or
 | `/graph` | SceneUpdate | pose graph, only with loop closure enabled: sequential edges (grey), loop closures (red) |
 | `/map` | Grid (RGBA) | the global occupancy map when it changed, at most every `--map-every` s of data time |
 | `/step` | JSON | per-scan numbers for a Plot panel: match score, keyframes, closures, rotation per step |
+
+## The corner-sweep bench
+
+`sweep` runs the corner sweep closed loop, faster than real time, in nine small
+scenes after what the real runs met (a box, an L, the dock, a curtain, legs by a
+wall, the dog's bench, a chair, a round bed, a glass fin):
+
+```bash
+cargo run --release --bin sweep -- --seeds 2 --dump /tmp/wf
+uv run --with numpy --with matplotlib ../../tools/py/wf_sim_plot.py /tmp/wf --out wf.png
+```
+
+(`tools/py` is in the project folder around this repo, not in it.)
+
+The robot model, the wire, the decode and the SLAM are the real ones: SangamIO's
+mock of the v8 (`sangamio/mock_bench.toml`, as measured) is stepped at its
+110 Hz, its groups go through SangamIO's wire format and dhruva-slam's decode
+into the SLAM the daemon runs, and the exploration session decides on the
+simulated clock, as the exploration thread would. What the bench leaves out
+(SLAM latency, TCP, the lidar's boot) is listed in `src/bin/sweep/run.rs`. Each
+run is scored on the true path: the floor the brushes left unswept along the
+walls, the corners, time, bumps, whether the lap closed. `--climb N`
+hill-climbs `[exploration.wall_follow]` on that score.

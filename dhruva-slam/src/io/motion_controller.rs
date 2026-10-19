@@ -72,6 +72,16 @@ impl Default for MotionConfig {
     }
 }
 
+impl MotionConfig {
+    /// A velocity command (m/s, rad/s) within the maximums, as it is sent.
+    pub fn limit(&self, linear: f32, angular: f32) -> (f32, f32) {
+        (
+            linear.clamp(-self.max_linear_vel, self.max_linear_vel),
+            angular.clamp(-self.max_angular_vel, self.max_angular_vel),
+        )
+    }
+}
+
 /// Minimum time between reconnection attempts.
 const RECONNECT_COOLDOWN: Duration = Duration::from_secs(2);
 
@@ -376,9 +386,7 @@ impl MotionController {
 
         let client = self.client.as_mut().ok_or("Not connected")?;
 
-        // Clamp to configured limits
-        let linear = linear.clamp(-self.config.max_linear_vel, self.config.max_linear_vel);
-        let angular = angular.clamp(-self.config.max_angular_vel, self.config.max_angular_vel);
+        let (linear, angular) = self.config.limit(linear, angular);
 
         // Build velocity command
         let mut cmd_config = HashMap::new();

@@ -7,6 +7,7 @@ license = "MIT"
 
 [dependencies]
 dhruva-slam = { path = "../dhruva-slam" }
+sangamio = { path = "../sangamio", features = ["mock"] }
 clap = { version = "4.5", features = ["derive"] }
 foxglove = { version = "0.29", default-features = false, features = ["zstd"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
