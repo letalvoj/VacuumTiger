@@ -41,6 +41,7 @@
 
 use super::packet::{TxPacket, heartbeat_packet, motor_mode_nav_packet, request_stm32_packet};
 use super::state::ComponentState;
+use crate::core::drive::bumper_stops;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -301,14 +302,12 @@ pub(super) fn heartbeat_loop<W: std::io::Write + Send + 'static>(
             // =========================================================
             // BUMPER HARD-STOP (issue #18, R2)
             // =========================================================
-            // Driving forward into a pressed (front) bumper stops the wheels at
-            // once (<200 ms), without waiting for the dead-man. Backing off and
-            // turning away pass: that is how a controller gets free again (the
-            // corner sweep touches walls on purpose), as in Kobuki's safety
-            // controller. `bumper_pressed` is already masked on the dock (see
+            // `bumper_stops`, at once (<200 ms) without waiting for the dead-man.
+            // `bumper_pressed` is already masked on the dock (see
             // `bumper_press_masked` in state.rs). `linear` is in device units:
             // forward is positive while `linear_velocity_scale` is (viomi_v8.toml).
-            if component_state.bumper_pressed.load(Ordering::Relaxed) && linear > 0 {
+            let pressed = component_state.bumper_pressed.load(Ordering::Relaxed);
+            if bumper_stops(pressed, f32::from(linear)) {
                 log::warn!(
                     "BUMPER-STOP L={} R={}: parando rodas (velocidade estava {:?})",
                     component_state.bumper_left.load(Ordering::Relaxed),
