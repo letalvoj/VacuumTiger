@@ -301,17 +301,14 @@ pub(super) fn heartbeat_loop<W: std::io::Write + Send + 'static>(
             // =========================================================
             // BUMPER HARD-STOP (issue #18, R2)
             // =========================================================
-            // Colisão durante a marcha -> parada imediata (<200ms), sem passar
-            // pelo DEAD-MAN. O reader publica `bumper_pressed` já mascarado
-            // (criterio D: sem falso-positivo na base — o contato de carga marca
-            // os dois bumpers e o byte de dock oscila; ver `bumper_press_masked`
-            // em state.rs, que segura o sinal de base por 1,5 s e ignora pressão
-            // estática com as rodas paradas). Só freia se o robo estiver de fato
-            // se movendo (senão o bumper pressionado não infla a distância nem
-            // gera log repetido).
-            if component_state.bumper_pressed.load(Ordering::Relaxed)
-                && (linear != 0 || angular != 0)
-            {
+            // Driving forward into a pressed (front) bumper stops the wheels at
+            // once (<200 ms), without waiting for the dead-man. Backing off and
+            // turning away pass: that is how a controller gets free again (the
+            // corner sweep touches walls on purpose), as in Kobuki's safety
+            // controller. `bumper_pressed` is already masked on the dock (see
+            // `bumper_press_masked` in state.rs). `linear` is in device units:
+            // forward is positive while `linear_velocity_scale` is (viomi_v8.toml).
+            if component_state.bumper_pressed.load(Ordering::Relaxed) && linear > 0 {
                 log::warn!(
                     "BUMPER-STOP L={} R={}: parando rodas (velocidade estava {:?})",
                     component_state.bumper_left.load(Ordering::Relaxed),
@@ -720,6 +717,37 @@ mod tests {
                 && i32::from_le_bytes([p[4], p[5], p[6], p[7]]) == 0
         });
         assert!(stopped, "bumper pressionado com marcha deve parar as rodas via 0x66 0,0");
+    }
+
+    /// Backing off (and turning) with the bumper still pressed is how a controller
+    /// gets free of what it touched: the interlock lets it through.
+    #[test]
+    fn bumper_pressed_lets_the_robot_back_off() {
+        let state = Arc::new(ComponentState::new(73, 100_000));
+        state.lidar_enabled.store(true, Ordering::Relaxed);
+        state.linear_velocity.store(-700, Ordering::Relaxed); // ~-0.15 m/s
+        state.angular_velocity.store(150, Ordering::Relaxed);
+        state.note_drive_command();
+        state.bumper_left.store(true, Ordering::Relaxed);
+        state.bumper_pressed.store(true, Ordering::Relaxed);
+
+        let frames = run_heartbeat(state, 300);
+
+        let velocities: Vec<(i32, i32)> = frames
+            .iter()
+            .filter(|(cmd, p)| *cmd == 0x66 && p.len() == 8)
+            .map(|(_, p)| {
+                (
+                    i32::from_le_bytes([p[0], p[1], p[2], p[3]]),
+                    i32::from_le_bytes([p[4], p[5], p[6], p[7]]),
+                )
+            })
+            .collect();
+        assert!(!velocities.is_empty(), "no velocity frames");
+        assert!(
+            velocities.iter().all(|&v| v == (-700, 150)),
+            "reversing with the bumper pressed must not be stopped: {velocities:?}"
+        );
     }
 
     /// O bumper pressão com o robô PARADO não gera comando de parada extra que
