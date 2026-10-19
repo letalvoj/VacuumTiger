@@ -7,6 +7,8 @@
 //! - [`OccupancyGrid`]: 2D grid map with log-odds probabilities
 //! - [`RayTracer`]: Bresenham ray tracing for free space
 //! - [`MapIntegrator`]: Integrates scans into map
+//! - [`FloorPlan`]: The map kept across runs, merged by evidence votes
+//! - [`Rooms`]: The floor plan's free space split at its doors
 //!
 //! # Example
 //!
@@ -29,11 +31,13 @@ mod floor_plan;
 mod integrator;
 mod occupancy_grid;
 mod ray_tracer;
+mod rooms;
 
 pub use floor_plan::{FloorPlan, FloorPlanConfig, PlanCell};
 pub use integrator::{MapIntegrator, MapIntegratorConfig};
 pub use occupancy_grid::{CellState, OccupancyGrid, OccupancyGridConfig};
 pub use ray_tracer::RayTracer;
+pub use rooms::{Rooms, RoomsConfig};
 
 /// Bounding box for map region.
 #[derive(Debug, Clone, Copy)]

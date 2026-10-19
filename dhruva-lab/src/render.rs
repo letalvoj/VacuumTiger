@@ -1,9 +1,10 @@
-//! Final map as a PNG: occupancy, 1 m grid, odometry path (orange), SLAM path
-//! (blue), loop closures (red), start (green) and end (red) markers.
+//! Final map as a PNG: occupancy (free space tinted per room when segmented), 1 m grid,
+//! odometry path (orange), SLAM path (blue), loop closures (red), start (green) and end
+//! (red) markers.
 
 use std::path::Path;
 
-use dhruva_slam::algorithms::mapping::{CellState, OccupancyGrid};
+use dhruva_slam::algorithms::mapping::{CellState, OccupancyGrid, Rooms};
 use dhruva_slam::engine::graph::{EdgeType, PoseGraph};
 use image::{Rgb, RgbImage};
 use imageproc::drawing::{draw_filled_circle_mut, draw_line_segment_mut};
@@ -23,11 +24,22 @@ const ODOM: Rgb<u8> = Rgb([255, 150, 30]);
 const SLAM: Rgb<u8> = Rgb([40, 110, 255]);
 const CLOSURE: Rgb<u8> = Rgb([230, 20, 20]);
 
+/// Free space in a light tint per room, from `rooms` (made from `grid`).
+const ROOM_TINTS: [Rgb<u8>; 6] = [
+    Rgb([255, 228, 196]),
+    Rgb([200, 230, 255]),
+    Rgb([210, 245, 210]),
+    Rgb([245, 215, 245]),
+    Rgb([255, 250, 200]),
+    Rgb([215, 240, 240]),
+];
+
 pub fn map_png(
     path: &Path,
     grid: &OccupancyGrid,
     rows: &[PoseRow],
     graph: &PoseGraph,
+    rooms: Option<&Rooms>,
 ) -> Result<(), String> {
     let (w, h) = grid.dimensions();
     // Crop to the observed cells.
@@ -60,7 +72,9 @@ pub fn map_png(
         for cx in x0..=x1 {
             let color = match grid.get_state(cx, cy) {
                 CellState::Occupied => OCCUPIED,
-                CellState::Free => FREE,
+                CellState::Free => rooms
+                    .and_then(|r| r.room(cx, cy))
+                    .map_or(FREE, |r| ROOM_TINTS[(r as usize - 1) % ROOM_TINTS.len()]),
                 CellState::Unknown => continue,
             };
             let px = (cx - x0) as u32 * SCALE;
