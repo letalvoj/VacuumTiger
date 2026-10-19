@@ -30,9 +30,8 @@ robot_radius = 0.17        # Collision radius (meters)
 collision_mode = "stop"           # "stop", "slide", "passthrough" - stop for realistic testing
 slide_friction = 0.3       # Used when collision_mode = "slide"
 
-# Lidar configuration (Delta-2D specifications)
-# Note: Mounting offset is handled by hardware config, not simulation.
-# The mock simulator generates robot-centered lidar data directly.
+# Lidar configuration (Delta-2D specifications): mounted at the robot centre, sweeping
+# clockwise from straight ahead. mock_bench.toml has the v8's mount, rate and noise.
 [device.simulation.lidar]
 num_rays = 360           # Rays per 360° scan
 scan_rate_hz = 5.0       # Scans per second

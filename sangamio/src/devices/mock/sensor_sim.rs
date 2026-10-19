@@ -193,7 +193,7 @@ mod tests {
 
         // Create a simple free space map (all white)
         let img = image::GrayImage::from_fn(100, 100, |_, _| image::Luma([255u8]));
-        let map = SimulationMap::from_test_image(img, 0.1, (0.0, 0.0));
+        let map = SimulationMap::from_image(img, 0.1, (0.0, 0.0));
 
         let (left, right) = bumper.check(&map, 5.0, 5.0, 0.0, 0.17);
 
@@ -208,7 +208,7 @@ mod tests {
 
         // Create map with no cliff mask
         let img = image::GrayImage::from_fn(100, 100, |_, _| image::Luma([255u8]));
-        let map = SimulationMap::from_test_image(img, 0.1, (0.0, 0.0));
+        let map = SimulationMap::from_image(img, 0.1, (0.0, 0.0));
 
         let states = cliff.check(&map, 5.0, 5.0, 0.0);
 

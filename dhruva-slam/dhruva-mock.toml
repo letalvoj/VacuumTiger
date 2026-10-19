@@ -32,11 +32,13 @@ ticks_per_meter = 4464.0
 wheel_base = 0.233
 
 [lidar]
-# The SangamIO mock casts rays from the robot centre in the robot frame: no mount.
+# SangamIO's mock.toml mounts the lidar at the robot centre, sweeping clockwise from
+# straight ahead. (Its mock_bench.toml is the v8: use dhruva-v8.toml with it.)
 mounting_x = 0.0
 mounting_y = 0.0
 optical_offset = 0.0
 angle_offset = 0.0
+sweep_start_angle = 0.0
 
 [preprocessing]
 min_range = 0.15

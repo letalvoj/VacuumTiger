@@ -145,18 +145,8 @@ impl PhysicsState {
 
     /// Check if robot at given position would collide with obstacles
     fn check_collision(&self, x: f32, y: f32, map: &SimulationMap) -> bool {
-        // Check multiple points around robot circumference
-        let num_checks = 8;
-        for i in 0..num_checks {
-            let angle = (i as f32 / num_checks as f32) * TAU;
-            let check_x = x + self.robot_radius * angle.cos();
-            let check_y = y + self.robot_radius * angle.sin();
-            if map.is_occupied(check_x, check_y) {
-                return true;
-            }
-        }
-        // Also check center
-        map.is_occupied(x, y)
+        // The whole disc: a chair leg fits between a handful of points on the rim.
+        map.disc_occupied(x, y, self.robot_radius)
     }
 
     /// Compute slide motion when colliding

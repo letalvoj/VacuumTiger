@@ -1,9 +1,13 @@
-# Mock Device Configuration for SangamIO
-# Simulates CRL-200S robot hardware for algorithm testing
+# The SangamIO mock as close to the viomi v8 as measured, for benches: whatever runs on the
+# robot with viomi_v8.toml + dhruva-v8.toml runs on this with dhruva-v8.toml unchanged.
+# Measured on the v8's recordings (docs/SLAM_LAB.md, docs/HW_PROTOCOLS.md): the drive
+# response, the lidar's rate, sweep and noise, odometry, the gyro's scale and deadband.
+# It models the robot, not what dhruva-slam assumes of it: where they differ (the gyro
+# scale), the bench shows it as the robot would.
 
 [device]
 type = "mock"
-name = "Mock CRL-200S Simulator"
+name = "Mock viomi v8"
 
 [device.simulation]
 # Map file (YAML file that references PGM image)
@@ -20,38 +24,48 @@ speed_factor = 1.0    # 1.0 = real-time, 2.0 = 2x speed
 random_seed = 42      # bench: deterministic
 log_level = "standard"  # "minimal", "standard", "verbose"
 
-# Robot physical parameters (CRL-200S defaults)
 [device.simulation.robot]
-wheel_base = 0.233         # Distance between wheels (meters)
-ticks_per_meter = 4464.0   # Encoder ticks per meter
-max_linear_speed = 0.3     # Maximum linear velocity (m/s)
-max_angular_speed = 1.0    # Maximum angular velocity (rad/s)
-robot_radius = 0.17        # Collision radius (meters)
-collision_mode = "stop"           # "stop", "slide", "passthrough" - stop for realistic testing
-slide_friction = 0.3       # Used when collision_mode = "slide"
+wheel_base = 0.238         # dhruva-v8.toml
+ticks_per_meter = 4516.7   # dhruva-v8.toml (calibrated on flat1)
+max_linear_speed = 0.3
+max_angular_speed = 1.0
+robot_radius = 0.175       # 35 cm body
+collision_mode = "stop"
+slide_friction = 0.3
+# Drive steps on the v8: nothing for 80 ms, then a 120 ms lag to 90% of the command.
+response_delay = 0.08
+response_time_constant = 0.12
+response_gain = 0.9
 
-# Lidar configuration (Delta-2D specifications)
-# Note: Mounting offset is handled by hardware config, not simulation.
-# The mock simulator generates robot-centered lidar data directly.
+# Published as SangamIO's CRL-200S driver publishes with viomi_v8.toml: angles in the robot
+# heading, clockwise from its lidar_mounting.angle_offset, ranges from the optical centre.
 [device.simulation.lidar]
-num_rays = 400           # bench: v8 LDS3 gives up to 400 pts/rev
-scan_rate_hz = 5.0       # Scans per second
-min_range = 0.15         # Minimum detection range (meters)
-max_range = 8.0          # Maximum detection range (meters)
+num_rays = 360             # one return per degree
+scan_rate_hz = 6.03        # 166 ms per revolution
+sweep_start_angle = 0.2182
+mounting_x = -0.110
+mounting_y = 0.0
+optical_offset = 0.025
+min_range = 0.15
+max_range = 8.0
 
 [device.simulation.lidar.noise]
-range_stddev = 0.01      # bench: ~v8 static scatter is 4.5 mm
-range_bias = 0.0         # Systematic range bias (meters)
-angle_stddev = 0.002
-quality_base = 200       # Base quality value (0-255)
-quality_distance_decay = 10  # Quality reduction per meter
-miss_rate = 0.05
+range_stddev = 0.0005      # walls seen still: 0.5 mm + 3 mm per m
+range_stddev_per_m = 0.003
+range_bias = 0.0
+angle_stddev = 0.0
+quality_base = 200
+quality_distance_decay = 10
+miss_rate = 0.05           # beams with no return on plain walls
 
-# IMU configuration
+[device.simulation.imu]
+gyro_scale = 5729.6        # 0.0100 deg/s per LSB, measured (dhruva-slam assumes 0.01025)
+
 [device.simulation.imu.gyro_noise]
-stddev = [5.0, 5.0, 10.0]   # Noise standard deviation [x, y, z] (raw units)
-bias = [0.0, 0.0, 0.0]      # Constant bias [x, y, z]
+stddev = [5.0, 5.0, 10.0]   # raw; not measured (hidden by the deadband at rest)
+bias = [0.0, 0.0, 0.0]      # none to subtract (docs/SLAM_LAB.md)
 drift_rate = 0.0            # Bias drift rate (units/second)
+deadband = 100.0            # |raw| < 100 (about 1 deg/s) reads 0, in the MCU
 
 [device.simulation.imu.accel_noise]
 stddev = [10.0, 10.0, 20.0]  # Noise standard deviation [x, y, z] (raw units)

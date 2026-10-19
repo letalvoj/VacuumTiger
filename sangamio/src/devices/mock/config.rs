@@ -14,13 +14,15 @@
 //! ├── RobotConfig                    # Physical parameters
 //! │   ├── wheel_base, ticks_per_meter
 //! │   ├── max_linear/angular_speed
-//! │   └── collision_mode, robot_radius
+//! │   ├── collision_mode, robot_radius
+//! │   └── response_delay/time_constant/gain   # the drive's response
 //! ├── LidarConfig                    # Lidar simulation
-//! │   ├── num_rays, scan_rate_hz
-//! │   ├── min/max_range, mounting offsets
+//! │   ├── num_rays, scan_rate_hz, sweep_start_angle
+//! │   ├── min/max_range, mounting_x/y, optical_offset
 //! │   └── LidarNoiseConfig
 //! ├── ImuConfig                      # IMU simulation
-//! │   ├── GyroNoiseConfig
+//! │   ├── gyro_scale
+//! │   ├── GyroNoiseConfig (with the deadband)
 //! │   ├── Noise3DConfig (accel)
 //! │   └── Noise3DConfig (tilt)
 //! ├── EncoderConfig                  # Encoder simulation
@@ -67,6 +69,10 @@ pub struct LidarNoiseConfig {
     #[serde(default = "default_lidar_range_stddev")]
     pub range_stddev: f32,
 
+    /// Range noise standard deviation per meter of range, added to `range_stddev`
+    #[serde(default)]
+    pub range_stddev_per_m: f32,
+
     /// Systematic range bias (meters)
     #[serde(default)]
     pub range_bias: f32,
@@ -108,6 +114,7 @@ impl Default for LidarNoiseConfig {
     fn default() -> Self {
         Self {
             range_stddev: default_lidar_range_stddev(),
+            range_stddev_per_m: 0.0,
             range_bias: 0.0,
             angle_stddev: default_lidar_angle_stddev(),
             quality_base: default_quality_base(),
@@ -158,6 +165,10 @@ pub struct GyroNoiseConfig {
     /// Bias drift rate (units per second)
     #[serde(default)]
     pub drift_rate: f32,
+
+    /// Readings smaller than this (raw) read exactly 0, as the v8's MCU publishes them.
+    #[serde(default)]
+    pub deadband: f32,
 }
 
 fn default_gyro_stddev() -> [f32; 3] {
@@ -170,6 +181,7 @@ impl Default for GyroNoiseConfig {
             stddev: default_gyro_stddev(),
             bias: [0.0, 0.0, 0.0],
             drift_rate: 0.0,
+            deadband: 0.0,
         }
     }
 }
@@ -243,6 +255,20 @@ pub struct RobotConfig {
     /// Slide friction coefficient (0.0-1.0, used when collision_mode="slide")
     #[serde(default = "default_slide_friction")]
     pub slide_friction: f32,
+
+    /// How the wheels follow a drive command: after `response_delay` (s) they approach
+    /// `response_gain` times it with the time constant `response_time_constant` (s).
+    /// The defaults (0, 0, 1) follow it at once.
+    #[serde(default)]
+    pub response_delay: f32,
+    #[serde(default)]
+    pub response_time_constant: f32,
+    #[serde(default = "default_response_gain")]
+    pub response_gain: f32,
+}
+
+fn default_response_gain() -> f32 {
+    1.0
 }
 
 fn default_wheel_base() -> f32 {
@@ -277,15 +303,19 @@ impl Default for RobotConfig {
             robot_radius: default_robot_radius(),
             collision_mode: default_collision_mode(),
             slide_friction: default_slide_friction(),
+            response_delay: 0.0,
+            response_time_constant: 0.0,
+            response_gain: default_response_gain(),
         }
     }
 }
 
 /// Lidar sensor configuration (Delta-2D specifications)
 ///
-/// Note: Mounting offset configuration has been moved to hardware config.
-/// The mock simulator generates lidar data as if measured from robot center,
-/// matching the transformed output of real hardware.
+/// The points come as the CRL-200S driver publishes them: angles already in the robot's
+/// heading (its `angle_offset` applied), ranges measured from the lidar where it is
+/// mounted. The consumer places the lidar (its own mounting and optical offsets, which
+/// must match these). The defaults put it at the robot centre.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LidarConfig {
@@ -293,9 +323,22 @@ pub struct LidarConfig {
     #[serde(default = "default_num_rays")]
     pub num_rays: usize,
 
-    /// Scan rate in Hz
+    /// Scan rate in Hz: one revolution per scan, each beam taken at its own time, clockwise
+    /// from `sweep_start_angle` (rad, robot frame), the scan published at its end.
     #[serde(default = "default_scan_rate_hz")]
     pub scan_rate_hz: f32,
+    #[serde(default)]
+    pub sweep_start_angle: f32,
+
+    /// Where the lidar sits in the robot frame (m).
+    #[serde(default)]
+    pub mounting_x: f32,
+    #[serde(default)]
+    pub mounting_y: f32,
+
+    /// Taken off every range: the consumer adds it back (m).
+    #[serde(default)]
+    pub optical_offset: f32,
 
     /// Minimum detection range (meters)
     #[serde(default = "default_min_range")]
@@ -328,6 +371,10 @@ impl Default for LidarConfig {
         Self {
             num_rays: default_num_rays(),
             scan_rate_hz: default_scan_rate_hz(),
+            sweep_start_angle: 0.0,
+            mounting_x: 0.0,
+            mounting_y: 0.0,
+            optical_offset: 0.0,
             min_range: default_min_range(),
             max_range: default_max_range(),
             noise: LidarNoiseConfig::default(),
@@ -339,6 +386,10 @@ impl Default for LidarConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImuConfig {
+    /// Gyroscope counts per rad/s
+    #[serde(default = "default_gyro_scale")]
+    pub gyro_scale: f32,
+
     /// Gyroscope noise configuration
     #[serde(default)]
     pub gyro_noise: GyroNoiseConfig,
@@ -352,9 +403,14 @@ pub struct ImuConfig {
     pub tilt_noise: Noise3DConfig,
 }
 
+fn default_gyro_scale() -> f32 {
+    1000.0
+}
+
 impl Default for ImuConfig {
     fn default() -> Self {
         Self {
+            gyro_scale: default_gyro_scale(),
             gyro_noise: GyroNoiseConfig::default(),
             accel_noise: Noise3DConfig {
                 stddev: [10.0, 10.0, 20.0],

@@ -26,6 +26,14 @@ impl NoiseGenerator {
         Self { rng }
     }
 
+    /// An independent generator seeded from this one: one per simulated sensor, so they do
+    /// not draw the same sequence (clones do).
+    pub fn split(&mut self) -> Self {
+        Self {
+            rng: SmallRng::seed_from_u64(self.rng.next_u64()),
+        }
+    }
+
     /// Generate Gaussian noise with given standard deviation
     #[inline]
     pub fn gaussian(&mut self, stddev: f32) -> f32 {

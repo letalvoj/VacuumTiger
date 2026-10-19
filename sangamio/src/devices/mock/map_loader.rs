@@ -26,6 +26,10 @@ pub struct MapMetadata {
     /// Optional cliff mask file (same dimensions as main map)
     #[serde(default)]
     pub cliff_mask: Option<String>,
+
+    /// Optional lidar mask file (same dimensions as main map): see [`SimulationMap`]
+    #[serde(default)]
+    pub lidar_mask: Option<String>,
 }
 
 fn default_occupied_thresh() -> f32 {
@@ -33,12 +37,21 @@ fn default_occupied_thresh() -> f32 {
 }
 
 /// Simulation map loaded from PGM+YAML
+///
+/// The occupancy grid is what the body runs into. The lidar sees the same, unless a lidar
+/// mask (an extension of the ROS format) says otherwise: there a cell's darkness is the
+/// chance that a beam crossing the cell returns from it, so it depends on the resolution.
+/// Glass is occupied but clear in the mask; a curtain is free but a light gray in it, so
+/// the beams stop somewhere among its folds.
 pub struct SimulationMap {
     /// Occupancy grid pixels
     pixels: GrayImage,
 
     /// Optional cliff mask layer
     cliff_mask: Option<GrayImage>,
+
+    /// Optional lidar mask layer
+    lidar_mask: Option<GrayImage>,
 
     /// Resolution in meters per pixel
     resolution: f32,
@@ -51,15 +64,28 @@ pub struct SimulationMap {
 }
 
 impl SimulationMap {
-    /// Create map from test image (for unit tests)
-    #[cfg(test)]
-    pub fn from_test_image(pixels: GrayImage, resolution: f32, origin: (f32, f32)) -> Self {
+    /// A map from an occupancy image built in memory (black = occupied).
+    pub fn from_image(pixels: GrayImage, resolution: f32, origin: (f32, f32)) -> Self {
         Self {
             pixels,
             cliff_mask: None,
+            lidar_mask: None,
             resolution,
             origin,
             occupied_thresh: 128,
+        }
+    }
+
+    /// The map with a lidar mask (the size of the map).
+    pub fn with_lidar_mask(self, mask: GrayImage) -> Self {
+        assert_eq!(
+            mask.dimensions(),
+            self.pixels.dimensions(),
+            "lidar mask size"
+        );
+        Self {
+            lidar_mask: Some(mask),
+            ..self
         }
     }
 
@@ -89,32 +115,28 @@ impl SimulationMap {
             })?
             .into_luma8();
 
-        // Load optional cliff mask
-        let cliff_mask = if let Some(cliff_file) = &metadata.cliff_mask {
-            let cliff_path = yaml_dir.join(cliff_file);
-            let cliff_img = image::open(&cliff_path)
+        // Optional masks, the size of the map
+        let mask = |file: &Option<String>, what: &str| -> Result<Option<GrayImage>> {
+            let Some(file) = file else {
+                return Ok(None);
+            };
+            let path = yaml_dir.join(file);
+            let mask = image::open(&path)
                 .map_err(|e| {
-                    Error::Config(format!(
-                        "Failed to load cliff mask {}: {}",
-                        cliff_path.display(),
-                        e
-                    ))
+                    Error::Config(format!("Failed to load {what} {}: {e}", path.display()))
                 })?
                 .into_luma8();
-
-            // Validate dimensions match
-            if cliff_img.dimensions() != img.dimensions() {
+            if mask.dimensions() != img.dimensions() {
                 return Err(Error::Config(format!(
-                    "Cliff mask dimensions {:?} don't match map dimensions {:?}",
-                    cliff_img.dimensions(),
+                    "{what} dimensions {:?} don't match map dimensions {:?}",
+                    mask.dimensions(),
                     img.dimensions()
                 )));
             }
-
-            Some(cliff_img)
-        } else {
-            None
+            Ok(Some(mask))
         };
+        let cliff_mask = mask(&metadata.cliff_mask, "cliff mask")?;
+        let lidar_mask = mask(&metadata.lidar_mask, "lidar mask")?;
 
         // Convert threshold to pixel value
         // occupied_thresh: pixels BELOW this are occupied (darker = occupied)
@@ -123,6 +145,7 @@ impl SimulationMap {
         Ok(Self {
             pixels: img,
             cliff_mask,
+            lidar_mask,
             resolution: metadata.resolution,
             origin: (metadata.origin[0], metadata.origin[1]),
             occupied_thresh,
@@ -188,6 +211,17 @@ impl SimulationMap {
         }
     }
 
+    /// Whether any cell within `radius` of the world point (x, y) is occupied.
+    pub fn disc_occupied(&self, x: f32, y: f32, radius: f32) -> bool {
+        let n = (radius / self.resolution).ceil() as i32;
+        (-n..=n).any(|i| {
+            (-n..=n).any(|j| {
+                let (dx, dy) = (i as f32 * self.resolution, j as f32 * self.resolution);
+                dx.hypot(dy) <= radius && self.is_occupied(x + dx, y + dy)
+            })
+        })
+    }
+
     /// Check if world coordinate is a cliff (from mask or map boundary)
     pub fn is_cliff(&self, x: f32, y: f32) -> bool {
         match self.world_to_pixel(x, y) {
@@ -203,30 +237,70 @@ impl SimulationMap {
         }
     }
 
-    /// Ray-cast from origin in direction, return distance to obstacle
-    ///
-    /// Returns max_range if no obstacle is hit.
-    pub fn ray_cast(&self, ox: f32, oy: f32, angle: f32, max_range: f32) -> f32 {
-        // Step size: half resolution for accuracy
-        let step = self.resolution * 0.5;
-        let dx = angle.cos() * step;
-        let dy = angle.sin() * step;
+    /// The chance (0..1) that a lidar beam crossing the cell at the world point (x, y)
+    /// returns from it: the lidar mask's darkness, or else whether the cell is occupied.
+    pub fn lidar_opacity(&self, x: f32, y: f32) -> f32 {
+        match (&self.lidar_mask, self.world_to_pixel(x, y)) {
+            (Some(mask), Some((px, py))) => 1.0 - f32::from(mask.get_pixel(px, py).0[0]) / 255.0,
+            _ => f32::from(u8::from(self.is_occupied(x, y))),
+        }
+    }
 
-        let mut x = ox;
-        let mut y = oy;
-        let mut distance = 0.0;
-
-        while distance < max_range {
-            x += dx;
-            y += dy;
-            distance += step;
-
-            if self.is_occupied(x, y) {
+    /// Distance from (ox, oy) along `angle` to where the ray enters the first cell that
+    /// `hits` (given the cell's centre), or `max_range`. Exact: the cells are walked as
+    /// the ray crosses them (Amanatides & Woo). The cell holding the origin is not tested:
+    /// the lidar is never inside what it sees. Ranges come in steps of the resolution's
+    /// fraction along the ray, so benches use fine (1 cm) maps.
+    pub fn ray_cast(
+        &self,
+        ox: f32,
+        oy: f32,
+        angle: f32,
+        max_range: f32,
+        mut hits: impl FnMut(f32, f32) -> bool,
+    ) -> f32 {
+        if !(ox.is_finite() && oy.is_finite() && angle.is_finite()) {
+            return max_range;
+        }
+        let res = self.resolution;
+        let (dy, dx) = angle.sin_cos();
+        // In cells from the origin of the map.
+        let (gx, gy) = ((ox - self.origin.0) / res, (oy - self.origin.1) / res);
+        let (mut i, mut j) = (gx.floor(), gy.floor());
+        // Per axis: the cell step, the ray length per cell, and to the next cell border.
+        let axis = |g: f32, cell: f32, d: f32| {
+            if d == 0.0 {
+                return (0.0, f32::INFINITY, f32::INFINITY);
+            }
+            let per_cell = res / d.abs();
+            let to_border = if d > 0.0 { cell + 1.0 - g } else { g - cell };
+            (d.signum(), per_cell, to_border * per_cell)
+        };
+        let (step_i, per_i, mut next_i) = axis(gx, i, dx);
+        let (step_j, per_j, mut next_j) = axis(gy, j, dy);
+        loop {
+            let distance = if next_i < next_j {
+                i += step_i;
+                let distance = next_i;
+                next_i += per_i;
+                distance
+            } else {
+                j += step_j;
+                let distance = next_j;
+                next_j += per_j;
+                distance
+            };
+            if distance >= max_range {
+                return max_range;
+            }
+            let centre = (
+                self.origin.0 + (i + 0.5) * res,
+                self.origin.1 + (j + 0.5) * res,
+            );
+            if hits(centre.0, centre.1) {
                 return distance;
             }
         }
-
-        max_range // No hit
     }
 }
 
@@ -239,13 +313,7 @@ mod tests {
         // Create a simple 100x100 map with 0.1m resolution
         // Origin at (-5, -5), so map covers (-5,-5) to (5,5) in world coords
         let img = GrayImage::from_fn(100, 100, |_, _| image::Luma([255u8]));
-        let map = SimulationMap {
-            pixels: img,
-            cliff_mask: None,
-            resolution: 0.1,
-            origin: (-5.0, -5.0),
-            occupied_thresh: 128,
-        };
+        let map = SimulationMap::from_image(img, 0.1, (-5.0, -5.0));
 
         // Origin should map to bottom-left pixel
         assert_eq!(map.world_to_pixel(-5.0, -5.0), Some((0, 99)));
@@ -256,5 +324,91 @@ mod tests {
         // Out of bounds should return None
         assert_eq!(map.world_to_pixel(-10.0, 0.0), None);
         assert_eq!(map.world_to_pixel(10.0, 0.0), None);
+    }
+
+    /// A 2 x 1 m floor at 1 cm per cell; `column` paints both layers per pixel column.
+    fn strip(column: impl Fn(u32) -> (u8, u8)) -> SimulationMap {
+        let layer = |pick: fn((u8, u8)) -> u8| {
+            GrayImage::from_fn(200, 100, |i, _| image::Luma([pick(column(i))]))
+        };
+        SimulationMap::from_image(layer(|c| c.0), 0.01, (0.0, 0.0)).with_lidar_mask(layer(|c| c.1))
+    }
+
+    fn opaque(map: &SimulationMap) -> impl FnMut(f32, f32) -> bool + '_ {
+        |x, y| map.lidar_opacity(x, y) >= 1.0
+    }
+
+    #[test]
+    fn a_ray_stops_at_the_first_hit() {
+        let map = SimulationMap::from_image(
+            GrayImage::from_fn(200, 100, |i, _| {
+                image::Luma([if i >= 150 { 0 } else { 255 }])
+            }),
+            0.01,
+            (0.0, 0.0),
+        );
+        let hit = map.ray_cast(0.5, 0.5, 0.0, 5.0, opaque(&map));
+        assert!((hit - 1.0).abs() < 0.01, "hit {hit}");
+        assert_eq!(map.ray_cast(0.5, 0.5, 0.0, 0.5, opaque(&map)), 0.5);
+    }
+
+    #[test]
+    fn rays_are_exact_along_the_axes_and_diagonals() {
+        // A 2 x 2 m box around the map origin, 10 cm walls; cast from the origin, which
+        // lies on cell borders in both axes.
+        let map = SimulationMap::from_image(
+            GrayImage::from_fn(200, 200, |i, j| {
+                let wall = !(10..190).contains(&i) || !(10..190).contains(&j);
+                image::Luma([if wall { 0 } else { 255 }])
+            }),
+            0.01,
+            (-1.0, -1.0),
+        );
+        let quarter = std::f32::consts::FRAC_PI_4;
+        for (k, expected) in [
+            (0, 0.9),
+            (2, 0.9),
+            (4, 0.9),
+            (6, 0.9),
+            (1, 0.9 * 2f32.sqrt()),
+        ] {
+            let angle = k as f32 * quarter;
+            let hit = map.ray_cast(0.0, 0.0, angle, 5.0, opaque(&map));
+            assert!(
+                (hit - expected).abs() < 1e-4,
+                "{angle}: {hit} vs {expected}"
+            );
+        }
+        assert_eq!(map.ray_cast(f32::NAN, 0.0, 0.0, 5.0, opaque(&map)), 5.0);
+    }
+
+    #[test]
+    fn glass_stops_the_body_not_the_beams() {
+        // Glass at x in [1.0, 1.02): occupied, clear to the lidar; a wall beyond x = 1.5.
+        let map = strip(|i| match i {
+            100..102 => (0, 255),
+            150.. => (0, 0),
+            _ => (255, 255),
+        });
+        assert!(map.is_occupied(1.01, 0.5));
+        let hit = map.ray_cast(0.5, 0.5, 0.0, 5.0, opaque(&map));
+        assert!(
+            (hit - 1.0).abs() < 0.01,
+            "sees the wall behind the glass: {hit}"
+        );
+    }
+
+    #[test]
+    fn a_curtain_is_seen_and_passed() {
+        let map = strip(|i| match i {
+            100..120 => (255, 128),
+            _ => (255, 255),
+        });
+        assert!(!map.is_occupied(1.1, 0.5));
+        let opacity = map.lidar_opacity(1.1, 0.5);
+        assert!(
+            (opacity - 0.5).abs() < 0.01,
+            "half the beams per step: {opacity}"
+        );
     }
 }

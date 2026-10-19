@@ -68,10 +68,18 @@ impl SensorGroupData {
     /// even when timestamps appear equal (e.g., at high update rates like 110Hz).
     #[inline]
     pub fn touch(&mut self) {
-        self.timestamp_us = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0);
+        self.stamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as u64)
+                .unwrap_or(0),
+        );
+    }
+
+    /// Like [`touch`](Self::touch), at a given time (a simulation's clock).
+    #[inline]
+    pub fn stamp(&mut self, timestamp_us: u64) {
+        self.timestamp_us = timestamp_us;
         self.sequence_number = self.sequence_number.wrapping_add(1);
     }
 }

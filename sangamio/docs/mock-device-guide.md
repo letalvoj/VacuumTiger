@@ -75,8 +75,9 @@ resolution: 0.02            # meters per pixel
 origin: [-5.0, -5.0, 0.0]   # [x, y, yaw] of bottom-left pixel
 occupied_thresh: 0.65       # Pixels darker than this are occupied
 
-# Optional: cliff mask (same dimensions as main map)
-cliff_mask: my_map_cliffs.pgm
+# Optional masks, same dimensions as the main map:
+cliff_mask: my_map_cliffs.pgm   # black where the cliff sensors trigger
+lidar_mask: my_map_lidar.pgm    # what the lidar sees, see below
 ```
 
 **Step 3: Calculate Origin**
@@ -113,6 +114,20 @@ Cliff masks define areas where cliff sensors should trigger:
 2. Paint black (0) where cliffs exist
 3. Leave white (255) for safe floor
 4. Reference in YAML: `cliff_mask: my_map_cliffs.pgm`
+
+### Lidar Masks: Glass and Curtains
+
+Without a mask the lidar sees exactly what blocks the robot. A `lidar_mask` (an extension of
+the ROS format) separates the two: a cell's darkness is the chance that a beam crossing it
+returns from it, so its effect depends on the resolution.
+
+- Glass: occupied in the map, white (clear) in the mask. The robot bumps it, the lidar
+  sees through it.
+- A curtain: free in the map, gray in the mask. The robot pushes through, beams stop
+  somewhere among its folds.
+
+Ranges are exact (the ray walks the cells it crosses) but measured to a cell's edge: use
+1 cm maps where range accuracy matters.
 
 ## Configuration Reference
 
@@ -157,21 +172,30 @@ max_linear_speed = 0.3   # Speed limit (m/s)
 max_angular_speed = 1.0  # Turn rate limit (rad/s)
 robot_radius = 0.17      # Collision radius (meters)
 collision_mode = "stop"  # "stop", "slide", "passthrough"
+response_delay = 0.08          # Dead time from command to wheels (s; v8: 0.08)
+response_time_constant = 0.12  # First-order lag of the wheel speed (s; v8: 0.12)
+response_gain = 0.9            # Reached / commanded speed (v8: 0.9)
 ```
+
+The bumper interlock is SangamIO's (`core::drive::bumper_stops`): driving forward into a
+pressed front bumper zeroes the command until the client sends another.
 
 #### Lidar Simulation
 
 ```toml
 [device.simulation.lidar]
 num_rays = 360           # Points per scan
-scan_rate_hz = 5.0       # Scans per second
+scan_rate_hz = 5.0       # Revolutions per second (v8: 6.03)
+sweep_start_angle = 0.2182  # First beam (rad, robot frame); beams go clockwise
 min_range = 0.15         # Minimum detection (meters)
 max_range = 8.0          # Maximum detection (meters)
-mounting_x = -0.110      # Lidar offset from center
-angle_offset = 0.2182    # Angular offset (radians)
+mounting_x = -0.110      # Lidar position in the robot frame (meters)
+mounting_y = 0.0
+optical_offset = 0.025   # Published range = true range - this (meters)
 
 [device.simulation.lidar.noise]
 range_stddev = 0.005     # Distance noise (meters)
+range_stddev_per_m = 0.003  # ... plus this much per meter of range
 angle_stddev = 0.001     # Angular noise (radians)
 miss_rate = 0.01         # Invalid reading probability
 quality_base = 200       # Base quality (0-255)
@@ -180,10 +204,14 @@ quality_base = 200       # Base quality (0-255)
 #### IMU Simulation
 
 ```toml
+[device.simulation.imu]
+gyro_scale = 1000.0        # Raw units per rad/s (v8: 5729.6)
+
 [device.simulation.imu.gyro_noise]
 stddev = [5.0, 5.0, 10.0]  # Per-axis noise
 bias = [0.0, 0.0, 0.0]     # Constant bias
 drift_rate = 0.0           # Bias drift (units/sec)
+deadband = 0.0             # |raw| below this reads 0 (v8: 100)
 
 [device.simulation.imu.accel_noise]
 stddev = [10.0, 10.0, 20.0]
@@ -201,16 +229,14 @@ quantization_noise = true # ±0.5 tick jitter
 
 ## Speed Factor Usage
 
-The `speed_factor` setting accelerates simulation time:
+The simulation always steps at the CRL-200S's 110 Hz in simulated time and stamps every
+group with that clock. `speed_factor` only makes it run that many times as fast as the wall
+clock: at 2.0, `sensor_status` arrives at 220 Hz wall time, still 110 Hz by its stamps.
+Higher factors cost CPU and may not be sustainable.
 
-| Factor | sensor_status | lidar | Use Case |
-|--------|---------------|-------|----------|
-| 1.0 | 110 Hz | 5 Hz | Real-time development |
-| 2.0 | 220 Hz | 10 Hz | Faster iteration |
-| 5.0 | 550 Hz | 25 Hz | Quick integration tests |
-| 10.0 | 1100 Hz | 50 Hz | Stress testing |
-
-**Note:** Higher speeds increase CPU usage and may not be sustainable on all systems.
+`mock_bench.toml` is the mock as close to the measured v8 as we know it. Offline benches
+don't run the daemon: they step a `MockRobot` (`devices::mock::robot`) as fast as they like
+and read the same `sensor_status` and `lidar` groups.
 
 ## Deterministic Testing
 

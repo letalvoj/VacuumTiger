@@ -9,12 +9,16 @@
 //!
 //! | Component | Simulation Method |
 //! |-----------|-------------------|
-//! | Lidar (Delta-2D) | Ray-casting against occupancy grid |
+//! | Drive | Delayed, lagged response to the command; the bumper interlock |
+//! | Lidar (Delta-2D) | Beams ray-cast from the mount as it turns, against the lidar mask or grid |
 //! | Wheel encoders | Differential drive kinematics + slip noise |
 //! | IMU (gyro/accel) | Physics-based with configurable noise |
 //! | Bumpers | Collision detection against map |
 //! | Cliff sensors | Cliff mask lookup or boundary detection |
 //! | Battery/buttons | Fixed configurable states |
+//!
+//! [`MockRobot`] is the simulated robot, stepped by its caller: this driver steps it in real
+//! time, benches as fast as they like. `mock_bench.toml` is the v8 as measured.
 //!
 //! # Map Format
 //!
@@ -27,6 +31,7 @@
 //! origin: [-5.0, -5.0, 0.0] # [x, y, yaw] of bottom-left pixel
 //! occupied_thresh: 0.65     # Darker = occupied
 //! cliff_mask: cliffs.pgm    # Optional cliff layer
+//! lidar_mask: lidar.pgm     # Optional: what the lidar sees (glass, curtains)
 //! ```
 //!
 //! PGM pixel values:
@@ -67,28 +72,19 @@
 //! The simulation runs at 110Hz (matching CRL-200S hardware):
 //!
 //! ```text
-//! Every ~9ms:
-//! 1. Read velocity commands from shared state
-//! 2. Update physics (pose, collision detection)
-//! 3. Generate encoder ticks from wheel velocities
-//! 4. Generate IMU readings (gyro, accel, tilt)
-//! 5. Check bumpers and cliff sensors
-//! 6. Publish sensor_status via streaming channel
-//!
-//! Every ~200ms (5Hz):
-//! 7. Generate lidar scan via ray-casting
-//! 8. Update lidar sensor group
+//! Every ~9 ms of wall time (divided by `speed_factor`):
+//! 1. Pass a new velocity command from shared state to the robot
+//! 2. Step it, 1/110 s of simulated time a step, until it has caught up with the clock:
+//!    wheels, physics, encoders, IMU, bumpers, cliffs, the beams due
+//! 3. Publish each step's sensor_status via the streaming channel
+//! 4. When a revolution completes (`scan_rate_hz`): update the lidar sensor group
 //! ```
 //!
 //! # Speed Factor
 //!
-//! The `speed_factor` setting accelerates simulation time:
-//!
-//! | Factor | sensor_status | lidar | Use Case |
-//! |--------|---------------|-------|----------|
-//! | 1.0 | 110 Hz | 5 Hz | Real-time testing |
-//! | 2.0 | 220 Hz | 10 Hz | Faster algorithm iteration |
-//! | 5.0 | 550 Hz | 25 Hz | Quick integration tests |
+//! The `speed_factor` setting accelerates simulation time: `sensor_status` and the scans
+//! come `speed_factor` times as often in wall time, stamped with the simulation's clock.
+//! Benches that need more speed step a [`MockRobot`] directly.
 //!
 //! # Noise Models
 //!
@@ -131,45 +127,26 @@ pub mod lidar_sim;
 pub mod map_loader;
 pub mod noise;
 pub mod physics;
+pub mod robot;
 pub mod sensor_sim;
+
+pub use robot::MockRobot;
 
 use crate::config::DeviceConfig;
 use crate::core::driver::{DeviceDriver, DriverInitResult};
-use crate::core::types::{Command, Kinematics, SensorGroupData, SensorValue};
+use crate::core::types::{Command, SensorGroupData, SensorValue};
 use crate::error::{Error, Result};
 
 use config::SimulationConfig;
-use encoder_sim::EncoderSimulator;
-use imu_sim::ImuSimulator;
-use lidar_sim::LidarSimulator;
 use map_loader::SimulationMap;
-use noise::NoiseGenerator;
-use physics::PhysicsState;
-use sensor_sim::{ActuatorState, BumperSimulator, CliffSimulator};
+use sensor_sim::ActuatorState;
 
 use crossbeam_channel::Sender;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-
-/// Atomic f32 wrapper using AtomicU32
-struct AtomicF32(AtomicU32);
-
-impl AtomicF32 {
-    fn new(val: f32) -> Self {
-        Self(AtomicU32::new(val.to_bits()))
-    }
-
-    fn load(&self, order: Ordering) -> f32 {
-        f32::from_bits(self.0.load(order))
-    }
-
-    fn store(&self, val: f32, order: Ordering) {
-        self.0.store(val.to_bits(), order);
-    }
-}
 
 /// Component state for tracking enable/disable commands
 /// Mirrors CRL-200S behavior where lidar and motors must be explicitly enabled
@@ -191,8 +168,10 @@ impl ComponentState {
 
 /// Shared state for thread communication
 struct SharedState {
-    linear_vel: AtomicF32,
-    angular_vel: AtomicF32,
+    /// A drive command (m/s, rad/s) not yet passed to the robot. Only new commands reach
+    /// it, as with the real driver, whose bumper interlock zeroes the command until the
+    /// client sends another.
+    drive: Mutex<Option<(f32, f32)>>,
     shutdown: AtomicBool,
     components: ComponentState,
 }
@@ -200,10 +179,16 @@ struct SharedState {
 impl SharedState {
     fn new() -> Self {
         Self {
-            linear_vel: AtomicF32::new(0.0),
-            angular_vel: AtomicF32::new(0.0),
+            drive: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             components: ComponentState::new(),
+        }
+    }
+
+    /// Queues a drive command over any not yet taken.
+    fn configure_drive(&self, linear: f32, angular: f32) {
+        if let Ok(mut drive) = self.drive.lock() {
+            *drive = Some((linear, angular));
         }
     }
 }
@@ -253,16 +238,20 @@ impl DeviceDriver for MockDriver {
             map.resolution()
         );
 
-        // Initialize physics state
-        let physics = PhysicsState::new(
-            self.config.start_x,
-            self.config.start_y,
-            self.config.start_theta,
-            &self.config.robot,
-        );
-
-        // Create noise generator
-        let noise = NoiseGenerator::new(self.config.random_seed);
+        // Groups are stamped with the simulation's clock from now on: it runs
+        // `speed_factor` times as fast as the wall clock, and consumers integrate the
+        // odometry over the stamps.
+        let epoch_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros() as u64);
+        let speed_factor = self.config.speed_factor;
+        if !(speed_factor.is_finite() && speed_factor > 0.0) {
+            return Err(Error::Config(format!(
+                "speed_factor {speed_factor} must be > 0"
+            )));
+        }
+        let robot = MockRobot::new(self.config.clone(), map, epoch_us)?;
+        let kinematics = robot.kinematics();
 
         // Create sensor groups
         let sensor_status = Arc::new(Mutex::new(SensorGroupData::new("sensor_status")));
@@ -286,26 +275,21 @@ impl DeviceDriver for MockDriver {
         let (stream_tx, stream_rx) = crate::core::types::create_stream_channel();
 
         // Clone references for simulation thread
-        let sim_config = self.config.clone();
         let shared = Arc::clone(&self.shared_state);
         let sensor_status_clone = Arc::clone(&sensor_status);
         let lidar_data_clone = Arc::clone(&lidar_data);
-        let actuator_state_clone = Arc::clone(&self.actuator_state);
 
         // Spawn simulation thread
         let handle = thread::Builder::new()
             .name("mock-simulation".to_string())
             .spawn(move || {
                 simulation_loop(
-                    sim_config,
+                    speed_factor,
+                    robot,
                     shared,
-                    map,
-                    physics,
-                    noise,
                     sensor_status_clone,
                     lidar_data_clone,
                     stream_tx,
-                    actuator_state_clone,
                 );
             })
             .map_err(|e| Error::Other(format!("Failed to spawn simulation thread: {}", e)))?;
@@ -319,13 +303,6 @@ impl DeviceDriver for MockDriver {
         sensor_data.insert("sensor_status".to_string(), sensor_status);
         sensor_data.insert("lidar".to_string(), lidar_data);
         sensor_data.insert("device_version".to_string(), version_data);
-        let kinematics = Kinematics {
-            wheel_m_per_tick: 1.0 / self.config.robot.ticks_per_meter,
-            wheel_track_m: self.config.robot.wheel_base,
-            wheel_tick_bits: 16,
-            gyro_rad_per_lsb: 1.0 / imu_sim::GYRO_SCALE,
-            accel_mps2_per_lsb: Some(9.81 / imu_sim::ACCEL_SCALE),
-        };
         sensor_data.insert(
             "kinematics".to_string(),
             Arc::new(Mutex::new(kinematics.to_sensor_group())),
@@ -358,6 +335,16 @@ impl DeviceDriver for MockDriver {
                                 log::debug!("Drive enabled (wheel motors on)");
                             }
                             crate::core::types::ComponentAction::Configure { config } => {
+                                // As the CRL-200S driver: both, or nothing is stored.
+                                let (
+                                    Some(SensorValue::F32(linear)),
+                                    Some(SensorValue::F32(angular)),
+                                ) = (config.get("linear"), config.get("angular"))
+                                else {
+                                    return Err(Error::InvalidParameter(
+                                        "drive Configure needs linear and angular (f32)".into(),
+                                    ));
+                                };
                                 if !self
                                     .shared_state
                                     .components
@@ -369,25 +356,15 @@ impl DeviceDriver for MockDriver {
                                     );
                                     return Ok(());
                                 }
-                                if let Some(SensorValue::F32(v)) = config.get("linear") {
-                                    self.shared_state.linear_vel.store(*v, Ordering::Relaxed);
-                                }
-                                if let Some(SensorValue::F32(w)) = config.get("angular") {
-                                    self.shared_state.angular_vel.store(*w, Ordering::Relaxed);
-                                }
-                                log::debug!(
-                                    "Drive command: linear={}, angular={}",
-                                    self.shared_state.linear_vel.load(Ordering::Relaxed),
-                                    self.shared_state.angular_vel.load(Ordering::Relaxed)
-                                );
+                                log::debug!("Drive command: linear={linear}, angular={angular}");
+                                self.shared_state.configure_drive(*linear, *angular);
                             }
                             crate::core::types::ComponentAction::Disable { .. } => {
                                 self.shared_state
                                     .components
                                     .wheel_motor_enabled
                                     .store(false, Ordering::Relaxed);
-                                self.shared_state.linear_vel.store(0.0, Ordering::Relaxed);
-                                self.shared_state.angular_vel.store(0.0, Ordering::Relaxed);
+                                self.shared_state.configure_drive(0.0, 0.0);
                                 log::debug!("Drive disabled (wheel motors off)");
                             }
                             _ => {}
@@ -455,186 +432,133 @@ impl Drop for MockDriver {
     }
 }
 
-/// Main simulation loop
+/// How far (simulated s) the loop may fall behind the clock before it gives the time up.
+const MAX_LAG: f64 = 0.5;
+
+/// Steps the robot until its clock reaches `due` (s), handing `publish` every step's
+/// `sensor_status`. Returns whether a scan completed.
+fn catch_up(
+    robot: &mut MockRobot,
+    due: f64,
+    lidar_on: bool,
+    mut publish: impl FnMut(&SensorGroupData),
+) -> bool {
+    let mut scanned = false;
+    while robot.time() < due {
+        scanned |= robot.step(lidar_on);
+        publish(robot.status());
+    }
+    scanned
+}
+
+/// Steps the robot in (scaled) real time at the CRL-200S's 110 Hz and publishes its groups.
 fn simulation_loop(
-    config: SimulationConfig,
+    speed_factor: f32,
+    mut robot: MockRobot,
     shared: Arc<SharedState>,
-    map: SimulationMap,
-    mut physics: PhysicsState,
-    noise: NoiseGenerator,
     sensor_status: Arc<Mutex<SensorGroupData>>,
     lidar_data: Arc<Mutex<SensorGroupData>>,
     stream_tx: Sender<SensorGroupData>,
-    _actuator_state: Arc<Mutex<ActuatorState>>,
 ) {
-    // Create simulators
-    let mut lidar_sim = LidarSimulator::new(&config.lidar, noise.clone());
-    let mut imu_sim = ImuSimulator::new(&config.imu, noise.clone());
-    let mut encoder_sim =
-        EncoderSimulator::new(&config.encoder, config.robot.ticks_per_meter, noise.clone());
-    let bumper_sim = BumperSimulator::new(&config.bumpers);
-    let cliff_sim = CliffSimulator::new(&config.cliffs);
-
-    // Timing
-    let base_interval_us = (1_000_000.0 / 110.0) as u64; // ~9090us for 110Hz
-    let scaled_interval =
-        Duration::from_micros((base_interval_us as f32 / config.speed_factor) as u64);
-    let lidar_interval_ticks = (110.0 / config.lidar.scan_rate_hz) as u32; // ~22 ticks at 5Hz
-
-    let mut last_time = Instant::now();
-    let mut lidar_tick_counter: u32 = 0;
-
-    log::info!(
-        "Simulation loop started: speed_factor={}, interval={:?}",
-        config.speed_factor,
-        scaled_interval
-    );
+    let interval = Duration::from_secs_f32(robot::STEP_DT / speed_factor);
+    log::info!("Simulation loop started: speed_factor={speed_factor}, interval={interval:?}");
+    let start = Instant::now();
+    // Simulated time given up when the loop fell too far behind (stalled, or too slow).
+    let mut skipped = 0.0;
 
     while !shared.shutdown.load(Ordering::Relaxed) {
-        let loop_start = Instant::now();
-
-        // Calculate delta time
-        let now = Instant::now();
-        let wall_dt = now.duration_since(last_time).as_secs_f32();
-        let sim_dt = wall_dt * config.speed_factor;
-        last_time = now;
-
-        // Read velocity commands
-        let linear_vel = shared.linear_vel.load(Ordering::Relaxed);
-        let angular_vel = shared.angular_vel.load(Ordering::Relaxed);
-
-        // Update physics
-        let collision = physics.update(sim_dt, linear_vel, angular_vel, &map, &config.robot);
-        if collision && config.log_level != "minimal" {
-            log::debug!("Collision at ({:.3}, {:.3})", physics.x(), physics.y());
+        if let Some((linear, angular)) = shared.drive.lock().ok().and_then(|mut d| d.take()) {
+            robot.drive(linear, angular);
         }
-
-        // Generate encoder data
-        let (left_vel, right_vel) =
-            physics.wheel_velocities(linear_vel, angular_vel, config.robot.wheel_base);
-        let (wheel_left, wheel_right) = encoder_sim.update(left_vel, right_vel, sim_dt);
-
-        // Generate IMU data
-        let imu_reading = imu_sim.generate(angular_vel, linear_vel, sim_dt);
-
-        // Check bumpers and cliffs
-        let (bumper_left, bumper_right) = bumper_sim.check(
-            &map,
-            physics.x(),
-            physics.y(),
-            physics.theta(),
-            config.robot.robot_radius,
-        );
-        let cliff_states = cliff_sim.check(&map, physics.x(), physics.y(), physics.theta());
-
-        // Build sensor_status
-        if let Ok(mut status) = sensor_status.lock() {
-            status.set("wheel_left", SensorValue::U16(wheel_left));
-            status.set("wheel_right", SensorValue::U16(wheel_right));
-
-            status.set("gyro_x", SensorValue::I16(imu_reading.gyro[0]));
-            status.set("gyro_y", SensorValue::I16(imu_reading.gyro[1]));
-            status.set("gyro_z", SensorValue::I16(imu_reading.gyro[2]));
-            status.set("accel_x", SensorValue::I16(imu_reading.accel[0]));
-            status.set("accel_y", SensorValue::I16(imu_reading.accel[1]));
-            status.set("accel_z", SensorValue::I16(imu_reading.accel[2]));
-            status.set("tilt_x", SensorValue::I16(imu_reading.tilt[0]));
-            status.set("tilt_y", SensorValue::I16(imu_reading.tilt[1]));
-            status.set("tilt_z", SensorValue::I16(imu_reading.tilt[2]));
-
-            status.set("bumper_left", SensorValue::Bool(bumper_left));
-            status.set("bumper_right", SensorValue::Bool(bumper_right));
-            // As the CRL-200S publishes them: front zones only, no dock in the simulation.
-            let zones = u8::from(bumper_left) << 2 | u8::from(bumper_right) << 1;
-            status.set("bumper_zones", SensorValue::U8(zones));
-            status.set("dock_ir", SensorValue::U8(0));
-
-            // Cliff sensors
-            status.set(
-                "cliff_left_side",
-                SensorValue::Bool(*cliff_states.get("left_side").unwrap_or(&false)),
+        let lidar_on = shared.components.lidar_enabled.load(Ordering::Relaxed);
+        let mut due = start.elapsed().as_secs_f64() * f64::from(speed_factor) - skipped;
+        if due - robot.time() > MAX_LAG {
+            log::warn!(
+                "Simulation {:.1} s behind: skipping ahead",
+                due - robot.time()
             );
-            status.set(
-                "cliff_left_front",
-                SensorValue::Bool(*cliff_states.get("left_front").unwrap_or(&false)),
-            );
-            status.set(
-                "cliff_right_front",
-                SensorValue::Bool(*cliff_states.get("right_front").unwrap_or(&false)),
-            );
-            status.set(
-                "cliff_right_side",
-                SensorValue::Bool(*cliff_states.get("right_side").unwrap_or(&false)),
-            );
-
-            // Battery (fixed)
-            status.set(
-                "battery_voltage",
-                SensorValue::F32(config.sensors.battery.voltage),
-            );
-            status.set(
-                "battery_level",
-                SensorValue::U8(config.sensors.battery.level),
-            );
-            status.set(
-                "is_charging",
-                SensorValue::Bool(config.sensors.battery.is_charging),
-            );
-
-            // Other sensors (fixed)
-            status.set(
-                "dustbox_attached",
-                SensorValue::Bool(config.sensors.dustbox_attached),
-            );
-            status.set(
-                "is_dock_connected",
-                SensorValue::Bool(config.sensors.dock_connected),
-            );
-            status.set(
-                "start_button",
-                SensorValue::U16(config.sensors.start_button),
-            );
-            status.set("dock_button", SensorValue::U16(config.sensors.dock_button));
-
-            status.touch();
-
-            // Send to streaming channel
+            skipped += due - robot.time();
+            due = robot.time();
+        }
+        let scanned = catch_up(&mut robot, due, lidar_on, |status| {
             let _ = stream_tx.try_send(status.clone());
+        });
+        if let Ok(mut status) = sensor_status.lock() {
+            status.clone_from(robot.status());
         }
-
-        // Generate lidar scan periodically (only if lidar is enabled)
-        lidar_tick_counter += 1;
-        if lidar_tick_counter >= lidar_interval_ticks {
-            lidar_tick_counter = 0;
-
-            // Only generate scan if lidar is enabled
-            if shared.components.lidar_enabled.load(Ordering::Relaxed) {
-                let scan = lidar_sim.generate_scan(&map, physics.x(), physics.y(), physics.theta());
-
-                if let Ok(mut lidar) = lidar_data.lock() {
-                    log::trace!(
-                        "Generated lidar scan: {} points at ({:.2}, {:.2}, {:.2}°)",
-                        scan.len(),
-                        physics.x(),
-                        physics.y(),
-                        physics.theta().to_degrees()
-                    );
-                    lidar.set("scan", SensorValue::PointCloud2D(scan));
-                    // Simulator ground truth at scan time, for offline SLAM scoring.
-                    lidar.set("gt_x", SensorValue::F32(physics.x()));
-                    lidar.set("gt_y", SensorValue::F32(physics.y()));
-                    lidar.set("gt_theta", SensorValue::F32(physics.theta()));
-                    lidar.touch();
-                }
-            }
+        if scanned && let Ok(mut lidar) = lidar_data.lock() {
+            lidar.clone_from(robot.scan());
         }
-
-        // Sleep for remaining interval
-        let elapsed = loop_start.elapsed();
-        if elapsed < scaled_interval {
-            thread::sleep(scaled_interval - elapsed);
-        }
+        thread::sleep(interval);
     }
 
     log::info!("Simulation loop terminated");
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::Config;
+
+    fn simulation(file: &str) -> super::SimulationConfig {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/").to_owned() + file;
+        let config = Config::load(&path).unwrap_or_else(|e| panic!("{file}: {e}"));
+        config.device.simulation.expect(file)
+    }
+
+    #[test]
+    fn the_shipped_mock_configs_load() {
+        simulation("mock.toml");
+        // The measured values are where they belong.
+        let v8 = simulation("mock_bench.toml");
+        assert_eq!(v8.robot.response_delay, 0.08);
+        assert_eq!(v8.lidar.sweep_start_angle, 0.2182);
+        assert_eq!(v8.lidar.noise.range_stddev_per_m, 0.003);
+        assert_eq!(v8.imu.gyro_scale, 5729.6);
+        assert_eq!(v8.imu.gyro_noise.deadband, 100.0);
+    }
+
+    #[test]
+    fn catching_up_publishes_every_sample() {
+        let config = simulation("mock.toml");
+        let map = super::SimulationMap::load(&config.map_file).expect("mock.toml's map");
+        let mut robot = super::MockRobot::new(config, map, 0).expect("a valid config");
+        let mut sequence = Vec::new();
+        let scanned = super::catch_up(&mut robot, 1.0, true, |status| {
+            sequence.push(status.sequence_number)
+        });
+        assert!(scanned);
+        assert_eq!(sequence, (1..=110).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn a_drive_configure_needs_linear_and_angular() {
+        use crate::core::driver::DeviceDriver;
+        use crate::core::types::{Command, ComponentAction, SensorValue};
+        let device = Config::load(concat!(env!("CARGO_MANIFEST_DIR"), "/mock.toml"))
+            .expect("mock.toml")
+            .device;
+        let mut driver = super::MockDriver::new(device).expect("a mock driver");
+        let configure = |keys: &[&str]| Command::ComponentControl {
+            id: "drive".into(),
+            action: ComponentAction::Configure {
+                config: keys
+                    .iter()
+                    .map(|k| (k.to_string(), SensorValue::F32(0.1)))
+                    .collect(),
+            },
+        };
+        assert!(driver.send_command(configure(&["linear"])).is_err());
+        assert!(
+            driver
+                .send_command(configure(&["linear", "angular"]))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_mistyped_key_is_refused() {
+        let parse = basic_toml::from_str::<super::config::LidarConfig>;
+        assert!(parse("sweep_start_angle = 0.2").is_ok());
+        assert!(parse("sweep_start_angel = 0.2").is_err());
+    }
 }

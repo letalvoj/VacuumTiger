@@ -52,11 +52,6 @@ pub struct ImuSimulator {
     gyro_drift: [f32; 3],
 }
 
-/// Scale factor: rad/s to raw gyro units
-/// Typical MPU6050 at ±2000°/s range: ~16.4 LSB/(°/s) = ~939 LSB/(rad/s)
-/// We use 1000 for round numbers
-pub(crate) const GYRO_SCALE: f32 = 1000.0;
-
 /// Scale factor: g to raw accel units
 /// Typical MPU6050 at ±2g range: 16384 LSB/g
 pub(crate) const ACCEL_SCALE: f32 = 16384.0;
@@ -107,17 +102,19 @@ impl ImuSimulator {
         // - X (roll rate): ~0 (no rolling)
         // - Y (pitch rate): ~0 (no pitching)
         // - Z (yaw rate): = angular_vel (CCW positive)
-        let gyro_z_ideal = angular_vel * GYRO_SCALE;
+        let gyro_z_ideal = angular_vel * self.config.gyro_scale;
 
         let gyro_x_noise = self.noise.gaussian(gyro_stddev[0]);
         let gyro_y_noise = self.noise.gaussian(gyro_stddev[1]);
         let gyro_z_noise = self.noise.gaussian(gyro_stddev[2]);
 
+        let deadband = self.config.gyro_noise.deadband;
         let gyro = [
-            clamp_i16(self.gyro_drift[0] + gyro_bias[0] + gyro_x_noise),
-            clamp_i16(self.gyro_drift[1] + gyro_bias[1] + gyro_y_noise),
-            clamp_i16(gyro_z_ideal + self.gyro_drift[2] + gyro_bias[2] + gyro_z_noise),
-        ];
+            self.gyro_drift[0] + gyro_bias[0] + gyro_x_noise,
+            self.gyro_drift[1] + gyro_bias[1] + gyro_y_noise,
+            gyro_z_ideal + self.gyro_drift[2] + gyro_bias[2] + gyro_z_noise,
+        ]
+        .map(|rate| clamp_i16(if rate.abs() < deadband { 0.0 } else { rate }));
 
         // =====================================================================
         // Accelerometer (linear acceleration + gravity)
