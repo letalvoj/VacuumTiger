@@ -224,6 +224,30 @@ impl OccupancyGrid {
             .collect()
     }
 
+    /// The cells a round robot's centre can drive to from world point `from`, keeping more
+    /// than `keep` m (its radius and a margin) from anything not free, given the grid's
+    /// `clearance()`; from the nearest such cell, however far, when `from` itself is too close
+    /// to something. Row by row from cell (0, 0); all false when no cell is clear enough.
+    /// Cells join diagonally too: with `keep` over a cell, a diagonal step never squeezes
+    /// between obstacles.
+    pub fn reachable(&self, clearance: &[f32], keep: f32, from: (f32, f32)) -> Vec<bool> {
+        use imageproc::region_labelling::{Connectivity, connected_components};
+        let (w, h) = (self.width, self.height);
+        let space = GrayImage::from_fn(w as u32, h as u32, |x, y| {
+            Luma([u8::from(clearance[y as usize * w + x as usize] > keep)])
+        });
+        let parts = connected_components(&space, Connectivity::Eight, Luma([0]));
+        let squared_distance = |i: usize| {
+            let (x, y) = self.cell_to_world(i % w, i / w);
+            (x - from.0).powi(2) + (y - from.1).powi(2)
+        };
+        let part = (0..w * h)
+            .filter(|&i| clearance[i] > keep)
+            .min_by(|&a, &b| squared_distance(a).total_cmp(&squared_distance(b)))
+            .map(|i| parts.as_raw()[i]);
+        parts.pixels().map(|p| Some(p[0]) == part).collect()
+    }
+
     /// Update a cell with an observation.
     ///
     /// If `occupied` is true, adds `log_odds_occupied`.

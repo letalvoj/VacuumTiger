@@ -113,21 +113,23 @@ impl<'a> CoveragePlanner<'a> {
     }
 
     /// All rooms for a robot at `start`: the nearest room first (the one it is in), then
-    /// depth first through the doorways, the nearest unvisited neighbour of the latest room;
-    /// rooms with nothing to clean are left out.
+    /// depth first through the doorways, the nearest unvisited neighbour of the latest room.
+    /// Only the floor the robot can drive to from `start` is planned: space seen only through
+    /// a gap it does not fit through is left out, and so are rooms with nothing left.
     pub fn plan(&self, start: Point2D) -> Vec<RoomCoverage> {
+        let reachable = (self.grid).reachable(&self.clearance, self.keep(0.0), (start.x, start.y));
         let neighbours: Vec<Vec<usize>> = (self.rooms.neighbours().into_iter())
             .map(|list| list.into_iter().map(|r| r as usize - 1).collect())
             .collect();
         let mut at = start;
         walk(&neighbours, |candidates| {
             let distances: Vec<f32> = (candidates.iter())
-                .map(|&r| self.distance(r as u16 + 1, at))
+                .map(|&r| self.distance(r as u16 + 1, at, &reachable))
                 .collect();
             let i = (0..candidates.len())
                 .min_by(|&a, &b| distances[a].total_cmp(&distances[b]))
                 .unwrap_or(0);
-            let plan = self.room(candidates[i] as u16 + 1, at);
+            let plan = self.room(candidates[i] as u16 + 1, at, &reachable);
             if let Some(end) = plan.paths.last().and_then(|p| p.points.last()) {
                 at = *end;
             }
@@ -138,17 +140,17 @@ impl<'a> CoveragePlanner<'a> {
         .collect()
     }
 
-    /// The coverage of `room` for a robot at `start`: its outline, then its sections depth
-    /// first through the section adjacency graph, each followed by the loops around furniture
-    /// it ended near.
-    pub fn room(&self, room: u16, start: Point2D) -> RoomCoverage {
+    /// The coverage of the `reachable` part of `room` for a robot at `start`: its outline,
+    /// then its sections depth first through the section adjacency graph, each followed by the
+    /// loops around furniture it ended near.
+    fn room(&self, room: u16, start: Point2D, reachable: &[bool]) -> RoomCoverage {
         let mut paths = Vec::new();
         let mut at = start;
-        let (mut walls, mut furniture) = self.loops(&self.mask(room, 0.0));
+        let (mut walls, mut furniture) = self.loops(&self.mask(room, 0.0, reachable));
         paths.extend(drive_loops(&mut walls, PathKind::Wall, f32::MAX, &mut at));
 
         // Lanes start one lane spacing in from the loops.
-        let inner = self.mask(room, self.config.lane_spacing);
+        let inner = self.mask(room, self.config.lane_spacing, reachable);
         let [along, across] = [self.axis, self.axis + FRAC_PI_2].map(|a| self.lanes(&inner, a));
         let lanes = if across.run_count() < along.run_count() {
             across
@@ -188,16 +190,25 @@ impl<'a> CoveragePlanner<'a> {
         RoomCoverage { room, paths }
     }
 
-    /// Distance from `at` to the nearest cell of `room` (m), `f32::MAX` for an empty room.
-    fn distance(&self, room: u16, at: Point2D) -> f32 {
+    /// Distance from `at` to the nearest `reachable` cell of `room` (m), `f32::MAX` for none.
+    fn distance(&self, room: u16, at: Point2D, reachable: &[bool]) -> f32 {
         let (w, h) = self.grid.dimensions();
         (0..w * h)
-            .filter(|&i| self.rooms.room(i % w, i / w) == Some(room))
-            .map(|i| {
-                let (x, y) = self.grid.cell_to_world(i % w, i / w);
-                Point2D::new(x, y).distance(&at)
-            })
+            .filter(|&i| reachable[i] && self.rooms.room(i % w, i / w) == Some(room))
+            .map(|i| self.cell_centre(i).distance(&at))
             .fold(f32::MAX, f32::min)
+    }
+
+    fn cell_centre(&self, i: usize) -> Point2D {
+        let w = self.grid.dimensions().0;
+        let (x, y) = self.grid.cell_to_world(i % w, i / w);
+        Point2D::new(x, y)
+    }
+
+    /// How far the robot's centre stays from anything not free, `inset` m more than its
+    /// radius and margin.
+    fn keep(&self, inset: f32) -> f32 {
+        self.config.robot_radius + self.config.margin + inset
     }
 
     fn max_section_lanes(&self) -> usize {
@@ -210,14 +221,17 @@ impl<'a> CoveragePlanner<'a> {
         self.config.lane_spacing.powi(2)
     }
 
-    /// The cells of `room` where the robot's centre keeps `inset` m more than the robot radius
-    /// and margin from anything not free, without fragments smaller than `min_area`.
-    fn mask(&self, room: u16, inset: f32) -> GrayImage {
+    /// The `reachable` cells of `room` where the robot's centre keeps `inset` m more than the
+    /// robot radius and margin from anything not free, without fragments smaller than
+    /// `min_area`.
+    fn mask(&self, room: u16, inset: f32, reachable: &[bool]) -> GrayImage {
         let (w, h) = self.grid.dimensions();
-        let keep = self.config.robot_radius + self.config.margin + inset;
+        let keep = self.keep(inset);
         let mask = GrayImage::from_fn(w as u32, h as u32, |x, y| {
             let (x, y) = (x as usize, y as usize);
-            let inside = self.rooms.room(x, y) == Some(room) && self.clearance[y * w + x] > keep;
+            let i = y * w + x;
+            let inside =
+                reachable[i] && self.rooms.room(x, y) == Some(room) && self.clearance[i] > keep;
             Luma([if inside { 255 } else { 0 }])
         });
         let parts = connected_components(&mask, Connectivity::Eight, Luma([0]));
@@ -652,8 +666,10 @@ mod tests {
     fn cover(grid: &OccupancyGrid) -> RoomCoverage {
         let rooms = Rooms::segment(grid, RoomsConfig::default());
         assert_eq!(rooms.count(), 1);
-        CoveragePlanner::new(grid, &rooms, CoverageConfig::default())
-            .room(1, Point2D::new(1.2, 1.2))
+        let mut plan = CoveragePlanner::new(grid, &rooms, CoverageConfig::default())
+            .plan(Point2D::new(1.2, 1.2));
+        assert_eq!(plan.len(), 1);
+        plan.remove(0)
     }
 
     /// The points of the paths of `kinds`, in driving order.
@@ -824,18 +840,38 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rooms_are_cleaned_one_at_a_time_and_stay_in_place() {
-        // Two 2 x 2 m rooms side by side with a 0.8 m door.
-        let grid = grid(6.0, 4.0, |x, y| {
+    /// Two 2 x 2 m rooms side by side, the left one from x = 1 to 3 m, joined by a `door` m
+    /// wide opening.
+    fn two_rooms(door: f32) -> OccupancyGrid {
+        grid(6.0, 4.0, |x, y| {
             let (inside_x, inside_y) = ((1.0..5.0).contains(&x), (1.0..3.0).contains(&y));
-            let wall = (2.95..3.05).contains(&x) && !(1.6..2.4).contains(&y);
+            let opening = (2.0 - door / 2.0..2.0 + door / 2.0).contains(&y);
+            let wall = (2.95..3.05).contains(&x) && !opening;
             match (inside_x && inside_y, wall) {
                 (true, false) => Some(false),
                 _ if (0.9..5.1).contains(&x) && (0.9..3.1).contains(&y) => Some(true),
                 _ => None,
             }
-        });
+        })
+    }
+
+    #[test]
+    fn a_room_the_robot_cannot_get_into_is_left_out() {
+        // A 0.3 m gap: the lidar sees through it, the robot does not fit.
+        let grid = two_rooms(0.3);
+        let rooms = Rooms::segment(&grid, RoomsConfig::default());
+        assert_eq!(rooms.count(), 2, "the gap is a doorway to segmentation");
+        let planner = CoveragePlanner::new(&grid, &rooms, CoverageConfig::default());
+        let plan = planner.plan(Point2D::new(4.5, 2.0));
+        assert_eq!(plan.len(), 1);
+        for p in plan[0].paths.iter().flat_map(|path| &path.points) {
+            assert!(p.x > 3.05, "{p:?} is past the wall with the gap");
+        }
+    }
+
+    #[test]
+    fn rooms_are_cleaned_one_at_a_time_and_stay_in_place() {
+        let grid = two_rooms(0.8);
         let rooms = Rooms::segment(&grid, RoomsConfig::default());
         assert_eq!(rooms.count(), 2);
         let planner = CoveragePlanner::new(&grid, &rooms, CoverageConfig::default());
