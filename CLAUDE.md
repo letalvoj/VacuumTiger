@@ -1,494 +1,65 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This is the `v8-integration` fork of VacuumTiger. It runs on a viomi.vacuum.v8 (a CRL-200S).
 
-## Project Overview
+- **Architecture, hard safety rules, docs map:** `../CLAUDE.md`, in the project folder that holds
+  this repo. Read it first.
+- **Current plan:** `../docs/ROADMAP.md`.
 
-VacuumTiger is an open-source robotic vacuum firmware project for the CRL-200S hardware platform. The project consists of the following components:
+This file only covers working inside the repo.
 
-1. **SangamIO**: A daemon providing hardware abstraction and real-time control via TCP/UDP streaming
-2. **DhruvaSLAM**: A 2D SLAM daemon (Rust) that consumes SangamIO streams and serves maps/pose to clients
-3. **Drishti**: Python visualization and control client for monitoring and commanding the robot
-4. **DhruvaNav**: Autonomous navigation/exploration (frontier exploration, path planning) consuming DhruvaSLAM
-5. **VastuSLAM**: An older high-performance 2D SLAM library kept in-repo for reference
+## Do not follow upstream's deploy
 
-**Target Platform**: Embedded Linux (ARM) - Allwinner A33 running Tina Linux
-**Primary Language**: Rust (edition 2024) for SangamIO, Python 3.8+ for Drishti
-**Cross-compilation Target**: `armv7-unknown-linux-musleabihf`
-**Architecture**: Daemon-based with UDP/TCP streaming (not a library)
+Upstream's instructions copied binaries to `/usr/sbin`, renamed AuxCtrl and used an SSH password.
+`sangamio/README.md` "Deployment" still shows them. On the v8 that would write flash. We never do
+that:
+- `../scripts/deploy.sh` copies builds to `/tmp/v8` (RAM).
+- `../scripts/robot/run_web.sh` starts the stack and restores the vendor firmware after.
 
-## System Architecture
+## Crates
 
-### Overview
+Each crate is its own Cargo project (no workspace), Rust edition 2024.
 
-```
-┌─────────────────────────────────────────────────┐
-│         Client Applications (SLAM/Drishti)      │
-└─────────────┬───────────────┬───────────────────┘
-              │ UDP 5555      │ TCP 5555
-              │ (sensors)     │ (commands)
-┌─────────────▼───────────────▼───────────────────┐
-│            SangamIO Daemon (Robot)              │
-│  • Telemetry streaming @ 110Hz (UDP unicast)    │
-│  • Lidar streaming @ 5Hz (360° scans)           │
-│  • Command processing (TCP, reliable)           │
-│  • Real-time control loop (20ms heartbeat)      │
-└─────────────┬───────────────┬───────────────────┘
-              │ /dev/ttyS3    │ /dev/ttyS1
-       ┌──────▼─────────┐  ┌──▼────────────┐
-       │ GD32F103 MCU   │  │ Delta-2D Lidar│
-       │ (Motor Control)│  │ (360° Scan)   │
-       └────────────────┘  └───────────────┘
-```
+| Crate | What | v8 / dev config |
+| --- | --- | --- |
+| `sangamio` | HAL daemon: GD32 + lidar, protobuf on TCP 5555, control lease, dead-man, bumper interlock; `--features mock` is the simulator | `viomi_v8.toml` / `mock.toml` |
+| `dhruva-slam` | SLAM daemon + library: odometry, matching, loop closure, exploration (`wall_follow` corner sweep), offline `--replay` | `dhruva-v8.toml` / `dhruva-mock.toml` |
+| `dwar` | web gateway: REST + WebSocket, Preact UI in `web/`, teleop, STOP, MCAP recorder | `../scripts/robot/dwar.toml` / `dwar.toml` |
+| `dhruva-lab` | offline lab: replays recordings through dhruva-slam's pipeline; metrics, floor plan, rooms | — |
+| `drishti`, `protocol-mitm` | PyQt viewer; serial MITM tool (reverse engineering) | — |
+| `dhruva-nav`, `vastu-slam`, `slam-test` | upstream leftovers, not used (`dhruva/` holds only a proposal doc) | — |
 
-### Key Design Principles
+Wire contracts:
+- `sangamio/proto/sangamio.proto`
+- `dhruva-slam/proto/dhruva.proto`
+- GD32 details: `sangamio/src/devices/crl200s/{COMMANDS,SENSORSTATUS}.md`
 
-1. **Daemon, Not Library**: SangamIO runs as a standalone service, not imported as a library
-2. **Concrete Over Abstract**: Direct implementations instead of trait objects (except LidarDriver)
-3. **Lock-Free Streaming**: Uses lock-free queues for sensor data flow
-4. **Real-Time Guarantees**: OS threads for heartbeat (20ms) instead of async
-5. **Hybrid Protocol**: UDP for sensor streaming (low latency), TCP for commands (reliable)
+## Build and test
 
-## Build and Deployment
-
-### Development (Host Machine)
+Run these from the crate's directory:
 
 ```bash
-# Build daemon
-cd sangam-io
-cargo build --release
-
-# Run with configuration
-cargo run --release -- --config sangamio.toml
-
-# Run with verbose logging
-RUST_LOG=debug cargo run --release
+export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"
+cargo test --release                       # sangamio: also --features mock
+cargo build --release --features mock --target-dir target/mock   # sangamio simulator → target/mock/release/sangamio
+cargo +nightly zigbuild --release --target armv7-unknown-linux-musleabihf   # robot builds
+cd dwar/web && npm run build               # before building dwar
 ```
 
-### Production (ARM Robot)
-
-```bash
-# Add ARM target
-rustup target add armv7-unknown-linux-musleabihf
-
-# Build for ARM (produces static binary with musl)
-cargo build --release --target armv7-unknown-linux-musleabihf
-
-# Strip debug symbols (reduces size ~40%)
-arm-linux-gnueabihf-strip target/armv7-unknown-linux-musleabihf/release/sangam-io
-```
-
-### Deployment to Robot
-
-**IMPORTANT**: The robot monitor auto-restarts killed processes. Rename binaries to prevent this.
-
-**SSH Credentials**: `root@vacuum`, password: `vacuum@123`
-
-**Complete Deployment**:
-
-```bash
-# Build ARM binary
-cd sangam-io
-cargo build --release --target armv7-unknown-linux-musleabihf
-
-# Deploy binary (device lacks sftp-server, use cat over SSH)
-cat target/armv7-unknown-linux-musleabihf/release/sangam-io | \
-  sshpass -p "vacuum@123" ssh root@vacuum "cat > /usr/sbin/sangamio && chmod +x /usr/sbin/sangamio"
-
-# Deploy configuration
-sshpass -p "vacuum@123" ssh root@vacuum "cat > /etc/sangamio.toml" < sangamio.toml
-
-# Disable original firmware (rename to prevent auto-restart)
-sshpass -p "vacuum@123" ssh root@vacuum "mv /usr/sbin/AuxCtrl /usr/sbin/AuxCtrl.bak && killall -9 AuxCtrl"
-
-# Run daemon
-sshpass -p "vacuum@123" ssh root@vacuum "RUST_LOG=info /usr/sbin/sangamio"
-```
-
-**CRITICAL**: Always overwrite `/usr/sbin/sangamio` directly. Do NOT write to `/tmp` folder.
-
-## Network Protocol
-
-SangamIO uses a hybrid UDP/TCP architecture:
-- **UDP** for sensor streaming (low latency, no head-of-line blocking)
-- **TCP** for commands (reliable delivery)
-
-Both use the same port (5555) for simpler configuration.
-
-### Message Format
-
-All messages use length-prefixed framing with Protobuf payloads:
-
-```
-+------------------+------------------+
-| Length (4 bytes) | Protobuf Message |
-| (big-endian)     | (binary)         |
-+------------------+------------------+
-```
-
-### Proto Schema
-
-See `sangam-io/proto/sangamio.proto` for SangamIO messages (sensors, commands).
-
-### Topics (UDP Streaming)
-
-**Outbound (Daemon → Client via UDP)**:
-- `sensors/sensor_status`: Sensor data @ 110Hz (all 13 sensors)
-- `sensors/device_version`: Version info (one-time)
-- `sensors/lidar`: LidarScan @ 5Hz (point cloud)
-
-**Inbound (Client → Daemon via TCP)**:
-- `command`: RobotCommand (SetVelocity, Stop, actuator control, etc.)
-
-### Client Registration
-
-UDP uses unicast (not broadcast). Several clients may be connected at once
-(`[network] max_clients`, default 8; the oldest client not holding the lease is evicted):
-1. Client connects TCP to port 5555
-2. Every client gets the telemetry stream: UDP to `<its IP>:udp_client_port`, or
-   over its TCP socket after `ComponentControl{id:"telemetry", Enable}` (needed
-   for a second client on the same host, which would share the UDP port)
-3. A control lease decides who may drive/switch actuators: taken implicitly by
-   the first controlling command, explicitly with `ComponentControl{id:"lease",
-   Enable{force}}`, released with `Disable`. Stops (drive Disable/Reset, actuator
-   Disable) are accepted from anyone. The drive is zeroed whenever the lease
-   changes hands.
-4. When TCP disconnects (or keepalive fails, ~15 s), the client leaves; if it
-   held the lease, the drive is zeroed
-
-### Example Python Client
-
-```python
-import socket
-import struct
-import threading
-from proto import sangamio_pb2
-
-ROBOT_IP = '192.168.68.101'
-PORT = 5555
-
-# TCP for commands
-tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-tcp_sock.connect((ROBOT_IP, PORT))
-
-# UDP for sensor data (same port)
-udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-udp_sock.bind(('0.0.0.0', PORT))
-
-def receive_sensors():
-    while True:
-        data, addr = udp_sock.recvfrom(4096)
-        length = struct.unpack('>I', data[:4])[0]
-        msg = sangamio_pb2.Message()
-        msg.ParseFromString(data[4:4+length])
-
-        if msg.topic == 'sensors/sensor_status':
-            sg = msg.sensor_group
-            print(f"Battery: {sg.values['battery_level'].u8_val}%")
-
-# Start receiving in background
-threading.Thread(target=receive_sensors, daemon=True).start()
-
-# Send commands via TCP
-def send_command(cmd):
-    payload = cmd.SerializeToString()
-    tcp_sock.send(struct.pack('>I', len(payload)) + payload)
-```
-
-## Configuration
-
-Edit `sangamio.toml`:
-
-```toml
-[device]
-type = "crl200s"
-name = "CRL-200S Vacuum Robot"
-
-[device.hardware]
-gd32_port = "/dev/ttyS3"
-lidar_port = "/dev/ttyS1"
-
-[network]
-bind_address = "0.0.0.0:5555"
-```
-
-## Module Organization
-
-```
-VacuumTiger/
-├── sangam-io/                 # Hardware abstraction daemon
-│   ├── src/
-│   │   ├── main.rs           # Entry point, TCP/UDP listener
-│   │   ├── config.rs         # TOML configuration loading
-│   │   ├── error.rs          # Error types
-│   │   ├── core/             # Core abstractions
-│   │   │   ├── mod.rs
-│   │   │   ├── driver.rs     # DeviceDriver trait
-│   │   │   └── types.rs      # SensorValue, Command types
-│   │   ├── devices/          # Hardware drivers
-│   │   │   ├── mod.rs        # Device factory (crl200s, mock)
-│   │   │   ├── crl200s/      # Real hardware driver
-│   │   │   │   ├── mod.rs
-│   │   │   │   ├── constants.rs      # Offsets, flags, timing
-│   │   │   │   ├── COMMANDS.md       # GD32 command reference
-│   │   │   │   ├── SENSORSTATUS.md   # Sensor packet docs
-│   │   │   │   ├── gd32/             # Motor controller driver
-│   │   │   │   │   ├── mod.rs        # Driver orchestration
-│   │   │   │   │   ├── protocol.rs   # RxPacket, PacketReader
-│   │   │   │   │   ├── packet.rs     # TxPacket, checksum
-│   │   │   │   │   ├── heartbeat.rs  # 20ms watchdog loop
-│   │   │   │   │   ├── reader.rs     # Status parsing
-│   │   │   │   │   ├── commands.rs   # Command handlers
-│   │   │   │   │   └── state.rs      # Shared atomic state
-│   │   │   │   └── delta2d/          # 3iRobotix lidar
-│   │   │   │       ├── mod.rs        # LidarDriver impl
-│   │   │   │       └── protocol.rs   # Packet parsing
-│   │   │   └── mock/         # Simulation driver (--features mock)
-│   │   │       ├── mod.rs           # MockDriver, simulation loop
-│   │   │       ├── config.rs        # SimulationConfig structs
-│   │   │       ├── physics.rs       # Differential drive kinematics
-│   │   │       ├── lidar_sim.rs     # Ray-casting lidar
-│   │   │       ├── imu_sim.rs       # IMU with noise
-│   │   │       ├── encoder_sim.rs   # Encoder with slip
-│   │   │       ├── sensor_sim.rs    # Bumpers, cliffs
-│   │   │       ├── map_loader.rs    # PGM+YAML loader
-│   │   │       └── noise.rs         # Noise generator
-│   │   └── streaming/        # Network communication
-│   │       ├── mod.rs        # Re-exports
-│   │       ├── wire.rs       # Protobuf serialization
-│   │       ├── clients.rs    # Client hub + control lease
-│   │       ├── net.rs        # Keepalive socket options
-│   │       ├── telemetry.rs  # Telemetry fan-out (UDP/TCP)
-│   │       └── tcp_receiver.rs  # TCP command handler
-│   ├── proto/                # Protobuf schema
-│   │   └── sangamio.proto    # Message definitions
-│   ├── maps/                 # Example simulation maps
-│   ├── docs/                 # Documentation
-│   │   └── mock-device-guide.md
-│   ├── sangamio.toml         # Hardware configuration
-│   └── mock.toml             # Simulation configuration
-│
-├── vastu-slam/               # High-performance 2D SLAM library
-│   ├── src/
-│   │   ├── lib.rs            # Library entry point
-│   │   ├── core/             # Foundation types (Pose2D, WorldPoint, GridCoord, sensors)
-│   │   ├── grid/             # Occupancy grid storage (SoA layout, log-odds updates)
-│   │   ├── matching/         # Scan matching (correlative, branch-bound, loop closure)
-│   │   ├── submap/           # Submap manager, pose graph, multi-submap matching
-│   │   ├── config/           # YAML configuration loading
-│   │   ├── io/               # Persistence (.vastu, .pgm, .svg formats)
-│   │   ├── modes/            # Operation modes (localization-only)
-│   │   └── evaluation/       # Cartographer-style evaluation metrics
-│   ├── configs/              # YAML configuration files
-│   ├── maps/                 # Test maps (PGM format)
-│   ├── scenarios/            # Test scenarios (YAML)
-│   ├── benches/              # Performance benchmarks
-│   └── tests/                # Integration tests
-│
-├── dhruva-slam/              # 2D SLAM daemon (Rust) — consumes SangamIO, serves DhruvaStream protocol
-│   ├── src/
-│   │   ├── core/             # Pose2D, lattice, sensor types
-│   │   ├── sensors/          # Odometry fusion, lidar preprocessing
-│   │   ├── algorithms/       # Scan matching, mapping, loop closure
-│   │   ├── engine/           # SLAM orchestration, pose graph
-│   │   ├── navigation/       # Path following, goal handling
-│   │   ├── exploration/      # Frontier exploration
-│   │   ├── threads/          # Worker threads (sensor, slam, cmds)
-│   │   ├── io/               # SangamIO client, TCP streaming, map save/load
-│   │   └── bin/              # Extra binaries (close_loop, etc.)
-│   └── proto/                # dhruva.proto (DhruvaStream/DhruvaCommand)
-│
-├── dhruva-nav/               # Navigation & exploration daemon (Rust)
-│   ├── src/
-│   │   ├── client.rs         # SangamIO command client
-│   │   ├── odometry.rs       # Pose tracking
-│   │   ├── planning/         # Cost map, theta*, smoother
-│   │   ├── exploration/      # Frontier explorer / follower
-│   │   └── threads/          # sensor/mapping/exploration loops
-│   └── proto/                # sangamio.proto copy
-│
-├── drishti/                  # Python visualization client
-│   ├── drishti.py           # Console client (legacy msgpack demo)
-│   ├── drishti_ui.py        # GUI application (subcommands: sensor | slam)
-│   ├── proto/               # Generated protobuf bindings (sangamio_pb2, dhruva_pb2)
-│   └── ui/                  # PyQt widgets
-│       ├── main_window.py
-│       ├── slam_main_window.py
-│       ├── processors/       # Data processing
-│       ├── threads/          # Background workers
-│       └── widgets/          # UI components
-│
-├── slam-test/                # SLAM integration test framework (scripts)
-└── protocol-mitm/            # Reverse engineering tools
-```
-
-## Critical Hardware Constraints
-
-### GD32F103 Heartbeat
-- **Requirement**: CMD=0x66 heartbeat every 20-50ms
-- **Consequence**: Motors stop if heartbeat missed
-- **Implementation**: Dedicated OS thread, not async
-- **Recovery**: 5-second re-initialization sequence
-
-### Serial Port Exclusivity
-- **Ports**: `/dev/ttyS3` (GD32), `/dev/ttyS1` (lidar)
-- **Issue**: Only one process can open port
-- **Solution**: Kill/rename AuxCtrl before running
-
-### Initialization Sequence
-- **GD32 Wake**: CMD=0x08 repeated for up to 5 seconds
-- **Required**: Must complete before any commands work
-- **Automatic**: Driver handles this internally
-
-## Protocol Specifications
-
-### GD32 Protocol
-- **Format**: `[0xFA 0xFB] [LEN] [CMD] [PAYLOAD] [CRC]`
-- **CRC**: 16-bit big-endian word sum checksum
-- **Status**: CMD=0x15, 96 bytes @ 110Hz
-- **Location**: `src/devices/crl200s/gd32/protocol.rs`
-
-### Delta-2D Protocol
-- **Format**: Variable-length with 8-byte headers
-- **Data**: Angle (0.01° units), distance (0.25mm units)
-- **Rate**: ~5Hz complete scans
-- **Location**: `src/devices/crl200s/delta2d/protocol.rs`
-
-## Performance Characteristics
-
-- **Binary Size**: ~350KB statically linked
-- **Memory Usage**: <10MB RSS
-- **CPU Usage**: <1% on Allwinner A33
-- **Latency**: <25ms command-to-action
-- **Streaming Rates**:
-  - Telemetry: 110Hz (every GD32 packet)
-  - Lidar: 5Hz (native scan rate)
-  - Commands: On-demand
-
-## Thread Model
-
-| Thread | Purpose | Timing | Priority |
-|--------|---------|--------|----------|
-| Main | Initialization | - | Normal |
-| GD32 Heartbeat | Safety watchdog | 20ms ± 2ms | High |
-| GD32 Reader | Parse status | Continuous | Normal |
-| Lidar Reader | Parse scans | Continuous | Normal |
-| TCP Publisher | Broadcast data | On-demand | Normal |
-| TCP Receiver | Handle commands | On-demand | Normal |
-
-## Safety and Error Handling
-
-- **Never use `unwrap()` or `panic!()`** in production code
-- **All errors through `sangam_io::Error` enum**
-- **Motors stop on any error condition**
-- **Heartbeat continues even if commands fail**
-- **Use `Result<T>` for fallible operations**
-
-## Testing and Debugging
-
-### Local Testing
-
-```bash
-# Unit tests
-cargo test
-
-# Virtual serial ports
-socat -d -d pty,raw,echo=0 pty,raw,echo=0
-
-# Run with PTY
-RUST_LOG=debug cargo run -- --config test.toml
-```
-
-### Hardware Testing
-
-```bash
-# Deploy and run
-./deploy.sh
-
-# Monitor logs
-ssh root@vacuum "journalctl -u sangamio -f"
-
-# Check resources
-ssh root@vacuum "top -p $(pgrep sangamio)"
-```
-
-## Drishti Visualization
-
-### GUI Application
-
-```bash
-cd drishti
-python -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
-python drishti_ui.py sensor --robot 192.168.68.101
-```
-
-Modes:
-- `sensor`: raw sensor visualization from SangamIO
-- `slam`: map + navigation from DhruvaSLAM (`python drishti_ui.py slam --host localhost`)
-
-Features:
-- Full-screen robot diagram with physically-correct layout
-- Real-time sensor overlays (all 13 sensors)
-- Bumper/cliff highlighting on trigger
-- Wheel encoder tick counters
-- Battery/charging status indicator
-- Start/dock button states
-
-### Console Client (Legacy)
-
-```bash
-python drishti.py --robot 192.168.68.101 --verbose
-```
-
-## Common Pitfalls and Solutions
-
-1. **AuxCtrl Auto-Restart**: Must rename binary, not just kill process
-2. **Serial Port Access**: Check `/dev/ttyS3` for GD32, not `/dev/ttyS1`
-3. **No SCP Support**: Use `cat | ssh` for file transfer
-4. **Unit Confusion**: Always use meters, m/s, radians in API
-5. **Blocking I/O**: Serial has timeouts, don't assume immediate response
-
-## Version History
-
-### SangamIO
-- **v0.3.0**: UDP/TCP unified port architecture, mock device simulation
-- **v0.2.0**: Daemon architecture, performance optimizations
-- **v0.1.0**: Initial release with basic functionality
-
-### VastuSLAM
-- **v0.1.0**: High-performance 2D SLAM library with scan matching, submap architecture, and loop closure
-
-## Documentation References
-
-- **sangam-io/README.md**: SangamIO daemon documentation
-- **sangam-io/COMMANDS.md**: GD32 command reference with TCP API
-- **sangam-io/SENSORSTATUS.md**: Sensor packet byte layout
-- **vastu-slam/README.md**: VastuSLAM library documentation
-- **vastu-slam/src/*/README.md**: Module-specific documentation (core, grid, matching, submap, config, io, modes, evaluation)
-- **drishti/README.md**: Python client documentation
-- **protocol-mitm/README.md**: MITM reverse engineering tools
-
-## Future Roadmap
-
-### Planned Features
-- WebSocket interface for browser monitoring
-- ROS2 bridge for ecosystem integration
-- Additional lidar models (RPLIDAR, Hokuyo)
-- Multi-robot coordination support
-
-### Explicitly Not Goals
-- Generic HAL for all hardware
-- Plugin system (static compilation preferred)
-- Remote/cloud operation (LAN-only)
-- AI/ML integration (keep in higher layers)
-
-## Development Guidelines
-
-When modifying this codebase:
-
-1. **Maintain simplicity**: Avoid unnecessary abstractions
-2. **Prioritize reliability**: Real-time constraints matter
-3. **Document changes**: Update relevant documentation
-4. **Test on hardware**: Virtual tests insufficient
-5. **Preserve safety**: Never bypass heartbeat mechanism
+Format only what you touch:
+- `rustfmt --edition 2024 --config skip_children=true <files>`.
+- dwar is not rustfmt-clean, so don't reformat it.
+
+## Conventions
+
+- Safety first in SangamIO:
+  - The GD32 holds the last velocity forever and needs a heartbeat every 20–50 ms
+    (`sangamio/README.md`).
+  - Only one process can own `/dev/ttyS3` (GD32) and `/dev/ttyS1` (lidar). The robot scripts stop
+    the vendor's AuxCtrl first.
+  - Never weaken the heartbeat, the dead-man or the refusal of the dangerous MCU commands.
+  - No `unwrap()` on the robot's runtime paths.
+- Algorithms are tested headless and deterministically. Call strategies and the mock's physics,
+  lidar and bumpers as a library. Don't run daemons in real time.
+- Small, single-purpose commits, each reviewed first (see `../CLAUDE.md`). Never push without the
+  owner's OK.

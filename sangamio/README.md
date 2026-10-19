@@ -99,6 +99,10 @@ it with another firmware build.
 
 ## Deployment
 
+> **Not on the viomi v8.** This is upstream's deploy: it writes `/usr/sbin` and `/etc`, which is
+> flash on the v8. The v8-integration fork runs from RAM instead (`scripts/deploy.sh` → `/tmp/v8`,
+> see the project's `CLAUDE.md`).
+
 **SSH**: `root@vacuum` (see project docs for credentials)
 
 ```bash
