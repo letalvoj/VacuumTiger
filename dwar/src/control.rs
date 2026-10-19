@@ -8,10 +8,12 @@
 //! - Drive commands are clamped to `[control]` limits. No command for
 //!   `deadman_ms` -> zero velocity. SangamIO's heartbeat dead-man
 //!   (`deadman_timeout_ms`) stays as the layer below.
-//! - STOP (anyone) zeroes everything and revokes teleop: the holder must take
-//!   it again, so a joystick still held can't undo a STOP.
+//! - STOP (anyone) zeroes everything, ends DhruvaSLAM's mapping (and with it
+//!   an autonomous sweep) and revokes teleop: the holder must take it again,
+//!   so a joystick still held can't undo a STOP.
 
 use crate::hub::{Action, Hub};
+use crate::proto::dhruva::{self, dhruva_command::Command as Dc};
 use crate::proto::sangamio::sensor_value::Value as V;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -111,11 +113,21 @@ impl Hub {
         Ok(())
     }
 
-    /// Emergency stop: zero the drive, cleaning actuators off, revoke teleop
-    /// and give SangamIO's lease back (so a SLAM controller isn't locked out).
-    /// SangamIO accepts the stops from any client; they jump the queue.
+    /// Emergency stop: halt DhruvaSLAM's autonomous drive (exploration), zero
+    /// the drive, cleaning actuators off, revoke teleop and give SangamIO's
+    /// lease back (so a SLAM controller isn't locked out). DhruvaSLAM is told
+    /// first, which narrows (not closes) the window in which its exploration
+    /// takes the freed lease again; its next tick after the command disables
+    /// the drive itself. SangamIO accepts the stops from any client; they jump
+    /// the queue.
     pub fn stop_all(&self, why: &str) -> Result<(), String> {
         let holder = std::mem::take(&mut *self.teleop()).holder;
+        let mut dhruva_stopped = true; // offline: nothing autonomous is driving
+        let dhruva_connected = self.shared().dhruva_connected;
+        if dhruva_connected && let Err(e) = self.dhruva(Dc::EmergencyStop(dhruva::EmergencyStopCommand {})) {
+            self.event("warn", format!("STOP not delivered to DhruvaSLAM: {}", e));
+            dhruva_stopped = false;
+        }
         let mut queued = true;
         for id in stop_components() {
             queued &= self.sangam_urgent(id, Action::Disable, &[]);
@@ -130,6 +142,9 @@ impl Hub {
         self.event("warn", format!("STOP ({}){}", why, holder.map_or(String::new(), |h| format!(", teleop of session #{} revoked", h))));
         if !self.shared().sangam_connected {
             return Err("SangamIO offline: STOP not delivered".into());
+        }
+        if !dhruva_stopped {
+            return Err("DhruvaSLAM did not get the STOP: an autonomous sweep may drive on".into());
         }
         if queued { Ok(()) } else { Err("command queue full: STOP may not have been delivered".into()) }
     }
