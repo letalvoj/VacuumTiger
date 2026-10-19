@@ -202,3 +202,29 @@ fn print_reasons(outcomes: &[Outcome]) {
         println!("{status:<40} {ticks:>7} {:>8.3}", speed / ticks as f32);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// wall_follow's scenario tests: every scene as on the robot, with a seed the climb did
+    /// not see (it climbs on the first few).
+    #[test]
+    fn the_v8_sweep_closes_every_lap_and_reaches_every_corner() {
+        let (config, sim) = settings(CONFIG.as_ref(), SIM.as_ref()).unwrap();
+        for scene in scene::scenes() {
+            let run = run::run(&scene, &config, sim.clone(), 7).unwrap();
+            let s = score::score(&scene, &run);
+            assert!(s.completed, "{}: {:?}", scene.name, run.ended);
+            // The body reaches 6 cm into a corner (0.1 m allows for noise); the curtain's
+            // corners are behind the fabric.
+            let reach = if scene.curtains.is_empty() { 0.1 } else { 0.2 };
+            assert!(
+                s.worst_corner() < reach,
+                "{}: corners {:?}",
+                scene.name,
+                s.corners
+            );
+        }
+    }
+}

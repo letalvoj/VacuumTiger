@@ -227,7 +227,10 @@ mod tests {
             a.path, b.path,
             "the climb compares runs: a seed must replay"
         );
-        assert!(!a.bumps.is_empty(), "it reached a wall");
+        let travelled: f32 = (a.path.windows(2))
+            .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
+            .sum();
+        assert!(travelled > 2.0, "it swept: {travelled:.2} m");
         // SLAM's belief at its last tick, a period before the end, against the truth then.
         let (bx, by, bt) = *a.belief.last().unwrap();
         let (tx, ty, tt) = a.path[a.path.len() - (period / a.dt).round() as usize];

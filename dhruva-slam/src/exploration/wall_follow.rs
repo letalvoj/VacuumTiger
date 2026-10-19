@@ -1,68 +1,66 @@
 //! Wall following: the corner sweep (scout).
 //!
-//! Follows a wall on one side (the side brush's) into every corner until the robot is back
-//! where the lap started. It does not hold a distance: it steers slightly into the wall so
-//! that, were the wall straight, it would touch it again after `bump_every` metres. Every
-//! touch puts the body against the wall, so the brush reaches the edge even where the lidar
-//! is wrong about the distance (glass, mirrors, dark surfaces); the lidar only gives the
-//! wall's direction. Obstacles are the latest scan plus remembered contacts (bumps and
-//! cliffs), so an obstacle the lidar misses is followed like a wall once it has been touched.
-//! A fence (virtual wall points, e.g. across a room's doorways) is followed too, though it is
-//! never touched. Contacts and the fence are in the world frame of when they were made and do
-//! not move with loop closures.
+//! Follows the edge of the room on one side (the side brush's) into every corner until the
+//! robot is back where the lap started. The edge is the nearest obstacle point on that side
+//! (or what blocks the way): the robot keeps it beside the body, `hover_gap` off, so one rule
+//! runs along walls, turns in inner corners, and hugs outer corners and legs round (the point
+//! followed is kept as it passes behind). From far away the same rule drives straight at the
+//! nearest point on the wall side, which is how a sweep starts.
+//!
+//! The lidar steers; the bumper corrects. A bump on something the lidar sees backs off a
+//! little and nudges away. What the bumper touches where the lidar sees nothing (glass) is a
+//! wall ahead: kept as a short line across the contact for a while, it is turned alongside
+//! and followed like a seen one; so are cliffs. A fence (virtual wall points, e.g. across a
+//! room's doorways) is an edge too, though it is never touched. Contacts and the fence are in
+//! the world frame of when they were made and do not move with loop closures.
+//!
+//! Known limit: a sweep that starts nearer a free-standing island than a wall follows the
+//! island round and closes its lap there.
+//!
+//! Scenario tests (rooms, legs, chairs, curtains, glass) are the lab's sweep bench,
+//! `dhruva-lab/src/bin/sweep`, closed loop through SangamIO's mock and the SLAM.
 //!
 //! The control logic is written for a wall on the right; a wall on the left mirrors the
 //! robot-frame inputs (y → -y) and the turn direction.
 
 use std::collections::VecDeque;
-use std::f32::consts::{FRAC_PI_4, TAU};
+use std::f32::consts::FRAC_PI_2;
 
 use serde::Deserialize;
 
-use crate::algorithms::matching::Line2D;
 use crate::core::math::angle_diff;
 use crate::core::types::{Point2D, PointCloud2D, Pose2D};
 use crate::state::CurrentMapData;
 
-use super::strategy::{ExplorationAction, ExplorationStrategy, HazardEvent};
+use super::strategy::{ExplorationAction, ExplorationStrategy, HazardEvent, HazardType};
 
-/// Obstacle closer than this to the front of the body blocks the way (m).
-const FRONT_CLEARANCE: f32 = 0.01;
-/// The wall-side window: from this far behind the centre…
-const SIDE_BEHIND: f32 = 0.05;
-/// …to this far ahead of it (m)…
-const SIDE_AHEAD: f32 = 0.30;
-/// …and sideways from this fraction of the body radius (so a wall ahead is not mistaken
-/// for the side wall)…
-const SIDE_INNER: f32 = 0.8;
-/// …out to this far from the body (m).
-const SIDE_SLACK: f32 = 0.25;
-/// Turn rate per radian of heading error.
-const K_ANGLE: f32 = 1.2;
-/// Smallest angle into the wall (rad): already touching, it still leans in.
-const MIN_APPROACH: f32 = 0.01;
-/// Travel over which the robot aims to close the gap when the next touch is due (m).
-const MIN_APPROACH_RUN: f32 = 0.3;
-/// Farther off the wall than this (m), close in within `CLOSE_RUN` rather than when the
-/// next touch is due.
-const MAX_GAP: f32 = 0.03;
-/// Travel over which a gap wider than `MAX_GAP` is closed (m).
-const CLOSE_RUN: f32 = 0.5;
-/// Contacts (bumps, cliffs) remembered as obstacle points. They are kept in the world frame
-/// and not moved by loop closures; only the ones near the robot matter.
-const MAX_CONTACTS: usize = 64;
-/// Obstacle points within this distance of a contact describe what was hit (m).
-const CONTACT_RADIUS: f32 = 0.25;
-/// Turn range after a contact (rad, away from the wall).
-const MIN_CONTACT_TURN: f32 = 0.05;
-const MAX_CONTACT_TURN: f32 = 1.6;
-/// Reverse this far after a contact (m) at this speed (m/s).
-const BACKOFF_DISTANCE: f32 = 0.02;
+/// Edge points are not behind the centre by more than this (m): the dock just left is.
+const BEHIND: f32 = 0.05;
+/// The edge point moves less than this per tick (m) while followed.
+const EDGE_TRACK: f32 = 0.04;
+/// The edge is the centroid of the points at most this much farther than the nearest (m),
+/// about the lidar's range noise, and within this of it (m): one surface, not the next leg.
+const EDGE_BAND: f32 = 0.02;
+const EDGE_SPAN: f32 = 0.15;
+/// Reverse after a bump at this speed (m/s).
 const BACKOFF_SPEED: f32 = 0.08;
-/// A turn in place is done within this angle (rad).
+/// Contacts the lidar did not see (glass, cliffs) are obstacles for this much travel (m):
+/// points every `CONTACT_STEP` (m) along a line across the contact, this far each side (m).
+const CONTACT_KEEP: f32 = 1.5;
+const CONTACT_STEP: f32 = 0.02;
+const CONTACT_SPAN: f32 = 0.1;
+/// A scan point this near a contact (m) is what was touched: the bumper's position is only
+/// known to within its zone.
+const EXPLAINED: f32 = 0.06;
+/// Following has started once the body is this close to the edge (m).
+const ON_EDGE: f32 = 0.05;
+/// A turn in place is done within this angle (rad); it turns at `SPIN_GAIN` per radian
+/// left (1/s), at least `MIN_SPIN` (rad/s).
 const TURN_TOLERANCE: f32 = 0.06;
-/// Ticks after which a back-off gives up (it reverses blind: 1 s at 10 Hz, ≤ 8 cm)…
-const MAX_BACKOFF_TICKS: u32 = 10;
+const SPIN_GAIN: f32 = 2.0;
+const MIN_SPIN: f32 = 0.2;
+/// Ticks after which a back-off gives up (blind: 1.5 s at 10 Hz)…
+const MAX_BACKOFF_TICKS: u32 = 15;
 /// …and a turn in place (stuck guard, 10 s).
 const MAX_TURN_TICKS: u32 = 100;
 /// Pose steps longer than this are relocalisation jumps, not travel (m).
@@ -86,12 +84,9 @@ pub struct WallFollowConfig {
     /// Robot body radius (m); taken from `[navigation] robot_radius`.
     #[serde(skip)]
     pub robot_radius: f32,
-    /// Steer into the wall so that, were it straight, the robot touches it again after
-    /// this much travel (m).
-    pub bump_every: f32,
     /// Forward speed (m/s).
     pub speed: f32,
-    /// Turn rate in corners (rad/s).
+    /// Turn rate on the spot (rad/s).
     pub turn_rate: f32,
     /// A lap is closed back within this distance of where following started (m)…
     pub lap_radius: f32,
@@ -99,6 +94,8 @@ pub struct WallFollowConfig {
     pub lap_min_distance: f32,
     /// Stop after this much travel in total (m).
     pub max_distance: f32,
+    /// The controller's gains, as tuned on the lab's sweep bench (`dhruva-lab/src/bin/sweep`).
+    pub tuning: Tuning,
 }
 
 impl Default for WallFollowConfig {
@@ -106,31 +103,67 @@ impl Default for WallFollowConfig {
         Self {
             side: WallSide::Right,
             robot_radius: 0.17,
-            bump_every: 2.5,
             speed: 0.15,
-            turn_rate: 0.6,
+            turn_rate: 0.5,
             lap_radius: 0.3,
             lap_min_distance: 3.0,
             max_distance: 300.0,
+            tuning: Tuning::default(),
+        }
+    }
+}
+
+/// How the edge is followed (`[exploration.wall_follow.tuning]`).
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct Tuning {
+    /// Gap kept between the body and an edge the lidar sees where it is (m).
+    pub hover_gap: f32,
+    /// Bend towards the edge per metre of gap beyond the wanted one (rad/m)…
+    pub k_gap: f32,
+    /// …and at most this far away from it when too close (rad).
+    pub max_bend_away: f32,
+    /// Turn rate per radian of heading error while driving (1/s).
+    pub k_turn: f32,
+    /// A heading error above this (rad) is turned on the spot; below it the robot drives.
+    pub spin_angle: f32,
+    /// A point the body would hit within this much more travel (m) blocks the way and is the
+    /// edge, on either side: a wall ahead takes over from the one alongside as the body
+    /// reaches it, so the corner gets swept.
+    pub front_look: f32,
+    /// Reverse this far after a bump (m), room to turn on the spot…
+    pub backoff_distance: f32,
+    /// …then nudge away by this much (rad).
+    pub nudge: f32,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            hover_gap: 0.02,
+            k_gap: 7.7,
+            max_bend_away: 0.27,
+            k_turn: 2.0,
+            spin_angle: 0.35,
+            front_look: 0.067,
+            backoff_distance: 0.033,
+            nudge: 0.8,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Phase {
-    /// Drive to the nearest obstacle.
-    Seek,
-    /// Follow the wall; `blind` is how far the robot has turned (rad) since it last saw it.
-    Follow {
-        blind: f32,
-    },
-    /// Reverse from `from` after a contact, then turn away from the wall by `turn` (rad).
+    /// Follow the edge (or drive to the nearest one).
+    Edge,
+    /// Reverse `distance` (m) from `from` after a bump, then turn by `turn` (rad, mirrored).
     BackOff {
         from: Pose2D,
+        distance: f32,
         turn: f32,
         ticks: u32,
     },
-    /// Turn in place to `heading`.
+    /// Turn in place to `heading`, then follow the edge.
     Turn {
         heading: f32,
         ticks: u32,
@@ -138,45 +171,19 @@ enum Phase {
     Done,
 }
 
-/// A wall seen from the robot: `angle` is the heading (relative to the robot's) that runs
-/// along it with the wall on the robot's right; `distance` is from the robot centre (m).
-#[derive(Debug, Clone, Copy)]
-struct WallLine {
-    angle: f32,
-    distance: f32,
-}
-
-/// The wall through `points` (robot frame), from a total least-squares line fit.
-fn wall_line(points: &[Point2D]) -> Option<WallLine> {
-    if points.len() < 3 {
-        return None;
-    }
-    let line = Line2D::fit(points)?;
-    // Along the line is (-b, a); the robot (origin) is on its left when c < 0.
-    let (ux, uy) = if line.c < 0.0 {
-        (-line.b, line.a)
-    } else {
-        (line.b, -line.a)
-    };
-    Some(WallLine {
-        angle: uy.atan2(ux),
-        distance: line.c.abs(),
-    })
-}
-
-/// Corner sweep: follow walls into every corner and around the room.
+/// Corner sweep: follow the room's edge into every corner and around the room.
 pub struct WallFollower {
     config: WallFollowConfig,
     phase: Phase,
-    /// Contact points (world frame), oldest first.
-    contacts: VecDeque<Point2D>,
+    /// Contacts the lidar did not see (world frame) and `travelled` when made, oldest first.
+    contacts: VecDeque<(Point2D, f32)>,
     last_pose: Option<Pose2D>,
     travelled: f32,
-    /// `travelled` by which the robot means to touch the wall again.
-    touch_due: f32,
     /// Where following started (world frame, not moved by loop closures) and the distance
     /// travelled by then.
     lap_start: Option<(Point2D, f32)>,
+    /// The edge point followed last tick (world frame).
+    last_edge: Option<Point2D>,
     /// Virtual wall points (world frame), followed like real ones.
     fence: Vec<Point2D>,
 }
@@ -191,12 +198,12 @@ impl WallFollower {
     pub fn fenced(config: WallFollowConfig, fence: Vec<Point2D>) -> Self {
         Self {
             config,
-            phase: Phase::Seek,
+            phase: Phase::Edge,
             contacts: VecDeque::new(),
             last_pose: None,
             travelled: 0.0,
-            touch_due: 0.0,
             lap_start: None,
+            last_edge: None,
             fence,
         }
     }
@@ -210,71 +217,115 @@ impl WallFollower {
     }
 
     /// A world point in the (mirrored) robot frame.
-    fn to_robot(&self, pose: &Pose2D, x: f32, y: f32) -> Point2D {
-        let p = pose.inverse().compose(&Pose2D::new(x, y, 0.0));
+    fn to_robot(&self, pose: &Pose2D, p: &Point2D) -> Point2D {
+        let p = pose.inverse().compose(&Pose2D::new(p.x, p.y, 0.0));
         Point2D::new(p.x, self.mirror() * p.y)
     }
 
-    /// Scan points, remembered contacts and the fence, in the (mirrored) robot frame.
-    fn obstacles(&self, pose: &Pose2D, scan: &PointCloud2D) -> Vec<Point2D> {
+    /// A (mirrored) robot-frame point in the world frame.
+    fn to_world(&self, pose: &Pose2D, p: &Point2D) -> Point2D {
+        let w = pose.compose(&Pose2D::new(p.x, self.mirror() * p.y, 0.0));
+        Point2D::new(w.x, w.y)
+    }
+
+    /// Scan points in the (mirrored) robot frame.
+    fn seen(&self, scan: &PointCloud2D) -> Vec<Point2D> {
         let m = self.mirror();
-        let scan_points = scan
-            .xs
-            .iter()
-            .zip(&scan.ys)
-            .map(|(&x, &y)| Point2D::new(x, m * y));
-        let remembered = (self.contacts.iter()).chain(&self.fence);
-        let remembered = remembered.map(|c| self.to_robot(pose, c.x, c.y));
-        scan_points.chain(remembered).collect()
+        (scan.xs.iter().zip(&scan.ys))
+            .map(|(&x, &y)| Point2D::new(x, m * y))
+            .collect()
     }
 
-    /// Updates the distance travelled; returns the heading change since the last tick.
-    fn track(&mut self, pose: &Pose2D) -> f32 {
-        let turned = match self.last_pose {
-            Some(last) => {
-                let step = (pose.x - last.x).hypot(pose.y - last.y);
-                if step < MAX_POSE_STEP {
-                    self.travelled += step;
-                }
-                angle_diff(last.theta, pose.theta)
-            }
-            None => 0.0,
-        };
-        self.last_pose = Some(*pose);
-        turned
-    }
-
-    fn front_blocked(&self, points: &[Point2D]) -> bool {
-        let r = self.config.robot_radius;
+    /// Scan points, kept contacts and the fence, in the (mirrored) robot frame.
+    fn obstacles(&self, pose: &Pose2D, scan: &PointCloud2D) -> Vec<Point2D> {
+        let remembered = (self.contacts.iter().map(|(c, _)| c)).chain(&self.fence);
+        let mut points = self.seen(scan);
+        points.extend(remembered.map(|c| self.to_robot(pose, c)));
         points
-            .iter()
-            .any(|p| p.x > 0.0 && p.x < r + FRONT_CLEARANCE && p.y.abs() < r)
     }
 
-    fn side_wall(&self, points: &[Point2D]) -> Option<WallLine> {
+    /// Updates the distance travelled and forgets old contacts.
+    fn track(&mut self, pose: &Pose2D) {
+        if let Some(last) = self.last_pose {
+            let step = (pose.x - last.x).hypot(pose.y - last.y);
+            if step < MAX_POSE_STEP {
+                self.travelled += step;
+            }
+        }
+        self.last_pose = Some(*pose);
+        while (self.contacts.front()).is_some_and(|&(_, at)| self.travelled - at > CONTACT_KEEP) {
+            self.contacts.pop_front();
+        }
+    }
+
+    /// Travel (m) before the body would hit `p` driving straight on, if it is in the way.
+    fn free_travel(&self, p: &Point2D) -> Option<f32> {
         let r = self.config.robot_radius;
-        let (inner, outer) = (-SIDE_INNER * r, -(r + SIDE_SLACK));
-        let window: Vec<Point2D> = points
-            .iter()
-            .filter(|p| p.x > -SIDE_BEHIND && p.x < SIDE_AHEAD && p.y < inner && p.y > outer)
-            .copied()
-            .collect();
-        wall_line(&window)
+        (p.x > 0.0 && p.y.abs() < r).then(|| p.x - (r * r - p.y * p.y).sqrt())
     }
 
-    /// How far to turn away from the wall after touching something at `contact`: parallel
-    /// to the obstacle when the lidar or earlier contacts saw it, else by where it was hit.
-    fn turn_after_contact(points: &[Point2D], contact: Point2D) -> f32 {
-        let near: Vec<Point2D> = points
-            .iter()
-            .filter(|p| p.distance(&contact) < CONTACT_RADIUS)
-            .copied()
-            .collect();
-        let turn = match wall_line(&near) {
-            Some(line) => line.angle,
-            None => contact.y.atan2(contact.x) + FRAC_PI_4,
+    /// The point that blocks the way within `front_look`, the nearest hit first.
+    fn blocking(&self, points: &[Point2D]) -> Option<Point2D> {
+        (points.iter())
+            .filter_map(|p| self.free_travel(p).map(|s| (p, s)))
+            .filter(|&(_, s)| s < self.config.tuning.front_look)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(p, _)| *p)
+    }
+
+    /// The edge point (robot frame, mirrored) and its distance from the centre: what blocks
+    /// the way, else the nearest point on the wall side, not behind unless it is still the
+    /// one followed (`last`, the previous edge point): an outer corner is hugged round.
+    fn edge(&self, points: &[Point2D], last: Option<Point2D>) -> Option<(Point2D, f32)> {
+        let near_last =
+            |p: &Point2D| last.is_some_and(|l| (p.x - l.x).hypot(p.y - l.y) < EDGE_TRACK);
+        let distance = |p: &&Point2D| p.x.hypot(p.y);
+        let side = || {
+            (points.iter())
+                .filter(|p| (p.x > -BEHIND || near_last(p)) && p.y < 0.0)
+                .min_by(|a, b| distance(a).total_cmp(&distance(b)))
+                .copied()
         };
-        turn.clamp(MIN_CONTACT_TURN, MAX_CONTACT_TURN)
+        let p = self.blocking(points).or_else(side)?;
+        let c = Self::centroid_near(points, p);
+        Some((c, c.x.hypot(c.y)))
+    }
+
+    /// The centroid of the points about as near as `p` and next to it. On a flat wall the
+    /// nearest point's bearing jumps by tens of degrees with a centimetre of range noise. The
+    /// near points around it lie symmetric about the foot of the perpendicular, so their
+    /// centroid does not jump. `p` is one of `points`, so there is at least one.
+    fn centroid_near(points: &[Point2D], p: Point2D) -> Point2D {
+        let d = p.x.hypot(p.y);
+        let near = (points.iter())
+            .filter(|q| q.x.hypot(q.y) - d < EDGE_BAND && (q.x - p.x).hypot(q.y - p.y) < EDGE_SPAN);
+        let (sx, sy, n) = near.fold((0.0, 0.0, 0), |(sx, sy, n), q| (sx + q.x, sy + q.y, n + 1));
+        Point2D::new(sx / n as f32, sy / n as f32)
+    }
+
+    /// The turn rate on the spot for `error` (rad, mirrored): `SPIN_GAIN` per radian, at
+    /// least `MIN_SPIN` so it does not stall, at most `turn_rate`.
+    fn spin(&self, error: f32) -> f32 {
+        let rate = (SPIN_GAIN * error.abs()).clamp(MIN_SPIN, self.config.turn_rate);
+        rate * error.signum()
+    }
+
+    /// Turns by `error` (rad, mirrored): on the spot when it is large, else while driving.
+    fn steer(&self, error: f32, reason: &'static str) -> (f32, f32, &'static str) {
+        let cfg = self.config;
+        if error.abs() > cfg.tuning.spin_angle {
+            (0.0, self.spin(error), reason)
+        } else {
+            let angular = (cfg.tuning.k_turn * error).clamp(-cfg.turn_rate, cfg.turn_rate);
+            (cfg.speed, angular, reason)
+        }
+    }
+
+    /// Turns on the spot to `heading`; `None` once there.
+    fn turn_to(&self, pose: &Pose2D, heading: f32) -> Option<(f32, f32, &'static str)> {
+        let remaining = self.mirror() * angle_diff(pose.theta, heading);
+        (remaining.abs() >= TURN_TOLERANCE)
+            .then(|| (0.0, self.spin(remaining), "turning on the spot"))
     }
 
     fn lap_closed(&self, pose: &Pose2D) -> bool {
@@ -284,100 +335,127 @@ impl WallFollower {
         })
     }
 
+    /// Whether the scan has a point within `EXPLAINED` of the contact `at` (world frame).
+    fn explains(&self, pose: &Pose2D, scan: &PointCloud2D, at: &Point2D) -> bool {
+        let at = self.to_robot(pose, at);
+        (self.seen(scan).iter()).any(|p| (p.x - at.x).hypot(p.y - at.y) < EXPLAINED)
+    }
+
+    /// Records a bump or cliff and starts backing off it.
+    fn on_hazard(&mut self, hazard: &HazardEvent, pose: &Pose2D, scan: &PointCloud2D) {
+        let at = Point2D::new(hazard.world_position.x, hazard.world_position.y);
+        let nudge = self.config.tuning.nudge;
+        let away_side = match self.config.side {
+            WallSide::Right => HazardType::BumperLeft,
+            WallSide::Left => HazardType::BumperRight,
+        };
+        let turn = if !hazard.hazard_type.is_cliff() && self.explains(pose, scan, &at) {
+            // The lidar sees what was touched: nudge away from the wall, unless the bump is
+            // on the side away from it.
+            if hazard.hazard_type == away_side {
+                -nudge
+            } else {
+                nudge
+            }
+        } else {
+            // Glass, or a cliff: nothing the lidar sees is there. What the shell touched runs
+            // along it there: a short line across the contact's bearing, a wall ahead, turned
+            // alongside as one seen.
+            let (s, c) = hazard.world_position.theta.sin_cos();
+            let n = (CONTACT_SPAN / CONTACT_STEP).round() as i32;
+            for k in -n..=n {
+                let along = k as f32 * CONTACT_STEP;
+                let p = Point2D::new(at.x - along * s, at.y + along * c);
+                self.contacts.push_back((p, self.travelled));
+            }
+            let c = self.to_robot(pose, &at);
+            c.y.atan2(c.x) + FRAC_PI_2
+        };
+        let here = (Point2D::new(pose.x, pose.y), self.travelled);
+        self.lap_start.get_or_insert(here);
+        self.phase = Phase::BackOff {
+            from: *pose,
+            distance: self.config.tuning.backoff_distance,
+            turn,
+            ticks: 0,
+        };
+    }
+
     /// The (mirrored) velocity command for this tick, moving through phase transitions.
-    fn step(&mut self, pose: &Pose2D, points: &[Point2D], turned: f32) -> (f32, f32, &'static str) {
+    fn step(&mut self, pose: &Pose2D, points: &[Point2D]) -> (f32, f32, &'static str) {
         let cfg = self.config;
+        let r = cfg.robot_radius;
         loop {
             match self.phase {
-                Phase::Seek => {
-                    if self.front_blocked(points) || self.side_wall(points).is_some() {
-                        self.phase = Phase::Follow { blind: 0.0 };
-                        continue;
-                    }
-                    let nearest = points
-                        .iter()
-                        .min_by(|a, b| a.x.hypot(a.y).total_cmp(&b.x.hypot(b.y)));
-                    return match nearest {
-                        None => (0.0, 0.0, "waiting for the lidar"),
-                        Some(p) => {
-                            let bearing = p.y.atan2(p.x);
-                            if bearing.abs() > 0.4 {
-                                (
-                                    0.0,
-                                    cfg.turn_rate * bearing.signum(),
-                                    "turning to the nearest wall",
-                                )
-                            } else {
-                                (cfg.speed, K_ANGLE * bearing, "driving to the nearest wall")
-                            }
-                        }
-                    };
-                }
-                Phase::Follow { blind } => {
-                    // The lap starts where following first does (from Seek or a bump).
-                    let here = (Point2D::new(pose.x, pose.y), self.travelled);
-                    self.lap_start.get_or_insert(here);
+                Phase::Edge => {
                     if self.lap_closed(pose) {
                         self.phase = Phase::Done;
                         continue;
                     }
-                    if self.front_blocked(points) {
-                        self.phase = Phase::Follow { blind: 0.0 };
-                        return (0.0, cfg.turn_rate, "inner corner");
+                    let last = self.last_edge.map(|w| self.to_robot(pose, &w));
+                    let Some((p, d)) = self.edge(points, last) else {
+                        self.last_edge = None;
+                        if points.is_empty() {
+                            return (0.0, 0.0, "waiting for the lidar");
+                        }
+                        return (cfg.speed, 0.0, "driving ahead to find a wall");
+                    };
+                    self.last_edge = Some(self.to_world(pose, &p));
+                    let gap = d - r;
+                    if gap < ON_EDGE {
+                        let here = (Point2D::new(pose.x, pose.y), self.travelled);
+                        self.lap_start.get_or_insert(here);
                     }
-                    if let Some(wall) = self.side_wall(points) {
-                        self.phase = Phase::Follow { blind: 0.0 };
-                        // Aim into the wall to touch it when the touch is due: the angle
-                        // steepens as that point comes closer. Too far off, close in now.
-                        let gap = (wall.distance - cfg.robot_radius).max(0.0);
-                        let due = if gap > MAX_GAP {
-                            CLOSE_RUN
-                        } else {
-                            self.touch_due - self.travelled
-                        };
-                        let run = due.max(MIN_APPROACH_RUN);
-                        let approach = gap.atan2(run).max(MIN_APPROACH);
-                        let angular = (K_ANGLE * (wall.angle - approach))
-                            .clamp(-cfg.turn_rate, cfg.turn_rate);
-                        return (cfg.speed, angular, "following the wall");
-                    }
-                    let blind = blind + turned.abs();
-                    if blind > TAU {
-                        // Circled without finding the wall again: look for one.
-                        self.phase = Phase::Seek;
+                    // Run along the edge point (it on the right), bent towards it when the
+                    // gap is wider than wanted: from far away, straight at it.
+                    let tuning = cfg.tuning;
+                    let bend = (tuning.k_gap * (gap - tuning.hover_gap))
+                        .clamp(-tuning.max_bend_away, FRAC_PI_2);
+                    let error = p.y.atan2(p.x) + FRAC_PI_2 - bend;
+                    if error > TURN_TOLERANCE && self.blocking(points).is_some() {
+                        // In the way (a corner, a leg): one turn on the spot that puts it
+                        // alongside, committed so it does not flip back to the old wall.
+                        let heading = pose.theta + self.mirror() * error;
+                        self.phase = Phase::Turn { heading, ticks: 0 };
                         continue;
                     }
-                    self.phase = Phase::Follow { blind };
-                    let angular = (cfg.speed / cfg.robot_radius).min(cfg.turn_rate);
-                    return (cfg.speed, -angular, "outer corner");
+                    let reason = if gap < ON_EDGE {
+                        "following the wall"
+                    } else {
+                        "driving to the nearest wall"
+                    };
+                    return self.steer(error, reason);
                 }
-                Phase::BackOff { from, turn, ticks } => {
+                Phase::BackOff {
+                    from,
+                    distance,
+                    turn,
+                    ticks,
+                } => {
                     let backed = (pose.x - from.x).hypot(pose.y - from.y);
-                    if backed >= BACKOFF_DISTANCE || ticks >= MAX_BACKOFF_TICKS {
+                    if backed >= distance || ticks >= MAX_BACKOFF_TICKS {
                         let heading = from.theta + self.mirror() * turn;
                         self.phase = Phase::Turn { heading, ticks: 0 };
                         continue;
                     }
                     self.phase = Phase::BackOff {
                         from,
+                        distance,
                         turn,
                         ticks: ticks + 1,
                     };
-                    return (-BACKOFF_SPEED, 0.0, "backing off a contact");
+                    return (-BACKOFF_SPEED, 0.0, "backing off a bump");
                 }
-                Phase::Turn { heading, ticks } => {
-                    let remaining = self.mirror() * angle_diff(pose.theta, heading);
-                    if remaining < TURN_TOLERANCE || ticks >= MAX_TURN_TICKS {
-                        self.phase = Phase::Follow { blind: 0.0 };
-                        continue;
+                Phase::Turn { heading, ticks } => match self.turn_to(pose, heading) {
+                    Some(command) if ticks < MAX_TURN_TICKS => {
+                        self.phase = Phase::Turn {
+                            heading,
+                            ticks: ticks + 1,
+                        };
+                        return command;
                     }
-                    self.phase = Phase::Turn {
-                        heading,
-                        ticks: ticks + 1,
-                    };
-                    let angular = (2.0 * remaining).clamp(0.2, cfg.turn_rate);
-                    return (0.0, angular, "turning after a contact");
-                }
+                    _ => self.phase = Phase::Edge,
+                },
                 Phase::Done => return (0.0, 0.0, "lap closed"),
             }
         }
@@ -396,28 +474,28 @@ impl ExplorationStrategy for WallFollower {
         scan: &PointCloud2D,
         hazard: Option<&HazardEvent>,
     ) -> ExplorationAction {
-        let turned = self.track(current_pose);
-        let contact = hazard.map(|h| Point2D::new(h.world_position.x, h.world_position.y));
-        if let Some(at) = contact {
-            if self.contacts.len() == MAX_CONTACTS {
-                self.contacts.pop_front();
-            }
-            self.contacts.push_back(at);
-            self.touch_due = self.travelled + self.config.bump_every;
-        }
-        let points = self.obstacles(current_pose, scan);
-        if let Some(at) = contact {
-            self.phase = Phase::BackOff {
-                from: *current_pose,
-                turn: Self::turn_after_contact(&points, self.to_robot(current_pose, at.x, at.y)),
-                ticks: 0,
-            };
+        self.track(current_pose);
+        let before = self.phase;
+        if let Some(h) = hazard {
+            self.on_hazard(h, current_pose, scan);
         }
         if self.travelled > self.config.max_distance {
             self.phase = Phase::Done;
         }
-
-        let (linear, angular, reason) = self.step(current_pose, &points, turned);
+        let points = self.obstacles(current_pose, scan);
+        let (linear, angular, reason) = self.step(current_pose, &points);
+        if std::mem::discriminant(&self.phase) != std::mem::discriminant(&before) {
+            log::debug!(
+                "wall_follow at ({:.2}, {:.2}, {:.2}) travelled {:.2}: {:?} -> {:?} ({})",
+                current_pose.x,
+                current_pose.y,
+                current_pose.theta,
+                self.travelled,
+                before,
+                self.phase,
+                reason
+            );
+        }
         if self.phase == Phase::Done {
             return ExplorationAction::Complete;
         }
@@ -436,7 +514,6 @@ impl ExplorationStrategy for WallFollower {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exploration::HazardType;
 
     fn no_map() -> CurrentMapData {
         CurrentMapData {
@@ -461,15 +538,13 @@ mod tests {
         }
     }
 
-    /// A follower in the middle of a lap, just after a touch.
+    /// A follower in the middle of a lap.
     fn following(side: WallSide) -> WallFollower {
         let mut follower = WallFollower::new(WallFollowConfig {
             side,
             ..WallFollowConfig::default()
         });
-        follower.phase = Phase::Follow { blind: 0.0 };
         follower.lap_start = Some((Point2D::new(100.0, 100.0), 0.0));
-        follower.touch_due = follower.config.bump_every;
         follower
     }
 
@@ -486,96 +561,145 @@ mod tests {
         drive(f.next_action(&no_map(), &Pose2D::identity(), scan, None))
     }
 
-    #[test]
-    fn wall_line_is_directed_with_the_robot_on_its_left() {
-        let right = [(0.0, -0.3), (0.2, -0.3), (0.4, -0.3)].map(|(x, y)| Point2D::new(x, y));
-        let line = wall_line(&right).unwrap();
-        assert!(line.angle.abs() < 1e-4 && (line.distance - 0.3).abs() < 1e-4);
-        // A wall straight ahead: run along it to the left.
-        let ahead = [(0.3, -0.2), (0.3, 0.0), (0.3, 0.2)].map(|(x, y)| Point2D::new(x, y));
-        let line = wall_line(&ahead).unwrap();
-        assert!((line.angle - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
+    fn wall_at(y: f32) -> PointCloud2D {
+        let mut scan = PointCloud2D::new();
+        segment_scan(&mut scan, (-0.5, y), (1.0, y));
+        scan
     }
 
     #[test]
-    fn leans_into_a_parallel_wall_to_touch_it_again() {
+    fn runs_along_a_wall_at_the_hover_gap() {
         let mut f = following(WallSide::Right);
         let r = f.config.robot_radius;
-        let wall_at = |gap: f32| {
-            let mut scan = PointCloud2D::new();
-            segment_scan(&mut scan, (-0.5, -r - gap), (1.0, -r - gap));
-            scan
-        };
-        // Close: aim to touch it when the next touch is due, here 0.6 m on.
-        f.touch_due = 0.6;
-        let (v, w) = tick(&mut f, &wall_at(0.02));
-        let approach = 0.02f32.atan2(0.6);
-        assert!(
-            v > 0.0 && (w + K_ANGLE * approach).abs() < 1e-3,
-            "v {v} w {w}"
-        );
-        // Too far off: close in now.
-        let (_, w) = tick(&mut f, &wall_at(0.1));
-        let approach = 0.1f32.atan2(CLOSE_RUN);
-        assert!((w + K_ANGLE * approach).abs() < 1e-3, "w {w}");
-
-        // Touching it, it still leans in a little.
-        let mut touching = PointCloud2D::new();
-        segment_scan(&mut touching, (-0.5, -r), (1.0, -r));
-        let (_, w) = tick(&mut f, &touching);
-        assert!(w < 0.0 && w > -0.05, "w {w}");
+        let (v, w) = tick(&mut f, &wall_at(-r - Tuning::default().hover_gap));
+        assert!(v > 0.0 && w.abs() < 0.02, "v {v} w {w}");
+        // A little off: driving on, it bends in.
+        let (v, w) = tick(&mut f, &wall_at(-r - 0.05));
+        assert!(v > 0.0 && w < 0.0, "v {v} w {w}");
+        // Into it: it turns out on the spot.
+        let (v, w) = tick(&mut f, &wall_at(-r + 0.01));
+        assert!(v == 0.0 && w > 0.0, "v {v} w {w}");
     }
 
     #[test]
-    fn turns_away_in_an_inner_corner_and_around_an_outer_one() {
+    fn a_fence_is_followed_like_a_wall() {
+        let r = WallFollowConfig::default().robot_radius;
+        let wall = wall_at(-r - 0.05);
+        let fence = (wall.xs.iter().zip(&wall.ys)).map(|(&x, &y)| Point2D::new(x, y));
+        let mut fenced = WallFollower::fenced(WallFollowConfig::default(), fence.collect());
+        fenced.lap_start = following(WallSide::Right).lap_start;
+        let along_fence = tick(&mut fenced, &PointCloud2D::new());
+        let along_wall = tick(&mut following(WallSide::Right), &wall);
+        assert_eq!(along_fence, along_wall);
+        fenced.reset();
+        assert_eq!(fenced.fence.len(), wall.xs.len(), "a reset keeps the fence");
+    }
+
+    #[test]
+    fn turns_on_the_spot_in_an_inner_corner_and_hugs_an_outer_one() {
         let mut f = following(WallSide::Right);
-        let mut corner = PointCloud2D::new();
-        segment_scan(&mut corner, (-0.5, -0.18), (0.175, -0.18));
-        segment_scan(&mut corner, (0.175, -0.18), (0.175, 1.0));
+        let r = f.config.robot_radius;
+        let mut corner = wall_at(-r - Tuning::default().hover_gap);
+        segment_scan(&mut corner, (r + 0.02, -0.5), (r + 0.02, 1.0));
         let (v, w) = tick(&mut f, &corner);
         assert!(v == 0.0 && w > 0.0, "inner corner: v {v} w {w}");
 
+        // The wall just followed ends just behind the body: round its end, towards it.
+        let mut f = following(WallSide::Right);
         let mut ended = PointCloud2D::new();
-        segment_scan(&mut ended, (-1.0, -0.2), (-0.2, -0.2));
-        let (v, w) = tick(&mut f, &ended);
-        assert!(v > 0.0 && w < 0.0, "outer corner: v {v} w {w}");
+        segment_scan(
+            &mut ended,
+            (-1.0, -r - Tuning::default().hover_gap),
+            (-0.03, -r - Tuning::default().hover_gap),
+        );
+        let (_, w) = tick(&mut f, &ended);
+        assert!(w < 0.0, "outer corner: w {w}");
     }
 
     #[test]
     fn a_left_wall_mirrors_the_turns() {
         let mut f = following(WallSide::Left);
-        let y = f.config.robot_radius + 0.1;
+        let r = f.config.robot_radius;
         let mut far = PointCloud2D::new();
-        segment_scan(&mut far, (-0.5, y), (1.0, y));
+        segment_scan(&mut far, (-0.5, r + 0.05), (1.0, r + 0.05));
         let (_, w) = tick(&mut f, &far);
-        assert!(w > 0.0, "leans into a left wall: {w}");
+        assert!(w > 0.0, "bends into a left wall: {w}");
     }
 
     #[test]
-    fn a_bump_turns_parallel_to_what_the_lidar_saw_there() {
-        // A wall ahead at 45 degrees, rising to the left; bumped with the right bumper.
-        let mut scan = PointCloud2D::new();
-        segment_scan(&mut scan, (0.4, -0.4), (-0.2, 0.6));
-        let contact = Point2D::new(0.17 * 0.3f32.cos(), -0.17 * 0.3f32.sin());
-        let points: Vec<Point2D> = scan.iter().collect();
-        let turn = WallFollower::turn_after_contact(&points, contact);
-        let along = (0.6f32 + 0.4).atan2(-0.2 - 0.4); // direction (-0.6, 1.0)
-        assert!(
-            (turn - along.min(MAX_CONTACT_TURN)).abs() < 0.05,
-            "turn {turn}"
-        );
+    fn a_bump_backs_off_a_little_and_nudges_away() {
+        let mut f = following(WallSide::Right);
+        let pose = Pose2D::identity();
+        let bump = HazardEvent::new(HazardType::BumperRight, &pose);
+        // The wall touched, in front, seen.
+        let r = f.config.robot_radius;
+        let mut wall = PointCloud2D::new();
+        segment_scan(&mut wall, (r, -0.3), (r, 0.3));
+        let (v, w) = drive(f.next_action(&no_map(), &pose, &wall, Some(&bump)));
+        assert!(v < 0.0 && w == 0.0, "backs off: {v} {w}");
+        // The pose does not move here, so the back-off ends by its tick limit.
+        for _ in 0..MAX_BACKOFF_TICKS {
+            f.next_action(&no_map(), &pose, &wall, None);
+        }
+        let Phase::Turn { heading, .. } = f.phase else {
+            panic!("turns after backing off: {:?}", f.phase);
+        };
+        let nudge = Tuning::default().nudge;
+        assert!((heading - nudge).abs() < 1e-6, "a nudge left, not a U-turn");
+        // On the side away from the wall, the nudge is towards it.
+        let mut f = following(WallSide::Right);
+        let bump = HazardEvent::new(HazardType::BumperLeft, &pose);
+        f.next_action(&no_map(), &pose, &wall, Some(&bump));
+        assert!(matches!(f.phase, Phase::BackOff { turn, .. } if turn == -nudge));
+    }
 
-        // Nothing seen there (glass): turn by where it was hit, more for the far side.
-        let blind_right = WallFollower::turn_after_contact(&[], contact);
-        let blind_left = WallFollower::turn_after_contact(&[], Point2D::new(contact.x, -contact.y));
-        assert!(blind_right < blind_left);
+    #[test]
+    fn a_bump_on_nothing_seen_turns_it_alongside_and_remembers_it() {
+        let mut f = following(WallSide::Right);
+        let pose = Pose2D::identity();
+        let bump = HazardEvent::new(HazardType::BumperBoth, &pose);
+        f.next_action(&no_map(), &pose, &PointCloud2D::new(), Some(&bump));
+        let Phase::BackOff { turn, .. } = f.phase else {
+            panic!("backs off: {:?}", f.phase);
+        };
+        assert!(
+            (turn - FRAC_PI_2).abs() < 1e-4,
+            "dead ahead: a quarter turn left, {turn}"
+        );
+        // A line across the front, through the contact.
+        let r = f.config.robot_radius;
+        assert!(f.contacts.iter().all(|(p, _)| (p.x - r).abs() < 1e-4));
+        let ys = f.contacts.iter().map(|(p, _)| p.y);
+        assert!(ys.clone().fold(0.0, f32::min) < -0.05 && ys.fold(0.0, f32::max) > 0.05);
+    }
+
+    #[test]
+    fn starts_for_the_nearest_wall_on_the_right_not_the_dock_behind() {
+        let mut f = WallFollower::new(WallFollowConfig::default());
+        // Just off the dock (behind, nearest of all and partly to the right), a wall ahead
+        // right and a nearer one on the left.
+        let scan = PointCloud2D {
+            xs: vec![-0.25, -0.25, 0.6, 0.3],
+            ys: vec![0.0, -0.3, -0.6, 0.5],
+            ..Default::default()
+        };
+        let (v, w) = drive(f.next_action(&no_map(), &Pose2D::identity(), &scan, None));
+        assert!(v == 0.0 && w < 0.0, "turns right on the spot: {v} {w}");
+        // Facing it, it drives straight at it.
+        let mut f = WallFollower::new(WallFollowConfig::default());
+        let ahead = PointCloud2D {
+            xs: vec![-0.25, 0.85],
+            ys: vec![0.0, -0.01],
+            ..Default::default()
+        };
+        let (v, w) = tick(&mut f, &ahead);
+        assert!(v > 0.0 && w.abs() < 0.05, "then drives at it: {v} {w}");
     }
 
     #[test]
     fn closes_the_lap_back_at_the_start() {
         let mut f = WallFollower::new(WallFollowConfig::default());
-        let mut scan = PointCloud2D::new();
-        segment_scan(&mut scan, (-0.5, -0.2), (1.0, -0.2));
+        let scan = wall_at(-0.175);
         let map = no_map();
         let start = Pose2D::identity();
         assert!(matches!(
@@ -590,274 +714,12 @@ mod tests {
     }
 
     #[test]
-    fn the_lap_starts_wherever_following_does() {
-        // E.g. after bumping glass while seeking: Follow is entered from a turn, not Seek.
+    fn the_lap_starts_at_the_first_bump_too() {
+        // E.g. glass the lidar never saw.
         let mut f = WallFollower::new(WallFollowConfig::default());
-        f.phase = Phase::Follow { blind: 0.0 };
         let at = Pose2D::new(1.0, 2.0, 0.0);
-        f.next_action(&no_map(), &at, &PointCloud2D::new(), None);
+        let bump = HazardEvent::new(HazardType::BumperBoth, &at);
+        f.next_action(&no_map(), &at, &PointCloud2D::new(), Some(&bump));
         assert_eq!(f.lap_start.map(|(p, _)| (p.x, p.y)), Some((1.0, 2.0)));
-    }
-
-    // ---- Closed-loop simulation: a unicycle in a polygon room, lidar by ray casting ----
-
-    type Segment = ((f32, f32), (f32, f32));
-
-    fn distance_to_segment(p: (f32, f32), s: Segment) -> f32 {
-        let ((ax, ay), (bx, by)) = s;
-        let (dx, dy) = (bx - ax, by - ay);
-        let t = (((p.0 - ax) * dx + (p.1 - ay) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
-        (p.0 - ax - t * dx).hypot(p.1 - ay - t * dy)
-    }
-
-    fn ray_hit(origin: (f32, f32), dir: (f32, f32), s: Segment) -> Option<f32> {
-        let ((ax, ay), (bx, by)) = s;
-        let (ex, ey) = (bx - ax, by - ay);
-        let denom = dir.0 * ey - dir.1 * ex;
-        if denom.abs() < 1e-9 {
-            return None;
-        }
-        let (wx, wy) = (ax - origin.0, ay - origin.1);
-        let t = (wx * ey - wy * ex) / denom;
-        let u = (wx * dir.1 - wy * dir.0) / denom;
-        (t > 0.0 && (0.0..=1.0).contains(&u)).then_some(t)
-    }
-
-    struct Run {
-        completed: bool,
-        bumps: usize,
-        path: Vec<(f32, f32)>,
-    }
-
-    /// Runs the follower at 10 Hz. `walls` are seen by the lidar and solid; `glass` is
-    /// solid only; the `fence` is neither.
-    fn simulate(
-        side: WallSide,
-        walls: &[Segment],
-        glass: &[Segment],
-        fence: Vec<Point2D>,
-        start: Pose2D,
-        seconds: f32,
-    ) -> Run {
-        let config = WallFollowConfig {
-            side,
-            ..WallFollowConfig::default()
-        };
-        let r = config.robot_radius;
-        let mut follower = WallFollower::fenced(config, fence);
-        let map = no_map();
-        let solid: Vec<Segment> = walls.iter().chain(glass).copied().collect();
-        let mut pose = start;
-        let mut hazard = None;
-        let mut run = Run {
-            completed: false,
-            bumps: 0,
-            path: Vec::new(),
-        };
-        let dt = 0.1;
-        for _ in 0..(seconds / dt) as usize {
-            let mut scan = PointCloud2D::new();
-            for i in 0..180 {
-                let a = i as f32 * TAU / 180.0;
-                let world = (pose.theta + a).sin_cos();
-                let hit = walls
-                    .iter()
-                    .filter_map(|&s| ray_hit((pose.x, pose.y), (world.1, world.0), s))
-                    .fold(f32::INFINITY, f32::min);
-                if hit < 5.0 {
-                    scan.push_xy(hit * a.cos(), hit * a.sin());
-                }
-            }
-            let action = follower.next_action(&map, &pose, &scan, hazard.as_ref());
-            hazard = None;
-            let (v, w) = match action {
-                ExplorationAction::Drive {
-                    linear, angular, ..
-                } => (linear, angular),
-                ExplorationAction::Complete => {
-                    run.completed = true;
-                    break;
-                }
-                other => panic!("unexpected {other:?}"),
-            };
-            let theta = pose.theta + w * dt;
-            let next = (pose.x + v * dt * theta.cos(), pose.y + v * dt * theta.sin());
-            let clearance = solid
-                .iter()
-                .map(|&s| distance_to_segment(next, s))
-                .fold(f32::INFINITY, f32::min);
-            if clearance < r {
-                // Blocked: the bumper on the side of the contact fires; the robot only turns.
-                let closest = solid
-                    .iter()
-                    .min_by(|a, b| {
-                        distance_to_segment(next, **a).total_cmp(&distance_to_segment(next, **b))
-                    })
-                    .unwrap();
-                let ((ax, ay), (bx, by)) = *closest;
-                let mid = ((ax + bx) / 2.0, (ay + by) / 2.0);
-                let probe = (0..=20)
-                    .map(|i| {
-                        let t = i as f32 / 20.0;
-                        (ax + t * (bx - ax), ay + t * (by - ay))
-                    })
-                    .min_by(|p, q| {
-                        let d = |z: &(f32, f32)| (z.0 - next.0).hypot(z.1 - next.1);
-                        d(p).total_cmp(&d(q))
-                    })
-                    .unwrap_or(mid);
-                let bearing = angle_diff(theta, (probe.1 - pose.y).atan2(probe.0 - pose.x));
-                let kind = if bearing > 0.15 {
-                    HazardType::BumperLeft
-                } else if bearing < -0.15 {
-                    HazardType::BumperRight
-                } else {
-                    HazardType::BumperBoth
-                };
-                pose = Pose2D::new(pose.x, pose.y, theta);
-                hazard = Some(HazardEvent::new(kind, &pose));
-                run.bumps += 1;
-            } else {
-                pose = Pose2D::new(next.0, next.1, theta);
-            }
-            run.path.push((pose.x, pose.y));
-        }
-        run
-    }
-
-    /// An L-shaped room: 4 x 3 m with the top-right 2 x 1 m cut out.
-    fn l_room() -> Vec<Segment> {
-        let corners = [
-            (0.0, 0.0),
-            (4.0, 0.0),
-            (4.0, 2.0),
-            (2.0, 2.0),
-            (2.0, 3.0),
-            (0.0, 3.0),
-        ];
-        (0..corners.len())
-            .map(|i| (corners[i], corners[(i + 1) % corners.len()]))
-            .collect()
-    }
-
-    fn closest_approach(path: &[(f32, f32)], to: (f32, f32)) -> f32 {
-        path.iter()
-            .map(|p| (p.0 - to.0).hypot(p.1 - to.1))
-            .fold(f32::INFINITY, f32::min)
-    }
-
-    /// Asserts a lap of the L room (mirrored by `m` = ±1 in y) hugged its walls and corners.
-    fn assert_swept(run: &Run, m: f32) {
-        let mirrored = |(x, y): (f32, f32)| (x, m * y);
-        assert!(run.completed, "lap not closed");
-        assert!(run.bumps <= 25, "{} bumps", run.bumps);
-        // Along the walls the body stays within 2 cm of them (here it rides a few
-        // millimetres off without quite triggering the simulated bumper).
-        let walls: Vec<Segment> = l_room()
-            .into_iter()
-            .map(|(a, b)| (mirrored(a), mirrored(b)))
-            .collect();
-        let mut gaps: Vec<f32> = run
-            .path
-            .iter()
-            .map(|&p| {
-                walls
-                    .iter()
-                    .map(|&s| distance_to_segment(p, s))
-                    .fold(f32::INFINITY, f32::min)
-            })
-            .filter(|&d| d < 0.4)
-            .map(|d| d - WallFollowConfig::default().robot_radius)
-            .collect();
-        gaps.sort_by(f32::total_cmp);
-        let median = gaps[gaps.len() / 2];
-        assert!(median < 0.02, "median gap to the wall {median:.3} m");
-        for corner in [(0.0, 0.0), (4.0, 0.0), (4.0, 2.0), (2.0, 3.0), (0.0, 3.0)] {
-            let d = closest_approach(&run.path, mirrored(corner));
-            assert!(d < 0.26, "corner {corner:?} missed by {d:.2} m");
-        }
-        assert!(
-            closest_approach(&run.path, mirrored((2.0, 2.0))) < 0.3,
-            "outer corner cut"
-        );
-    }
-
-    #[test]
-    fn sweeps_every_corner_of_an_l_shaped_room() {
-        let start = Pose2D::new(1.5, 1.2, 0.3);
-        let run = simulate(WallSide::Right, &l_room(), &[], vec![], start, 300.0);
-        assert_swept(&run, 1.0);
-    }
-
-    #[test]
-    fn a_fenced_doorway_is_followed_like_a_wall() {
-        // The L room's left wall opens at y 1..2 into a 1 m deep closet, fenced off.
-        let left_wall = ((0.0, 3.0), (0.0, 0.0));
-        let mut walls: Vec<Segment> = l_room().into_iter().filter(|&s| s != left_wall).collect();
-        walls.extend([
-            ((0.0, 3.0), (0.0, 2.0)),
-            ((0.0, 2.0), (-1.0, 2.0)),
-            ((-1.0, 2.0), (-1.0, 1.0)),
-            ((-1.0, 1.0), (0.0, 1.0)),
-            ((0.0, 1.0), (0.0, 0.0)),
-        ]);
-        let fence = (0..=20)
-            .map(|i| Point2D::new(-0.025, 1.0 + i as f32 * 0.05))
-            .collect();
-        let start = Pose2D::new(1.5, 1.2, 0.3);
-        let run = simulate(WallSide::Right, &walls, &[], fence, start, 300.0);
-        assert_swept(&run, 1.0);
-        let deepest = run.path.iter().map(|p| p.0).fold(f32::INFINITY, f32::min);
-        assert!(deepest > 0.1, "went {deepest:.2} m into the closet");
-    }
-
-    #[test]
-    fn a_long_fence_is_not_crept_across() {
-        // An 8 x 3 m room fenced at x = 4 along its whole height: the lean that keeps
-        // touching real walls must not carry the robot over the fence.
-        let corners = [(0.0, 0.0), (8.0, 0.0), (8.0, 3.0), (0.0, 3.0)];
-        let walls: Vec<Segment> = (0..4).map(|i| (corners[i], corners[(i + 1) % 4])).collect();
-        let fence = (0..=60)
-            .map(|i| Point2D::new(4.0, i as f32 * 0.05))
-            .collect();
-        let start = Pose2D::new(2.0, 1.2, 0.3);
-        let run = simulate(WallSide::Right, &walls, &[], fence, start, 300.0);
-        assert!(run.completed, "lap not closed");
-        let farthest = run
-            .path
-            .iter()
-            .map(|p| p.0)
-            .fold(f32::NEG_INFINITY, f32::max);
-        assert!(
-            farthest < 3.9,
-            "reached x = {farthest:.2} past the fence's body line"
-        );
-    }
-
-    #[test]
-    fn sweeps_a_mirrored_room_with_the_wall_on_the_left() {
-        let room: Vec<Segment> = l_room()
-            .into_iter()
-            .map(|((ax, ay), (bx, by))| ((ax, -ay), (bx, -by)))
-            .collect();
-        let start = Pose2D::new(1.5, -1.2, -0.3);
-        let run = simulate(WallSide::Left, &room, &[], vec![], start, 300.0);
-        assert_swept(&run, -1.0);
-    }
-
-    #[test]
-    fn follows_glass_the_lidar_cannot_see() {
-        // A 0.6 m glass fin out of the left wall.
-        let glass = [((0.0, 1.5), (0.6, 1.5))];
-        let start = Pose2D::new(1.5, 1.2, 0.3);
-        let run = simulate(WallSide::Right, &l_room(), &glass, vec![], start, 400.0);
-        assert!(run.completed, "lap not closed after {} bumps", run.bumps);
-        assert!(run.bumps >= 1, "never touched the glass");
-        // It went around the fin's tip rather than giving up on the wall.
-        assert!(closest_approach(&run.path, (0.6, 1.5)) < 0.35);
-        assert!(
-            closest_approach(&run.path, (0.0, 3.0)) < 0.3,
-            "missed the corner past the glass"
-        );
     }
 }

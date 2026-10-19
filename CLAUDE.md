@@ -25,7 +25,7 @@ Each crate is its own Cargo project (no workspace), Rust edition 2024.
 | `sangamio` | HAL daemon: GD32 + lidar, protobuf on TCP 5555, control lease, dead-man, bumper interlock; `--features mock` is the simulator | `viomi_v8.toml` / `mock.toml` |
 | `dhruva-slam` | SLAM daemon + library: odometry, matching, loop closure, exploration (`wall_follow` corner sweep), offline `--replay` | `dhruva-v8.toml` / `dhruva-mock.toml` |
 | `dwar` | web gateway: REST + WebSocket, Preact UI in `web/`, teleop, STOP, MCAP recorder | `../scripts/robot/dwar.toml` / `dwar.toml` |
-| `dhruva-lab` | offline lab: replays recordings through dhruva-slam's pipeline; metrics, floor plan, rooms | — |
+| `dhruva-lab` | offline lab: replays recordings through dhruva-slam's pipeline; metrics, floor plan, rooms; `sweep`, the corner-sweep bench on the mock | — |
 | `drishti`, `protocol-mitm` | PyQt viewer; serial MITM tool (reverse engineering) | — |
 | `dhruva-nav`, `vastu-slam`, `slam-test` | upstream leftovers, not used (`dhruva/` holds only a proposal doc) | — |
 

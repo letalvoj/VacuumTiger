@@ -166,9 +166,10 @@ loop_rate_hz = 10.0
 # Not leaving a 1 m circle for this long (s) ends the sweep with "Stuck: ...".
 stuck_after_s = 180.0
 
+# The rest (turn rate, lap, `tuning`) are the code's defaults, hill-climbed on the lab's
+# sweep bench (`dhruva-lab/src/bin/sweep`).
 [exploration.wall_follow]
 side = "right"
-bump_every = 2.5
 speed = 0.15
 
 [exploration.motion]

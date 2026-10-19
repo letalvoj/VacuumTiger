@@ -21,6 +21,14 @@ pub struct Knob {
 const KNOBS: &[Knob] = &[
     Knob { name: "speed", at: |c| &mut c.speed, min: 0.1, max: 0.3, factor: 1.15 },
     Knob { name: "turn_rate", at: |c| &mut c.turn_rate, min: 0.3, max: 1.2, factor: 1.2 },
+    Knob { name: "tuning.hover_gap", at: |c| &mut c.tuning.hover_gap, min: 0.002, max: 0.05, factor: 1.5 },
+    Knob { name: "tuning.k_gap", at: |c| &mut c.tuning.k_gap, min: 0.5, max: 10.0, factor: 1.4 },
+    Knob { name: "tuning.max_bend_away", at: |c| &mut c.tuning.max_bend_away, min: 0.2, max: 1.2, factor: 1.3 },
+    Knob { name: "tuning.k_turn", at: |c| &mut c.tuning.k_turn, min: 0.5, max: 5.0, factor: 1.3 },
+    Knob { name: "tuning.spin_angle", at: |c| &mut c.tuning.spin_angle, min: 0.15, max: 0.8, factor: 1.3 },
+    Knob { name: "tuning.front_look", at: |c| &mut c.tuning.front_look, min: 0.005, max: 0.08, factor: 1.5 },
+    Knob { name: "tuning.backoff_distance", at: |c| &mut c.tuning.backoff_distance, min: 0.01, max: 0.1, factor: 1.5 },
+    Knob { name: "tuning.nudge", at: |c| &mut c.tuning.nudge, min: 0.1, max: 0.8, factor: 1.3 },
 ];
 
 impl Knob {
