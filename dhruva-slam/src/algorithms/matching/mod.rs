@@ -89,7 +89,7 @@ pub use dynamic::{DynMatcher, DynMatcherConfig, MatcherType};
 pub use hybrid::{HybridConfig, HybridMatcher};
 pub use icp::{IcpConfig, PointToPointIcp};
 pub use multi_resolution::{MultiResolutionConfig, MultiResolutionMatcher};
-pub use point_to_line_icp::{PointToLineIcp, PointToLineIcpConfig};
+pub use point_to_line_icp::{Line2D, PointToLineIcp, PointToLineIcpConfig};
 pub use robust_kernels::RobustKernel;
 
 use crate::core::types::{PointCloud2D, Pose2D};

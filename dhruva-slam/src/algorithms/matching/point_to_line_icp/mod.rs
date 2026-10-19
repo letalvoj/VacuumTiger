@@ -27,6 +27,7 @@ mod gauss_newton;
 mod line2d;
 
 pub use config::PointToLineIcpConfig;
+pub use line2d::Line2D;
 
 use kiddo::{KdTree, SquaredEuclidean};
 

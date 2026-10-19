@@ -25,7 +25,9 @@ use std::time::{Duration, Instant};
 
 use dhruva_slam::algorithms::planning::AStarConfig;
 use dhruva_slam::config::{Config, build_slam_thread_config};
-use dhruva_slam::exploration::{ExplorationStrategy, FrontierConfig, FrontierExploration};
+use dhruva_slam::exploration::{
+    ExplorationStrategy, FrontierConfig, FrontierExploration, WallFollowConfig, WallFollower,
+};
 use dhruva_slam::io::map_manager::MapManager;
 use dhruva_slam::io::motion_controller::{MotionConfig, create_shared_motion_controller};
 use dhruva_slam::navigation::NavigatorConfig;
@@ -449,8 +451,12 @@ fn run_threaded_mode_rest(
                 safety_margin: config.navigation.safety_margin,
                 ..FrontierConfig::default()
             })),
+            "wall_follow" => Box::new(WallFollower::new(WallFollowConfig {
+                robot_radius: config.navigation.robot_radius,
+                ..config.exploration.wall_follow
+            })),
             other => {
-                log::error!("Unknown exploration strategy {other:?} (frontier)");
+                log::error!("Unknown exploration strategy {other:?} (frontier, wall_follow)");
                 std::process::exit(1);
             }
         };

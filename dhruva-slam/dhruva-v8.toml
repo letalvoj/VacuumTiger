@@ -156,9 +156,16 @@ max_iterations = 50
 tolerance = 1e-6
 
 [exploration]
+# Off: enabling it lets start_mapping drive the robot.
 enabled = false
-strategy = "frontier"
+# The corner sweep: follow the walls around the room once, touching them every ~2.5 m.
+strategy = "wall_follow"
 loop_rate_hz = 10.0
+
+[exploration.wall_follow]
+side = "right"
+bump_every = 2.5
+speed = 0.15
 
 [exploration.motion]
 max_linear_vel = 0.4

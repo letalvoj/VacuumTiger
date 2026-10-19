@@ -17,6 +17,7 @@ use crate::engine::slam::{
     KeyframeManagerConfig, LoopClosureConfig as SlamLoopClosureConfig, OnlineSlamConfig,
     SubmapManagerConfig,
 };
+use crate::exploration::WallFollowConfig;
 use crate::sensors::odometry::{
     ComplementaryConfig, DynOdometryConfig, MahonyConfig, OdometryType, WheelOdometryConfig,
 };
@@ -434,7 +435,7 @@ impl Default for OptimizationConfig {
 pub struct ExplorationCfg {
     /// Enable exploration thread.
     pub enabled: bool,
-    /// Exploration strategy: "frontier".
+    /// Exploration strategy: "frontier" or "wall_follow" (the corner sweep).
     pub strategy: String,
     /// Loop rate for exploration thread (Hz).
     pub loop_rate_hz: f32,
@@ -442,6 +443,8 @@ pub struct ExplorationCfg {
     pub motion: ExplorationMotionConfig,
     #[serde(default)]
     pub frontier: ExplorationFrontierConfig,
+    #[serde(default)]
+    pub wall_follow: WallFollowConfig,
 }
 
 impl Default for ExplorationCfg {
@@ -452,6 +455,7 @@ impl Default for ExplorationCfg {
             loop_rate_hz: 10.0,
             motion: ExplorationMotionConfig::default(),
             frontier: ExplorationFrontierConfig::default(),
+            wall_follow: WallFollowConfig::default(),
         }
     }
 }

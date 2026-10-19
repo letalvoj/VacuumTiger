@@ -4,6 +4,7 @@
 //!
 //! - [`strategy`]: Exploration strategy trait for extensibility
 //! - [`frontier`]: Frontier-based exploration implementation
+//! - [`wall_follow`]: Corner sweep: follow the walls around the room
 //!
 //! # Architecture
 //!
@@ -32,6 +33,8 @@
 
 mod frontier;
 mod strategy;
+mod wall_follow;
 
 pub use frontier::{FrontierConfig, FrontierExploration};
 pub use strategy::{ExplorationAction, ExplorationStrategy, HazardEvent, HazardType};
+pub use wall_follow::{WallFollowConfig, WallFollower, WallSide};
