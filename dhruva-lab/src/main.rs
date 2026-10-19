@@ -11,6 +11,7 @@
 //! - `traj_final.csv`: same columns, each scan moved with its keyframe to where the
 //!   last pose-graph optimisation put it (the trajectory behind the final map)
 //! - `metrics.json`: scores against `--reference` (another run's `traj.csv`)
+//! - `floor_plan.png`: the `--floor-plan` after merging this run into it
 
 mod metrics;
 mod render;
@@ -18,12 +19,14 @@ mod trace;
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::Parser;
+use dhruva_slam::algorithms::mapping::{FloorPlan, FloorPlanConfig, OccupancyGrid};
 use dhruva_slam::config::{Config, build_slam_thread_config};
 use dhruva_slam::core::types::{LaserScan, Pose2D};
+use dhruva_slam::engine::graph::PoseGraph;
 use dhruva_slam::engine::pipeline::SlamPipeline;
 use dhruva_slam::engine::slam::{SlamEngine, SlamMode};
 use dhruva_slam::io::recording::{Sample, for_each_sample};
@@ -51,6 +54,12 @@ struct Args {
     /// Same cut as `tools/py/sgio2bag.py --window` makes for the reference SLAMs.
     #[arg(long, default_value = "0:1", value_parser = window)]
     window: (f64, f64),
+    /// Floor plan to merge the final map into (created if missing), as one more
+    /// session; also renders it as `floor_plan.png`. The run is taken as already
+    /// aligned with the plan (no relocalisation yet). Each call counts as a session,
+    /// so replaying the same run twice votes twice.
+    #[arg(long)]
+    floor_plan: Option<PathBuf>,
 }
 
 fn window(s: &str) -> Result<(f64, f64), String> {
@@ -187,6 +196,12 @@ fn run(args: Args) -> Result<(), String> {
     let grid = pipeline.slam_mut().global_map().clone();
     let graph = pipeline.slam().pose_graph();
     render::map_png(&args.out.join("map.png"), &grid, &rows, graph)?;
+    if let Some(path) = &args.floor_plan {
+        // A refused merge (e.g. a misaligned run) leaves the plan and the run's outputs be.
+        if let Err(e) = merge_floor_plan(path, &grid, &args.out.join("floor_plan.png")) {
+            eprintln!("floor plan not updated: {e}");
+        }
+    }
 
     let mut summary = serde_json::json!({
         "scans": rows.len(),
@@ -208,6 +223,22 @@ fn run(args: Args) -> Result<(), String> {
         args.out.display()
     );
     Ok(())
+}
+
+/// Merges `grid` into the floor plan at `path` (a new one if there is none yet) and
+/// renders the result to `png`.
+fn merge_floor_plan(path: &Path, grid: &OccupancyGrid, png: &Path) -> Result<(), String> {
+    let mut plan = match FloorPlan::load(path) {
+        Ok(plan) => plan,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            FloorPlan::new(FloorPlanConfig::default())?
+        }
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    plan.merge(grid, &Pose2D::identity())?;
+    plan.save(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    render::map_png(png, &plan.to_grid(), &[], &PoseGraph::new())
 }
 
 /// The inclusive data-time bounds (us) of a window given as fractions of the

@@ -25,10 +25,12 @@
 //!
 //! Note: Some types are defined for planned features.
 
+mod floor_plan;
 mod integrator;
 mod occupancy_grid;
 mod ray_tracer;
 
+pub use floor_plan::{FloorPlan, FloorPlanConfig, PlanCell};
 pub use integrator::{MapIntegrator, MapIntegratorConfig};
 pub use occupancy_grid::{CellState, OccupancyGrid, OccupancyGridConfig};
 pub use ray_tracer::RayTracer;
