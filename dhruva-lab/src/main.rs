@@ -12,9 +12,11 @@
 //!   last pose-graph optimisation put it (the trajectory behind the final map)
 //! - `metrics.json`: scores against `--reference` (another run's `traj.csv`)
 //! - `floor_plan.png`: the `--floor-plan` after merging this run into it, by room
+//! - `sim_map.png`, `sim_map.yaml`: with `--sim-map`, the final map as a SangamIO mock map
 
 mod metrics;
 mod render;
+mod sim_map;
 mod trace;
 
 use std::collections::HashMap;
@@ -64,6 +66,13 @@ struct Args {
     /// call counts as a session, so replaying the same run twice votes twice.
     #[arg(long)]
     floor_plan: Option<PathBuf>,
+    /// Also write the final map cleaned for the SangamIO mock (`sim_map.png`/`.yaml`).
+    #[arg(long)]
+    sim_map: bool,
+    /// A box x0,y0,x1,y1 (m) to leave out of the sim map's floor, e.g. what was seen through
+    /// a mirror; repeatable.
+    #[arg(long, value_parser = sim_map::parse_block)]
+    block: Vec<sim_map::Block>,
 }
 
 fn window(s: &str) -> Result<(f64, f64), String> {
@@ -216,6 +225,12 @@ fn run(args: Args) -> Result<(), String> {
     let grid = pipeline.slam_mut().global_map().clone();
     let graph = pipeline.slam().pose_graph();
     render::map_png(&args.out.join("map.png"), &grid, &rows, graph, None, &[])?;
+    if args.sim_map {
+        let start = rows.first().map_or((0.0, 0.0), |r| (r.slam.x, r.slam.y));
+        let coverage = CoverageConfig::default();
+        let keep = coverage.robot_radius + coverage.margin;
+        sim_map::write(&args.out, &grid, start, keep, &args.block)?;
+    }
     // The run goes into the plan where relocalisation put it; a new plan starts in its frame.
     let to_plan = match (&relocaliser, placement.0) {
         (None, _) => Some(Pose2D::identity()),
