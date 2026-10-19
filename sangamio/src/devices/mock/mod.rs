@@ -544,6 +544,10 @@ fn simulation_loop(
 
             status.set("bumper_left", SensorValue::Bool(bumper_left));
             status.set("bumper_right", SensorValue::Bool(bumper_right));
+            // As the CRL-200S publishes them: front zones only, no dock in the simulation.
+            let zones = u8::from(bumper_left) << 2 | u8::from(bumper_right) << 1;
+            status.set("bumper_zones", SensorValue::U8(zones));
+            status.set("dock_ir", SensorValue::U8(0));
 
             // Cliff sensors
             status.set(

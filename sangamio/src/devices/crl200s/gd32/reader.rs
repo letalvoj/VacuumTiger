@@ -11,7 +11,7 @@
 
 use super::packet::version_request_packet;
 use super::protocol::{PacketReader, RxPacket};
-use super::state::{bumper_press_masked, monotonic_now_ms, ComponentState};
+use super::state::{ComponentState, bumper_press_masked, monotonic_now_ms};
 use crate::config::AxisTransform3D;
 use crate::core::types::{SensorGroupData, SensorValue, StreamSender};
 use crate::devices::crl200s::constants::{
@@ -20,9 +20,9 @@ use crate::devices::crl200s::constants::{
     FLAG_CLIFF_LEFT_SIDE, FLAG_CLIFF_RIGHT_FRONT, FLAG_CLIFF_RIGHT_SIDE, FLAG_DOCK_CONNECTED,
     FLAG_DUSTBOX_ATTACHED, OFFSET_ACCEL_X, OFFSET_ACCEL_Y, OFFSET_ACCEL_Z,
     OFFSET_BATTERY_VOLTAGE_RAW, OFFSET_BUMPER_FLAGS, OFFSET_CHARGING_FLAGS, OFFSET_CLIFF_FLAGS,
-    OFFSET_DOCK_BUTTON, OFFSET_DUSTBOX_FLAGS, OFFSET_GYRO_X, OFFSET_GYRO_Y, OFFSET_GYRO_Z,
-    OFFSET_START_BUTTON, OFFSET_TILT_X, OFFSET_TILT_Y, OFFSET_TILT_Z, OFFSET_WHEEL_LEFT_ENCODER,
-    OFFSET_WHEEL_RIGHT_ENCODER, STATUS_PAYLOAD_MIN_SIZE,
+    OFFSET_DOCK_BUTTON, OFFSET_DOCK_IR, OFFSET_DUSTBOX_FLAGS, OFFSET_GYRO_X, OFFSET_GYRO_Y,
+    OFFSET_GYRO_Z, OFFSET_START_BUTTON, OFFSET_TILT_X, OFFSET_TILT_Y, OFFSET_TILT_Z,
+    OFFSET_WHEEL_LEFT_ENCODER, OFFSET_WHEEL_RIGHT_ENCODER, STATUS_PAYLOAD_MIN_SIZE,
 };
 use serialport::SerialPort;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -277,6 +277,14 @@ fn handle_status_packet(
     let bump_r = (payload[OFFSET_BUMPER_FLAGS] & FLAG_BUMPER_RIGHT) != 0;
     data.set("bumper_left", SensorValue::Bool(bump_l));
     data.set("bumper_right", SensorValue::Bool(bump_r));
+    // Raw bytes, recorded for decoding (docs/HW_PROTOCOLS.md 3.4, checks V-2 / V-11): the
+    // bumper byte's four zones (b3 left side .. b0 right side; the flags above are the
+    // front two) and the dock IR receivers (high nibble left, low nibble right).
+    data.set(
+        "bumper_zones",
+        SensorValue::U8(payload[OFFSET_BUMPER_FLAGS]),
+    );
+    data.set("dock_ir", SensorValue::U8(payload[OFFSET_DOCK_IR]));
 
     // Charging/dock state (read out of the same status packet for the bumper mask).
     let charging = (payload[OFFSET_CHARGING_FLAGS] & FLAG_CHARGING) != 0;
@@ -340,7 +348,9 @@ fn handle_status_packet(
     if wheel_left != component_state.prev_wheel_left.load(Ordering::Relaxed)
         || wheel_right != component_state.prev_wheel_right.load(Ordering::Relaxed)
     {
-        component_state.last_motion_ms.store(now_ms, Ordering::Relaxed);
+        component_state
+            .last_motion_ms
+            .store(now_ms, Ordering::Relaxed);
     }
     component_state
         .prev_wheel_left

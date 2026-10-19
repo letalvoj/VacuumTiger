@@ -8,7 +8,9 @@
 //!
 //! ## `sensor_status` (~110Hz from GD32)
 //! Published on topic `sensors/sensor_status`. Contains all real-time sensor data:
-//! - **Bumpers**: `bumper_left`, `bumper_right` (Bool)
+//! - **Bumpers**: `bumper_left`, `bumper_right` (Bool, the front zones); `bumper_zones` (U8,
+//!   the raw bumper byte)
+//! - **Dock IR**: `dock_ir` (U8, raw: high nibble left receiver, low nibble right)
 //! - **Cliffs**: `cliff_left_side`, `cliff_left_front`, `cliff_right_front`, `cliff_right_side` (Bool)
 //! - **Battery**: `battery_voltage` (F32 volts), `battery_level` (U8 %), `is_charging` (Bool)
 //! - **Encoders**: `wheel_left`, `wheel_right` (U16 ticks)

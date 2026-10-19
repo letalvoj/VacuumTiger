@@ -489,6 +489,8 @@ The `sensor_status` group includes:
 | Sensor | Type | Description |
 |--------|------|-------------|
 | `bumper_left`, `bumper_right` | Bool | Bumper contact |
+| `bumper_zones` | U8 | Raw bumper byte (crl200s: b3 left side, b2 left front, b1 right front, b0 right side; unverified) |
+| `dock_ir` | U8 | Raw dock IR byte (crl200s: high nibble left receiver, low nibble right) |
 | `cliff_left_side`, `cliff_left_front` | Bool | Left cliff sensors |
 | `cliff_right_front`, `cliff_right_side` | Bool | Right cliff sensors |
 | `is_charging` | Bool | Charging state |

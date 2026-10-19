@@ -22,7 +22,8 @@ Frequency: ~110 Hz (every ~9ms, limited by 115200 baud)
 | 0x02 | 2 | 1 | Reserved | - | Unknown purpose |
 | 0x03 | 3 | 1 | Cliff Flags | u8 | Bit-field for cliff sensors |
 | 0x04 | 4 | 1 | Dustbox Flags | u8 | Bit-field for dustbox detection |
-| 0x05-0x06 | 5-6 | 2 | Reserved | - | Unknown purpose |
+| 0x05 | 5 | 1 | Reserved | - | Unknown purpose |
+| 0x06 | 6 | 1 | Dock IR | u8 | Receivers: high nibble left, low nibble right (one-hot zone; published raw as `dock_ir`) |
 | 0x07 | 7 | 1 | Charging Flags | u8 | Bit-field for charging/dock status |
 | 0x08 | 8 | 1 | Battery Voltage | u8 | Raw voltage (value / 10 = volts) |
 | 0x09-0x0F | 9-15 | 7 | Reserved | - | Unknown purpose |
