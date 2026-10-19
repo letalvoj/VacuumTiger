@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::core::types::{Point2D, Pose2D};
 use crate::exploration::{ExplorationAction, ExplorationStrategy, HazardEvent, HazardType};
 use crate::io::motion_controller::{
     MotionConfig, SharedMotionController, compute_velocity_to_target,
@@ -40,6 +41,8 @@ pub struct ExplorationConfig {
     pub motion: MotionConfig,
     /// Loop rate in Hz.
     pub loop_rate_hz: f32,
+    /// Not leaving a `STUCK_RADIUS` circle for this long ends exploration with an error.
+    pub stuck_after: Duration,
 }
 
 impl Default for ExplorationConfig {
@@ -47,6 +50,60 @@ impl Default for ExplorationConfig {
         Self {
             motion: MotionConfig::default(),
             loop_rate_hz: 10.0,
+            stuck_after: Duration::from_secs(180),
+        }
+    }
+}
+
+/// Leaving a circle of this radius (m) around where the robot was counts as progress.
+const STUCK_RADIUS: f32 = 1.0;
+/// A longer gap between two exploring ticks was a pause (navigation active, waiting for
+/// SLAM), not time spent stuck: the watch starts over.
+const STUCK_PAUSE: Duration = Duration::from_secs(1);
+
+/// Notices a robot that stays in one spot while exploring: wedged with the wheels
+/// spinning (the SLAM pose holds still while the odometry runs on), or circling among
+/// chair legs. Time-based, so it also covers a strategy that keeps turning in place.
+struct StuckWatch {
+    timeout: Duration,
+    /// Where the robot last left the circle around the previous anchor, and when.
+    anchor: Option<(Point2D, Instant)>,
+    /// The last tick it was told about.
+    last: Option<Instant>,
+}
+
+impl StuckWatch {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            anchor: None,
+            last: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.anchor = None;
+    }
+
+    /// Notes the robot at `pose`; true once it has stayed within `STUCK_RADIUS` of one
+    /// spot for `timeout`.
+    fn update(&mut self, pose: &Pose2D, now: Instant) -> bool {
+        if self
+            .last
+            .replace(now)
+            .is_some_and(|last| now.duration_since(last) > STUCK_PAUSE)
+        {
+            self.reset();
+        }
+        let here = Point2D::new(pose.x, pose.y);
+        match self.anchor {
+            Some((anchor, since)) if anchor.distance(&here) <= STUCK_RADIUS => {
+                now.duration_since(since) > self.timeout
+            }
+            _ => {
+                self.anchor = Some((here, now));
+                false
+            }
         }
     }
 }
@@ -118,6 +175,7 @@ fn run_exploration_loop(
     // A contact the strategy has not been told about yet (e.g. while waiting for SLAM).
     let mut pending_hazard: Option<HazardEvent> = None;
     let mut was_exploring = false;
+    let mut stuck_watch = StuckWatch::new(config.stuck_after);
 
     // Duration to rotate in place to build initial map (full 360° rotation)
     let initial_scan_duration =
@@ -151,6 +209,7 @@ fn run_exploration_loop(
         let exploring = exploration_mode == ExplorationMode::Exploring;
         if exploring && !was_exploring {
             strategy.reset();
+            stuck_watch.reset();
         }
         was_exploring = exploring;
 
@@ -439,6 +498,30 @@ fn run_exploration_loop(
             continue;
         }
 
+        // Ends like a completed sweep (the lidar keeps spinning, mapping goes on); only the
+        // status tells it apart (there is no failed mode).
+        if stuck_watch.update(&current_pose, Instant::now()) {
+            let status = format!(
+                "Stuck: did not leave {:.0} m around ({:.1}, {:.1}) in {:.0} s",
+                STUCK_RADIUS,
+                current_pose.x,
+                current_pose.y,
+                config.stuck_after.as_secs_f32()
+            );
+            log::error!("{}", status);
+            if let Err(e) = motion_controller.lock().unwrap().disable() {
+                log::warn!("Failed to disable motors: {}", e);
+            }
+            motion_enabled = false;
+            if let Ok(mut state) = shared_state.write() {
+                state.exploration_state.mode = ExplorationMode::Complete;
+                state.exploration_state.status = status;
+                state.exploration_state.current_target = None;
+            }
+            thread::sleep(loop_duration);
+            continue;
+        }
+
         // Get next action from strategy
         let hazard = pending_hazard.take();
         let action = strategy.next_action(&map, &current_pose, &scan.data, hazard.as_ref());
@@ -618,5 +701,48 @@ mod tests {
     fn test_exploration_config_default() {
         let config = ExplorationConfig::default();
         assert_eq!(config.loop_rate_hz, 10.0);
+    }
+
+    /// Ticks the watch at 10 Hz from `from` to `to` (s) along `path`; the first tick that
+    /// reports stuck, in seconds.
+    fn first_stuck(
+        watch: &mut StuckWatch,
+        t0: Instant,
+        (from, to): (f32, f32),
+        path: impl Fn(f32) -> Pose2D,
+    ) -> Option<f32> {
+        (0..)
+            .map(|i| from + i as f32 * 0.1)
+            .take_while(|&s| s <= to)
+            .find(|&s| watch.update(&path(s), t0 + Duration::from_secs_f32(s)))
+    }
+
+    #[test]
+    fn circling_in_one_spot_is_stuck_after_the_timeout() {
+        let timeout = ExplorationConfig::default().stuck_after;
+        let mut watch = StuckWatch::new(timeout);
+        // 0.15 m/s around a 0.5 m circle: it never leaves the 1 m one.
+        let circling = |s: f32| Pose2D::new(0.5 * (0.3 * s).cos(), 0.5 * (0.3 * s).sin(), 0.0);
+        let stuck = first_stuck(&mut watch, Instant::now(), (0.0, 300.0), circling);
+        assert!(
+            stuck
+                .is_some_and(|s| (timeout.as_secs_f32()..timeout.as_secs_f32() + 0.2).contains(&s)),
+            "{stuck:?}"
+        );
+    }
+
+    #[test]
+    fn driving_on_or_pausing_restarts_the_clock() {
+        let mut watch = StuckWatch::new(Duration::from_secs(120));
+        let t0 = Instant::now();
+        let still = |_| Pose2D::new(0.0, 0.0, 0.0);
+        // A wall run: 0.15 m/s in a straight line, never stuck.
+        let run = |s: f32| Pose2D::new(0.15 * s, 0.0, 0.0);
+        assert_eq!(first_stuck(&mut watch, t0, (0.0, 600.0), run), None);
+        // Still for 100 s, then a 60 s pause (navigation, SLAM stall), then still again:
+        // the clock starts over after the pause.
+        assert_eq!(first_stuck(&mut watch, t0, (600.0, 700.0), still), None);
+        let stuck = first_stuck(&mut watch, t0, (760.0, 1000.0), still);
+        assert!(stuck.is_some_and(|s| s > 880.0), "{stuck:?}");
     }
 }

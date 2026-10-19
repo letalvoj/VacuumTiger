@@ -439,6 +439,9 @@ pub struct ExplorationCfg {
     pub strategy: String,
     /// Loop rate for exploration thread (Hz).
     pub loop_rate_hz: f32,
+    /// Exploration stops with an error when the robot has not left a 1 m circle for this
+    /// long (s): wedged with the wheels spinning, or circling among chair legs.
+    pub stuck_after_s: f32,
     #[serde(default)]
     pub motion: ExplorationMotionConfig,
     #[serde(default)]
@@ -453,6 +456,7 @@ impl Default for ExplorationCfg {
             enabled: true,
             strategy: "frontier".to_string(),
             loop_rate_hz: 10.0,
+            stuck_after_s: 180.0,
             motion: ExplorationMotionConfig::default(),
             frontier: ExplorationFrontierConfig::default(),
             wall_follow: WallFollowConfig::default(),

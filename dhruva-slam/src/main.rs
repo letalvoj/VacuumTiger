@@ -439,6 +439,7 @@ fn run_threaded_mode_rest(
                 angular_vel: config.exploration.motion.angular_vel,
             },
             loop_rate_hz: config.exploration.loop_rate_hz,
+            stuck_after: Duration::from_secs_f32(config.exploration.stuck_after_s.max(1.0)),
         };
         let strategy: Box<dyn ExplorationStrategy> = match config.exploration.strategy.as_str() {
             "frontier" => Box::new(FrontierExploration::new(FrontierConfig {
