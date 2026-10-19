@@ -10,7 +10,7 @@
 use std::sync::{Arc, RwLock};
 
 use crate::algorithms::mapping::OccupancyGrid;
-use crate::core::types::Pose2D;
+use crate::core::types::{PointCloud2D, Pose2D, Timestamped};
 use crate::navigation::NavigationState;
 
 /// Robot operating state.
@@ -150,6 +150,8 @@ pub struct SensorStatus {
     pub lidar_angles: Vec<f32>,
     /// Latest lidar scan ranges (meters).
     pub lidar_ranges: Vec<f32>,
+    /// Latest preprocessed scan as the SLAM engine saw it (robot frame, deskewed).
+    pub scan_cloud: Timestamped<PointCloud2D>,
     /// Timestamp of last update (microseconds).
     pub timestamp_us: u64,
     /// Bumper state.

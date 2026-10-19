@@ -6,7 +6,7 @@
 //! Uses A* path planning to verify frontier reachability before selection.
 
 use crate::algorithms::planning::{AStarConfig, AStarPlanner};
-use crate::core::types::Pose2D;
+use crate::core::types::{PointCloud2D, Pose2D};
 use crate::state::CurrentMapData;
 
 use super::strategy::{ExplorationAction, ExplorationStrategy, HazardEvent};
@@ -772,6 +772,7 @@ impl ExplorationStrategy for FrontierExploration {
         &mut self,
         map: &CurrentMapData,
         current_pose: &Pose2D,
+        _scan: &PointCloud2D,
         hazard: Option<&HazardEvent>,
     ) -> ExplorationAction {
         // Store map for surrounded detection
@@ -1188,7 +1189,7 @@ mod tests {
 
         // Simulate bumper trigger using HazardEvent
         let hazard = HazardEvent::new(HazardType::BumperLeft, &pose);
-        let action = strategy.next_action(&map, &pose, Some(&hazard));
+        let action = strategy.next_action(&map, &pose, &PointCloud2D::new(), Some(&hazard));
 
         // Should get a backing up action
         assert!(matches!(action, ExplorationAction::MoveTo { .. }));
@@ -1207,7 +1208,7 @@ mod tests {
 
         // Simulate cliff sensor trigger
         let hazard = HazardEvent::new(HazardType::CliffLeftFront, &pose);
-        let action = strategy.next_action(&map, &pose, Some(&hazard));
+        let action = strategy.next_action(&map, &pose, &PointCloud2D::new(), Some(&hazard));
 
         // Should get a backing up action
         assert!(matches!(action, ExplorationAction::MoveTo { .. }));

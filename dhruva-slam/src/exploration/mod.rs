@@ -22,7 +22,7 @@
 //! let mut strategy = FrontierExploration::new(config);
 //!
 //! // In exploration loop:
-//! let action = strategy.next_action(&map, &pose, bumper_triggered);
+//! let action = strategy.next_action(&map, &pose, &scan, hazard.as_ref());
 //! match action {
 //!     ExplorationAction::MoveTo { target, .. } => { /* navigate to target */ }
 //!     ExplorationAction::Complete => { /* mapping finished */ }

@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use crate::core::types::{LaserScan, Pose2D};
+use crate::core::types::{LaserScan, Pose2D, Timestamped};
 use crate::engine::pipeline::{PipelineConfig, SlamPipeline};
 use crate::engine::slam::{SlamEngine, SlamMode};
 use crate::io::sangam_client::Message as SangamMessage;
@@ -523,6 +523,7 @@ impl SlamContext {
                 // Apply lidar angle_offset to transform from lidar frame to robot frame
                 let angle_offset = self.pipeline.preprocessor().lidar_offset().total_theta();
                 let laser_scan = &step.laser;
+                state.sensor_status.scan_cloud = Timestamped::new(step.cloud.clone(), timestamp_us);
                 state.sensor_status.lidar_ranges = laser_scan.ranges.clone();
                 state.sensor_status.lidar_angles = (0..laser_scan.ranges.len())
                     .map(|i| {

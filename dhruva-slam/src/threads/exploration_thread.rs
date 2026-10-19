@@ -11,16 +11,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::exploration::{
-    ExplorationAction, ExplorationStrategy, FrontierConfig, FrontierExploration, HazardEvent,
-    HazardType,
-};
+use crate::exploration::{ExplorationAction, ExplorationStrategy, HazardEvent, HazardType};
 use crate::io::motion_controller::{
     MotionConfig, SharedMotionController, compute_velocity_to_target,
 };
 use crate::navigation::NavState;
 use crate::navigation::NavTarget;
 use crate::state::{CliffState, ExplorationMode, SharedStateHandle};
+
+/// A SLAM scan (and so pose) older than this stops the robot: strategies steer by them.
+const SCAN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// State for initial scanning behavior when no map exists yet.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -38,8 +38,6 @@ enum InitialScanState {
 pub struct ExplorationConfig {
     /// Motion controller configuration (for velocity limits).
     pub motion: MotionConfig,
-    /// Frontier exploration configuration.
-    pub frontier: FrontierConfig,
     /// Loop rate in Hz.
     pub loop_rate_hz: f32,
 }
@@ -48,7 +46,6 @@ impl Default for ExplorationConfig {
     fn default() -> Self {
         Self {
             motion: MotionConfig::default(),
-            frontier: FrontierConfig::default(),
             loop_rate_hz: 10.0,
         }
     }
@@ -65,11 +62,13 @@ impl ExplorationThread {
     /// # Arguments
     ///
     /// - `config`: Thread configuration.
+    /// - `strategy`: What to explore with (`[exploration] strategy`).
     /// - `shared_state`: Handle to shared state.
     /// - `motion_controller`: Shared motion controller (shared with navigation thread).
     /// - `running`: Atomic flag for shutdown.
     pub fn spawn(
         config: ExplorationConfig,
+        strategy: Box<dyn ExplorationStrategy>,
         shared_state: SharedStateHandle,
         motion_controller: SharedMotionController,
         running: Arc<AtomicBool>,
@@ -77,7 +76,7 @@ impl ExplorationThread {
         let handle = thread::Builder::new()
             .name("exploration".into())
             .spawn(move || {
-                run_exploration_loop(config, shared_state, motion_controller, running);
+                run_exploration_loop(config, strategy, shared_state, motion_controller, running);
             })
             .expect("Failed to spawn exploration thread");
 
@@ -95,11 +94,12 @@ impl ExplorationThread {
 /// Main exploration loop.
 fn run_exploration_loop(
     config: ExplorationConfig,
+    mut strategy: Box<dyn ExplorationStrategy>,
     shared_state: SharedStateHandle,
     motion_controller: SharedMotionController,
     running: Arc<AtomicBool>,
 ) {
-    log::info!("Exploration thread started");
+    log::info!("Exploration thread started ({})", strategy.name());
 
     // Check if motion controller has an address configured
     let motion_available = {
@@ -107,16 +107,17 @@ fn run_exploration_loop(
         mc.has_address()
     };
 
-    // Initialize exploration strategy
-    let mut strategy: Box<dyn ExplorationStrategy> =
-        Box::new(FrontierExploration::new(config.frontier.clone()));
-
     let loop_duration = Duration::from_secs_f32(1.0 / config.loop_rate_hz);
     let mut last_bumper_state = (false, false);
     let mut last_cliff_state = CliffState::default();
     let mut motion_enabled = false;
     let mut lidar_enabled = false;
     let mut initial_scan_state = InitialScanState::NotStarted;
+    // The latest scan stamp and when it arrived.
+    let mut scan_seen = (0, Instant::now());
+    // A contact the strategy has not been told about yet (e.g. while waiting for SLAM).
+    let mut pending_hazard: Option<HazardEvent> = None;
+    let mut was_exploring = false;
 
     // Duration to rotate in place to build initial map (full 360° rotation)
     let initial_scan_duration =
@@ -126,7 +127,7 @@ fn run_exploration_loop(
         let loop_start = Instant::now();
 
         // Read current state
-        let (exploration_mode, current_pose, current_map, bumper_state, cliff_state) = {
+        let (exploration_mode, current_pose, current_map, scan, bumper_state, cliff_state) = {
             let state = match shared_state.read() {
                 Ok(s) => s,
                 Err(e) => {
@@ -140,10 +141,18 @@ fn run_exploration_loop(
                 state.exploration_state.mode,
                 state.robot_status.pose,
                 state.current_map.clone(),
+                state.sensor_status.scan_cloud.clone(),
                 state.sensor_status.bumper.clone(),
                 state.sensor_status.cliff.clone(),
             )
         };
+
+        // Every exploration session starts afresh (also after one completed).
+        let exploring = exploration_mode == ExplorationMode::Exploring;
+        if exploring && !was_exploring {
+            strategy.reset();
+        }
+        was_exploring = exploring;
 
         // Detect hazard events (rising edge detection for bumpers and cliff sensors)
         let hazard_event: Option<HazardEvent> = {
@@ -177,6 +186,9 @@ fn run_exploration_loop(
                 None
             }
         };
+
+        // Kept until the strategy hears of it, unless something else drives meanwhile.
+        pending_hazard = hazard_event.or(pending_hazard);
 
         // Update last states for edge detection
         last_bumper_state = (bumper_state.left_pressed, bumper_state.right_pressed);
@@ -267,6 +279,7 @@ fn run_exploration_loop(
 
         // Only explore if in exploration mode AND navigation is not active
         if exploration_mode != ExplorationMode::Exploring || nav_has_targets {
+            pending_hazard = None;
             // Only disable motors/lidar if exploration mode changed to Disabled
             // When yielding to navigation (nav_has_targets), keep motors enabled!
             if exploration_mode == ExplorationMode::Disabled && (motion_enabled || lidar_enabled) {
@@ -283,7 +296,6 @@ fn run_exploration_loop(
                     }
                     lidar_enabled = false;
                 }
-                strategy.reset();
                 // Reset initial scan state for next exploration session
                 initial_scan_state = InitialScanState::NotStarted;
             }
@@ -412,8 +424,24 @@ fn run_exploration_loop(
             }
         };
 
+        // SLAM publishes every scan it processes, also standing still: no new one is a stall.
+        if scan.timestamp_us != scan_seen.0 {
+            scan_seen = (scan.timestamp_us, Instant::now());
+        }
+        if scan_seen.1.elapsed() > SCAN_TIMEOUT {
+            if let Err(e) = motion_controller.lock().unwrap().set_velocity(0.0, 0.0) {
+                log::warn!("Failed to stop on a stale scan: {}", e);
+            }
+            if let Ok(mut state) = shared_state.write() {
+                state.exploration_state.status = "Waiting for SLAM".to_string();
+            }
+            thread::sleep(loop_duration);
+            continue;
+        }
+
         // Get next action from strategy
-        let action = strategy.next_action(&map, &current_pose, hazard_event.as_ref());
+        let hazard = pending_hazard.take();
+        let action = strategy.next_action(&map, &current_pose, &scan.data, hazard.as_ref());
 
         // Update shared state with exploration progress
         if let Ok(mut state) = shared_state.write() {
@@ -484,6 +512,23 @@ fn run_exploration_loop(
                 // DON'T use emergency_stop() as it disables motors
                 if let Err(e) = motion_controller.lock().unwrap().set_velocity(0.0, 0.0) {
                     log::warn!("Failed to stop before navigation handoff: {}", e);
+                }
+            }
+
+            ExplorationAction::Drive {
+                linear,
+                angular,
+                reason,
+            } => {
+                if let Err(e) = motion_controller
+                    .lock()
+                    .unwrap()
+                    .set_velocity(linear, angular)
+                {
+                    log::warn!("Failed to set velocity: {}", e);
+                }
+                if let Ok(mut state) = shared_state.write() {
+                    state.exploration_state.status = reason.to_string();
                 }
             }
 

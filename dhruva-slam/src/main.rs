@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use dhruva_slam::algorithms::planning::AStarConfig;
 use dhruva_slam::config::{Config, build_slam_thread_config};
-use dhruva_slam::exploration::FrontierConfig;
+use dhruva_slam::exploration::{ExplorationStrategy, FrontierConfig, FrontierExploration};
 use dhruva_slam::io::map_manager::MapManager;
 use dhruva_slam::io::motion_controller::{MotionConfig, create_shared_motion_controller};
 use dhruva_slam::navigation::NavigatorConfig;
@@ -436,7 +436,10 @@ fn run_threaded_mode_rest(
                 linear_vel: config.exploration.motion.linear_vel,
                 angular_vel: config.exploration.motion.angular_vel,
             },
-            frontier: FrontierConfig {
+            loop_rate_hz: config.exploration.loop_rate_hz,
+        };
+        let strategy: Box<dyn ExplorationStrategy> = match config.exploration.strategy.as_str() {
+            "frontier" => Box::new(FrontierExploration::new(FrontierConfig {
                 min_frontier_size: config.exploration.frontier.min_frontier_size,
                 frontier_detection_range: config.exploration.frontier.detection_range,
                 blocked_radius: config.exploration.frontier.blocked_radius,
@@ -445,12 +448,16 @@ fn run_threaded_mode_rest(
                 robot_radius: config.navigation.robot_radius,
                 safety_margin: config.navigation.safety_margin,
                 ..FrontierConfig::default()
-            },
-            loop_rate_hz: config.exploration.loop_rate_hz,
+            })),
+            other => {
+                log::error!("Unknown exploration strategy {other:?} (frontier)");
+                std::process::exit(1);
+            }
         };
 
         let thread = ExplorationThread::spawn(
             exploration_config,
+            strategy,
             shared_state.clone(),
             shared_motion.clone(),
             running.clone(),

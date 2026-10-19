@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 /// Generic timestamp wrapper for any data type.
 ///
 /// Timestamps are in microseconds since epoch (matches SangamIO).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Timestamped<T> {
     /// The wrapped data
     pub data: T,

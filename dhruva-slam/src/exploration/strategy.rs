@@ -6,7 +6,7 @@
 //!
 //! Note: Some types are defined for planned exploration features.
 
-use crate::core::types::Pose2D;
+use crate::core::types::{PointCloud2D, Pose2D};
 use crate::state::CurrentMapData;
 
 /// Type of hazard detected by contact sensors.
@@ -98,6 +98,15 @@ pub enum ExplorationAction {
         /// Human-readable reason for this target.
         reason: &'static str,
     },
+    /// Drive with this velocity until the next call (reactive behaviours).
+    Drive {
+        /// Linear velocity (m/s, negative = backward).
+        linear: f32,
+        /// Angular velocity (rad/s, positive = CCW).
+        angular: f32,
+        /// Human-readable reason for this motion.
+        reason: &'static str,
+    },
     /// Rotate in place to scan surroundings.
     RotateInPlace {
         /// Angle to rotate (radians, positive = CCW).
@@ -126,6 +135,7 @@ pub trait ExplorationStrategy: Send + Sync {
     /// # Arguments
     /// * `map` - Current occupancy grid map data
     /// * `current_pose` - Current robot pose in map frame
+    /// * `scan` - Latest preprocessed scan (robot frame)
     /// * `hazard` - Optional hazard event if bumper/cliff triggered since last call
     ///
     /// # Returns
@@ -134,6 +144,7 @@ pub trait ExplorationStrategy: Send + Sync {
         &mut self,
         map: &CurrentMapData,
         current_pose: &Pose2D,
+        scan: &PointCloud2D,
         hazard: Option<&HazardEvent>,
     ) -> ExplorationAction;
 
