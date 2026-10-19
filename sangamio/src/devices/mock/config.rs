@@ -55,7 +55,6 @@
 //! if simulated performance differs significantly from real-world results.
 
 use serde::Deserialize;
-use std::f32::consts::PI;
 
 // ============================================================================
 // Noise Configurations
@@ -464,16 +463,17 @@ pub struct BumpersConfig {
 fn default_bumper_trigger_distance() -> f32 {
     0.01
 }
+// The shell covers the front, ±97°; both press head-on.
 fn default_left_bumper() -> BumperZoneConfig {
     BumperZoneConfig {
-        start_angle: 0.3,
-        end_angle: PI / 2.0,
+        start_angle: -0.3,
+        end_angle: 1.7,
     }
 }
 fn default_right_bumper() -> BumperZoneConfig {
     BumperZoneConfig {
-        start_angle: -PI / 2.0,
-        end_angle: -0.3,
+        start_angle: -1.7,
+        end_angle: 0.3,
     }
 }
 

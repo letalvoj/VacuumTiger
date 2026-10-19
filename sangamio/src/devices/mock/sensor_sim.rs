@@ -2,7 +2,7 @@
 //!
 //! Provides collision-based bumper detection and map-based cliff detection.
 
-use super::config::{BumpersConfig, CliffsConfig};
+use super::config::{BumperZoneConfig, BumpersConfig, CliffsConfig};
 use super::map_loader::SimulationMap;
 use crate::core::types::ComponentAction;
 use std::collections::HashMap;
@@ -20,17 +20,9 @@ impl BumperSimulator {
         }
     }
 
-    /// Check bumper states based on map collisions
-    ///
-    /// # Arguments
-    /// * `map` - Simulation map for collision checking
-    /// * `x` - Robot X position (meters)
-    /// * `y` - Robot Y position (meters)
-    /// * `theta` - Robot orientation (radians)
-    /// * `robot_radius` - Robot collision radius (meters)
-    ///
-    /// # Returns
-    /// (left_triggered, right_triggered)
+    /// Which bumpers (left, right) touch something: a zone is pressed when any point of
+    /// its arc, `trigger_distance` out from the body, is occupied. The arc is sampled every
+    /// half cell, so a thin chair leg anywhere along it presses it, as on the real shell.
     pub fn check(
         &self,
         map: &SimulationMap,
@@ -39,43 +31,16 @@ impl BumperSimulator {
         theta: f32,
         robot_radius: f32,
     ) -> (bool, bool) {
-        let check_radius = robot_radius + self.config.trigger_distance;
-        let num_samples = 16; // Samples per bumper zone
-
-        let mut left_triggered = false;
-        let mut right_triggered = false;
-
-        // Check left bumper zone
-        let left_range = self.config.left.end_angle - self.config.left.start_angle;
-        for i in 0..num_samples {
-            let local_angle =
-                self.config.left.start_angle + (i as f32 / num_samples as f32) * left_range;
-            let world_angle = theta + local_angle;
-            let check_x = x + check_radius * world_angle.cos();
-            let check_y = y + check_radius * world_angle.sin();
-
-            if map.is_occupied(check_x, check_y) {
-                left_triggered = true;
-                break;
-            }
-        }
-
-        // Check right bumper zone
-        let right_range = self.config.right.end_angle - self.config.right.start_angle;
-        for i in 0..num_samples {
-            let local_angle =
-                self.config.right.start_angle + (i as f32 / num_samples as f32) * right_range;
-            let world_angle = theta + local_angle;
-            let check_x = x + check_radius * world_angle.cos();
-            let check_y = y + check_radius * world_angle.sin();
-
-            if map.is_occupied(check_x, check_y) {
-                right_triggered = true;
-                break;
-            }
-        }
-
-        (left_triggered, right_triggered)
+        let radius = robot_radius + self.config.trigger_distance;
+        let pressed = |zone: &BumperZoneConfig| {
+            let span = zone.end_angle - zone.start_angle;
+            let samples = (span.abs() * radius / (map.resolution() / 2.0)).ceil() as usize;
+            (0..=samples).any(|i| {
+                let angle = theta + zone.start_angle + span * i as f32 / samples.max(1) as f32;
+                map.is_occupied(x + radius * angle.cos(), y + radius * angle.sin())
+            })
+        };
+        (pressed(&self.config.left), pressed(&self.config.right))
     }
 }
 
@@ -199,6 +164,41 @@ mod tests {
 
         assert!(!left);
         assert!(!right);
+    }
+
+    #[test]
+    fn a_thin_leg_presses_the_shell_where_it_touches() {
+        let bumper = BumperSimulator::new(&BumpersConfig::default());
+        // A 2 cm chair leg on a 1 cm map, touching the shell of a robot at (1, 1)
+        // from `bearing` (radians, CCW from the robot's heading).
+        let leg = |bearing: f32| {
+            let (lx, ly) = (1.0 + 0.175 * bearing.cos(), 1.0 + 0.175 * bearing.sin());
+            let img = image::GrayImage::from_fn(200, 200, |px, py| {
+                let (x, y) = ((px as f32 + 0.5) * 0.01, (199 - py) as f32 * 0.01 + 0.005);
+                let inside = (x - lx).hypot(y - ly) < 0.01;
+                image::Luma([if inside { 0 } else { 255 }])
+            });
+            SimulationMap::from_image(img, 0.01, (0.0, 0.0))
+        };
+        let pressed = |bearing: f32| bumper.check(&leg(bearing), 1.0, 1.0, 0.0, 0.17);
+
+        // Every 0.05 rad along the shell (finer than the old 16 samples per zone), away
+        // from the overlap's edges, where the 2 cm leg straddles them.
+        for i in -32..=32 {
+            let bearing = i as f32 * 0.05;
+            let want = match bearing {
+                b if b.abs() < 0.2 => (true, true),
+                b if b > 0.4 => (true, false),
+                b if b < -0.4 => (false, true),
+                _ => continue,
+            };
+            assert_eq!(pressed(bearing), want, "a leg at {bearing:.2} rad");
+        }
+        assert_eq!(
+            pressed(std::f32::consts::PI),
+            (false, false),
+            "the back has no shell"
+        );
     }
 
     #[test]
