@@ -15,7 +15,7 @@
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
-use crate::io::sangam_udp_receiver::{LidarData, SangamUdpReceiver, SensorStatusData};
+use crate::io::sangam_udp_receiver::Sample;
 
 /// The channel dwar records the raw SangamIO stream on.
 const SANGAMIO_TOPIC: &str = "/sangamio/message";
@@ -116,56 +116,20 @@ fn sgio_frames(
     Ok(())
 }
 
-/// A recorded sensor sample, decoded for the SLAM pipeline.
-#[derive(Debug, Clone)]
-pub enum Sample {
-    /// Wheel encoders, gyro, bumpers, cliffs (the `sensor_status` group).
-    Status(SensorStatusData),
-    /// One lidar revolution (the `lidar` group).
-    Lidar(LidarData),
-}
-
-impl Sample {
-    /// Data time of the sample.
-    pub fn timestamp_us(&self) -> u64 {
-        match self {
-            Sample::Status(d) => d.timestamp_us,
-            Sample::Lidar(d) => d.timestamp_us,
-        }
-    }
-}
-
 /// Call `f` with every `sensor_status` and `lidar` group of a recording, decoded,
 /// in order. Other groups (kinematics, versions) and commands are skipped;
-/// frames that don't decode, or sensor groups that don't parse, are skipped and
-/// counted in one warning at the end.
+/// malformed frames are skipped and counted in one warning at the end.
 pub fn for_each_sample(
     path: &Path,
     mut f: impl FnMut(Sample) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    use crate::io::sangam_client::proto::sangamio;
-    use prost::Message as _;
-
     let mut malformed = 0usize;
-    let result = for_each_frame(path, |body| {
-        let Ok(msg) = sangamio::Message::decode(body) else {
+    let result = for_each_frame(path, |body| match Sample::decode(body) {
+        Ok(Some(s)) => f(s),
+        Ok(None) => Ok(()),
+        Err(_) => {
             malformed += 1;
-            return Ok(());
-        };
-        let Some(sangamio::message::Payload::SensorGroup(sg)) = msg.payload else {
-            return Ok(());
-        };
-        let sample = match sg.group_id.as_str() {
-            "sensor_status" => SangamUdpReceiver::parse_sensor_status(&sg).map(Sample::Status),
-            "lidar" => SangamUdpReceiver::parse_lidar(&sg).map(Sample::Lidar),
-            _ => return Ok(()),
-        };
-        match sample {
-            Some(s) => f(s),
-            None => {
-                malformed += 1;
-                Ok(())
-            }
+            Ok(())
         }
     });
     if malformed > 0 {

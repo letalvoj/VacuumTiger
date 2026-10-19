@@ -152,6 +152,47 @@ pub struct LidarData {
     pub points: Vec<LidarPoint>,
 }
 
+/// A sensor sample for the SLAM pipeline, decoded from one SangamIO message: the live
+/// stream, a recording and the simulator all go through [`Sample::decode`].
+#[derive(Debug, Clone)]
+pub enum Sample {
+    /// Wheel encoders, gyro, bumpers, cliffs (the `sensor_status` group).
+    Status(SensorStatusData),
+    /// One lidar revolution (the `lidar` group).
+    Lidar(LidarData),
+}
+
+impl Sample {
+    /// Decode a protobuf `Message` (without the length prefix). `Ok(None)` for messages
+    /// SLAM does not use (commands, other sensor groups); an error for malformed ones.
+    pub fn decode(body: &[u8]) -> Result<Option<Sample>> {
+        let msg = sangamio::Message::decode(body)?;
+        let Some(sangamio::message::Payload::SensorGroup(sg)) = msg.payload else {
+            return Ok(None);
+        };
+        let sample = match sg.group_id.as_str() {
+            "sensor_status" => SangamUdpReceiver::parse_sensor_status(&sg).map(Sample::Status),
+            "lidar" => SangamUdpReceiver::parse_lidar(&sg).map(Sample::Lidar),
+            _ => return Ok(None),
+        };
+        let Some(sample) = sample else {
+            return Err(ReceiverError::Decode(format!(
+                "malformed {} group at {} us",
+                sg.group_id, sg.timestamp_us
+            )));
+        };
+        Ok(Some(sample))
+    }
+
+    /// Data time of the sample.
+    pub fn timestamp_us(&self) -> u64 {
+        match self {
+            Sample::Status(d) => d.timestamp_us,
+            Sample::Lidar(d) => d.timestamp_us,
+        }
+    }
+}
+
 /// Channel capacity for sensor data. Era 8: com o sensor a ~323Hz e o SLAM thread
 /// ocupado no scan matching, o canal enchia e o try_send do receiver DROPAVA a
 /// odometria (odom_delta ~0). Subido bastante p/ absorver o burst sem perder.
@@ -230,6 +271,9 @@ impl SangamUdpReceiver {
         let mut buffer = vec![0u8; MAX_DATAGRAM_SIZE];
         let mut packet_count: u64 = 0;
         let mut last_log_time = std::time::Instant::now();
+        // Malformed messages in this 5 s window, and the last one's error: reported once
+        // per window, not at 110 Hz.
+        let mut malformed: (u64, Option<ReceiverError>) = (0, None);
 
         while self.running.load(Ordering::Relaxed) {
             // Receive UDP datagram
@@ -251,6 +295,11 @@ impl SangamUdpReceiver {
                     packet_count,
                     _src
                 );
+                if let (n, Some(e)) = std::mem::take(&mut malformed) {
+                    log::warn!(
+                        "UDP receiver: dropped {n} malformed messages in 5 s, the last: {e}"
+                    );
+                }
                 packet_count = 0;
                 last_log_time = std::time::Instant::now();
             }
@@ -271,41 +320,17 @@ impl SangamUdpReceiver {
                 continue;
             }
 
-            // Decode protobuf
-            let proto_msg = match sangamio::Message::decode(&buffer[4..4 + msg_len]) {
-                Ok(m) => m,
-                Err(e) => {
-                    log::warn!("Failed to decode protobuf: {}", e);
-                    continue;
+            // Non-blocking sends: when a channel is full, the sample is dropped (old data).
+            match Sample::decode(&buffer[4..4 + msg_len]) {
+                Ok(Some(Sample::Status(data))) => {
+                    self.sensor_tx.try_send(data).ok();
                 }
-            };
-
-            // Extract sensor group
-            let sensor_group = match proto_msg.payload {
-                Some(sangamio::message::Payload::SensorGroup(sg)) => sg,
-                _ => continue,
-            };
-
-            // Route based on group_id
-            match sensor_group.group_id.as_str() {
-                "sensor_status" => {
-                    if let Some(data) = Self::parse_sensor_status(&sensor_group) {
-                        // Non-blocking send - drop if channel full (old data)
-                        self.sensor_tx.try_send(data).ok();
-                    }
+                Ok(Some(Sample::Lidar(data))) => {
+                    log::debug!("Lidar scan received: {} points", data.points.len());
+                    self.lidar_tx.try_send(data).ok();
                 }
-                "lidar" => {
-                    if let Some(data) = Self::parse_lidar(&sensor_group) {
-                        log::debug!("Lidar scan received: {} points", data.points.len());
-                        // Non-blocking send - drop if channel full
-                        self.lidar_tx.try_send(data).ok();
-                    } else {
-                        log::warn!("Failed to parse lidar data from sensor group");
-                    }
-                }
-                other => {
-                    log::debug!("Ignoring unknown group_id: {}", other);
-                }
+                Ok(None) => {}
+                Err(e) => malformed = (malformed.0 + 1, Some(e)),
             }
         }
 
@@ -313,7 +338,7 @@ impl SangamUdpReceiver {
     }
 
     /// Parse sensor_status group into SensorStatusData.
-    pub fn parse_sensor_status(sg: &sangamio::SensorGroup) -> Option<SensorStatusData> {
+    fn parse_sensor_status(sg: &sangamio::SensorGroup) -> Option<SensorStatusData> {
         let values = &sg.values;
 
         let left_encoder = Self::get_u32(values, "wheel_left")? as u16;
@@ -337,7 +362,7 @@ impl SangamUdpReceiver {
     }
 
     /// Parse lidar group into LidarData.
-    pub fn parse_lidar(sg: &sangamio::SensorGroup) -> Option<LidarData> {
+    fn parse_lidar(sg: &sangamio::SensorGroup) -> Option<LidarData> {
         let points: Vec<LidarPoint> = if let Some(scan) = sg.values.get("scan") {
             match &scan.value {
                 Some(sangamio::sensor_value::Value::PointcloudVal(pc)) => pc
@@ -382,5 +407,38 @@ impl SangamUdpReceiver {
             sangamio::sensor_value::Value::BoolVal(v) => Some(*v),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group(id: &str) -> Vec<u8> {
+        sangamio::Message {
+            topic: format!("sensors/{id}"),
+            payload: Some(sangamio::message::Payload::SensorGroup(
+                sangamio::SensorGroup {
+                    group_id: id.into(),
+                    timestamp_us: 7,
+                    values: HashMap::new(),
+                },
+            )),
+        }
+        .encode_to_vec()
+    }
+
+    #[test]
+    fn decode_skips_unused_groups_and_rejects_broken_ones() {
+        assert!(matches!(Sample::decode(&group("kinematics")), Ok(None)));
+        assert!(
+            Sample::decode(&group("lidar")).is_err(),
+            "a lidar group without a scan"
+        );
+        assert!(
+            Sample::decode(&group("sensor_status")).is_err(),
+            "no encoders"
+        );
+        assert!(Sample::decode(b"not protobuf").is_err());
     }
 }

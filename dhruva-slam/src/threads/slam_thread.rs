@@ -614,7 +614,8 @@ pub fn run_replay(
     input: &std::path::Path,
     out_dir: &std::path::Path,
 ) -> std::io::Result<ReplayReport> {
-    use crate::io::recording::{Sample, for_each_sample};
+    use crate::io::recording::for_each_sample;
+    use crate::io::sangam_udp_receiver::Sample;
     use std::io::Write;
 
     std::fs::create_dir_all(out_dir)?;

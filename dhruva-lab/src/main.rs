@@ -35,7 +35,8 @@ use dhruva_slam::core::types::{LaserScan, Point2D, Pose2D};
 use dhruva_slam::engine::graph::PoseGraph;
 use dhruva_slam::engine::pipeline::SlamPipeline;
 use dhruva_slam::engine::slam::{SlamEngine, SlamMode};
-use dhruva_slam::io::recording::{Sample, for_each_sample};
+use dhruva_slam::io::recording::for_each_sample;
+use dhruva_slam::io::sangam_udp_receiver::Sample;
 
 #[derive(Parser)]
 #[command(about = "Replay a recording through dhruva-slam and trace every step")]
