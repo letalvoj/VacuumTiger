@@ -24,6 +24,7 @@ use std::time::Instant;
 
 use clap::Parser;
 use dhruva_slam::algorithms::mapping::{FloorPlan, FloorPlanConfig, OccupancyGrid};
+use dhruva_slam::algorithms::relocalisation::{Placement, Relocaliser, RelocaliserConfig};
 use dhruva_slam::config::{Config, build_slam_thread_config};
 use dhruva_slam::core::types::{LaserScan, Pose2D};
 use dhruva_slam::engine::graph::PoseGraph;
@@ -55,9 +56,9 @@ struct Args {
     #[arg(long, default_value = "0:1", value_parser = window)]
     window: (f64, f64),
     /// Floor plan to merge the final map into (created if missing), as one more
-    /// session; also renders it as `floor_plan.png`. The run is taken as already
-    /// aligned with the plan (no relocalisation yet). Each call counts as a session,
-    /// so replaying the same run twice votes twice.
+    /// session; also renders it as `floor_plan.png`. A run merged into an existing
+    /// plan is placed in it by relocalisation (and left out if it is not found). Each
+    /// call counts as a session, so replaying the same run twice votes twice.
     #[arg(long)]
     floor_plan: Option<PathBuf>,
 }
@@ -117,6 +118,15 @@ fn run(args: Args) -> Result<(), String> {
     let mut last_map_us = 0u64;
     let wall = Instant::now();
 
+    // A floor plan that already has content: find this run in it before merging. An
+    // unreadable plan stops the run before any work.
+    let plan = args.floor_plan.as_deref().map(load_floor_plan).transpose()?;
+    let mut relocaliser = plan
+        .as_ref()
+        .filter(|p| p.dimensions() != (0, 0))
+        .map(|p| Relocaliser::new(&p.to_grid(), RelocaliserConfig::default()));
+    let mut placement = (Placement::Searching, 0);
+
     let (lo, hi) = window_bounds_us(&args.recording, args.window)?;
     for_each_sample(&args.recording, |sample| {
         // Compared as f64 on purpose: the same cut as sgio2bag.py, see window_bounds_us.
@@ -156,6 +166,13 @@ fn run(args: Args) -> Result<(), String> {
                     points: step.cloud.len(),
                     anchor: anchor.map(|kf| (kf.id, kf.pose.inverse().compose(&result.pose))),
                 });
+                if let Some(r) = relocaliser.as_mut() {
+                    let state = r.update(&step.cloud, &result.pose);
+                    // Remember the scan at which the search last changed state.
+                    if state != placement.0 {
+                        placement = (state, rows.len());
+                    }
+                }
                 if step.timestamp_us.saturating_sub(last_map_us) >= map_every_us {
                     trace.map(step.timestamp_us, pipeline.slam_mut().global_map());
                     last_map_us = step.timestamp_us;
@@ -196,9 +213,19 @@ fn run(args: Args) -> Result<(), String> {
     let grid = pipeline.slam_mut().global_map().clone();
     let graph = pipeline.slam().pose_graph();
     render::map_png(&args.out.join("map.png"), &grid, &rows, graph)?;
-    if let Some(path) = &args.floor_plan {
-        // A refused merge (e.g. a misaligned run) leaves the plan and the run's outputs be.
-        if let Err(e) = merge_floor_plan(path, &grid, &args.out.join("floor_plan.png")) {
+    // The run goes into the plan where relocalisation put it; a new plan starts in its frame.
+    let to_plan = match (&relocaliser, placement.0) {
+        (None, _) => Some(Pose2D::identity()),
+        (Some(_), Placement::Committed(to_plan)) => Some(to_plan),
+        (Some(_), _) => None,
+    };
+    if let (Some(mut plan), Some(path)) = (plan, &args.floor_plan) {
+        let png = args.out.join("floor_plan.png");
+        // A refused merge leaves the plan and the run's other outputs be.
+        let merged = to_plan
+            .ok_or_else(|| format!("run not located in the plan ({:?})", placement.0))
+            .and_then(|t| update_floor_plan(&mut plan, path, &grid, &t, &png));
+        if let Err(e) = merged {
             eprintln!("floor plan not updated: {e}");
         }
     }
@@ -211,6 +238,13 @@ fn run(args: Args) -> Result<(), String> {
         "graph_nodes": graph.num_nodes(),
         "loop_closures": graph.num_loop_closures(),
     });
+    if relocaliser.is_some() {
+        summary["relocalisation"] = serde_json::json!({
+            "state": format!("{:?}", placement.0),
+            "scans": placement.1,
+            "to_plan": to_plan.map(|t| [t.x, t.y, t.theta]),
+        });
+    }
     if let Some(reference) = &args.reference {
         let score = metrics::against_reference(&rows, reference)?;
         summary["reference"] = score;
@@ -225,17 +259,26 @@ fn run(args: Args) -> Result<(), String> {
     Ok(())
 }
 
-/// Merges `grid` into the floor plan at `path` (a new one if there is none yet) and
-/// renders the result to `png`.
-fn merge_floor_plan(path: &Path, grid: &OccupancyGrid, png: &Path) -> Result<(), String> {
-    let mut plan = match FloorPlan::load(path) {
-        Ok(plan) => plan,
+/// The floor plan at `path`, or a new empty one if there is none yet.
+fn load_floor_plan(path: &Path) -> Result<FloorPlan, String> {
+    match FloorPlan::load(path) {
+        Ok(plan) => Ok(plan),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            FloorPlan::new(FloorPlanConfig::default())?
+            FloorPlan::new(FloorPlanConfig::default())
         }
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    };
-    plan.merge(grid, &Pose2D::identity())?;
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// Merges `grid` into `plan` through `to_plan`, saves it to `path` and renders it to `png`.
+fn update_floor_plan(
+    plan: &mut FloorPlan,
+    path: &Path,
+    grid: &OccupancyGrid,
+    to_plan: &Pose2D,
+    png: &Path,
+) -> Result<(), String> {
+    plan.merge(grid, to_plan)?;
     plan.save(path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     render::map_png(png, &plan.to_grid(), &[], &PoseGraph::new())
