@@ -81,6 +81,8 @@ const OFFSET_MAX: f32 = 0.02;
 const TOUCH_BACKOFF: f32 = 0.015;
 /// …then turn away by this much (rad).
 const TOUCH_TURN: f32 = 0.2;
+/// The slowest driving gets near what is ahead (m/s): see `regulated_speed`.
+const SLOW_SPEED: f32 = 0.12;
 /// A turn in place is done within this angle (rad); it turns at `SPIN_GAIN` per radian
 /// left (1/s), at least `MIN_SPIN` (rad/s).
 const TURN_TOLERANCE: f32 = 0.06;
@@ -133,7 +135,7 @@ pub struct WallFollowConfig {
     /// Robot body radius (m); taken from `[navigation] robot_radius`.
     #[serde(skip)]
     pub robot_radius: f32,
-    /// Forward speed (m/s).
+    /// Forward speed (m/s) with the way clear: see `Tuning::slow_within`.
     pub speed: f32,
     /// Cap on the turn rate, on the spot and while driving (rad/s).
     pub turn_rate: f32,
@@ -154,7 +156,7 @@ impl Default for WallFollowConfig {
         Self {
             side: WallSide::Right,
             robot_radius: 0.17,
-            speed: 0.17,
+            speed: 0.3,
             turn_rate: 0.8,
             lap_radius: 0.3,
             lap_overlap: 0.5,
@@ -180,6 +182,9 @@ pub struct Tuning {
     /// edge, on either side: a wall ahead takes over from the one alongside as the body
     /// reaches it, so the corner gets swept.
     pub front_look: f32,
+    /// Driving slows as what is ahead comes within this distance beyond `front_look` (m):
+    /// see `regulated_speed`.
+    pub slow_within: f32,
     /// Reverse this far after a bump (m), room to turn on the spot…
     pub backoff_distance: f32,
     /// …then nudge away by this much (rad).
@@ -201,6 +206,7 @@ impl Default for Tuning {
             k_turn: 2.0,
             spin_angle: 0.35,
             front_look: 0.067,
+            slow_within: 0.3,
             backoff_distance: 0.05,
             nudge: 0.6,
             first_touch: 0.5,
@@ -571,14 +577,31 @@ impl WallFollower {
     }
 
     /// Turns by `error` (rad, mirrored): on the spot when it is large, else while driving.
-    fn steer(&self, error: f32, reason: &'static str) -> (f32, f32, &'static str) {
+    fn steer(
+        &self,
+        error: f32,
+        points: &[Point2D],
+        reason: &'static str,
+    ) -> (f32, f32, &'static str) {
         let cfg = self.config;
         if error.abs() > cfg.tuning.spin_angle {
             (0.0, self.spin(error), reason)
         } else {
             let angular = (cfg.tuning.k_turn * error).clamp(-cfg.turn_rate, cfg.turn_rate);
-            (cfg.speed, angular, reason)
+            (self.regulated_speed(points), angular, reason)
         }
+    }
+
+    /// `speed` with the way clear, down to `SLOW_SPEED` as what is ahead comes within
+    /// `slow_within` beyond `front_look` (as Nav2's regulated pure pursuit slows near
+    /// obstacles): the drive's lag carries a fast body farther into what it meets.
+    fn regulated_speed(&self, points: &[Point2D]) -> f32 {
+        let cfg = self.config;
+        let slow = SLOW_SPEED.min(cfg.speed);
+        let ahead =
+            (points.iter().filter_map(|p| self.free_travel(p))).fold(f32::INFINITY, f32::min);
+        let clear = ((ahead - cfg.tuning.front_look) / cfg.tuning.slow_within).clamp(0.0, 1.0);
+        slow + (cfg.speed - slow) * clear
     }
 
     /// Turns on the spot to `heading`; `None` once there.
@@ -783,7 +806,7 @@ impl WallFollower {
                     } else {
                         "driving to the nearest wall"
                     };
-                    return self.steer(error, reason);
+                    return self.steer(error, points, reason);
                 }
                 Phase::BackOff {
                     from,
@@ -821,6 +844,7 @@ impl WallFollower {
                     leg,
                 } => {
                     let v = self.to_robot(pose, &vertex);
+                    // At full speed (past a corner the way is mostly clear): early enough.
                     let lead = cfg.speed * LAG;
                     let next = match leg {
                         Leg::Out if v.x <= lead - self.clear_past() => Some(Phase::Past {
@@ -849,7 +873,7 @@ impl WallFollower {
                         continue;
                     }
                     let error = self.mirror() * angle_diff(pose.theta, heading);
-                    return self.steer(error, "driving round an outer corner");
+                    return self.steer(error, points, "driving round an outer corner");
                 }
                 Phase::Done => return (0.0, 0.0, "lap closed"),
             }
@@ -984,6 +1008,27 @@ mod tests {
         // Into it: it turns out on the spot.
         let (v, w) = tick(&mut f, &wall_at(-r + 0.01));
         assert!(v == 0.0 && w > 0.0, "v {v} w {w}");
+    }
+
+    #[test]
+    fn slows_down_as_what_is_ahead_comes_near() {
+        let f = following(WallSide::Right);
+        let (r, t) = (f.config.robot_radius, f.config.tuning);
+        let ahead = |s: f32| [Point2D::new(r + s, 0.0)];
+        assert_eq!(f.regulated_speed(&[]), f.config.speed);
+        assert_eq!(
+            f.regulated_speed(&ahead(t.front_look + t.slow_within + 0.01)),
+            f.config.speed
+        );
+        let half = f.regulated_speed(&ahead(t.front_look + t.slow_within / 2.0));
+        assert!(
+            (half - (SLOW_SPEED + f.config.speed) / 2.0).abs() < 1e-4,
+            "{half}"
+        );
+        assert_eq!(f.regulated_speed(&ahead(t.front_look)), SLOW_SPEED);
+        // Beside the path or behind: no slower.
+        let off = [Point2D::new(r, -r - 0.01), Point2D::new(-r - 0.01, 0.0)];
+        assert_eq!(f.regulated_speed(&off), f.config.speed);
     }
 
     #[test]

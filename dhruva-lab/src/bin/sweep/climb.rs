@@ -26,6 +26,7 @@ const KNOBS: &[Knob] = &[
     Knob { name: "tuning.k_turn", at: |c| &mut c.tuning.k_turn, min: 0.5, max: 5.0, factor: 1.3 },
     Knob { name: "tuning.spin_angle", at: |c| &mut c.tuning.spin_angle, min: 0.15, max: 0.8, factor: 1.3 },
     Knob { name: "tuning.front_look", at: |c| &mut c.tuning.front_look, min: 0.005, max: 0.08, factor: 1.5 },
+    Knob { name: "tuning.slow_within", at: |c| &mut c.tuning.slow_within, min: 0.05, max: 0.6, factor: 1.5 },
     Knob { name: "tuning.backoff_distance", at: |c| &mut c.tuning.backoff_distance, min: 0.01, max: 0.1, factor: 1.5 },
     Knob { name: "tuning.nudge", at: |c| &mut c.tuning.nudge, min: 0.1, max: 0.8, factor: 1.3 },
     Knob { name: "tuning.first_touch", at: |c| &mut c.tuning.first_touch, min: 0.2, max: 2.0, factor: 1.5 },
