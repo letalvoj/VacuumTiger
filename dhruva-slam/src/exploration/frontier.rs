@@ -157,16 +157,18 @@ impl FrontierExploration {
         let radius_sq = self.config.blocked_radius * self.config.blocked_radius;
         let now = std::time::Instant::now();
 
-        self.recently_visited.iter().any(|((vx, vy), visited_time)| {
-            // Check if still in cooldown
-            if now.duration_since(*visited_time).as_secs_f32() > self.visited_cooldown_secs {
-                return false;
-            }
-            // Check if frontier is near this visited location
-            let dx = frontier.centroid.x - vx;
-            let dy = frontier.centroid.y - vy;
-            (dx * dx + dy * dy) < radius_sq
-        })
+        self.recently_visited
+            .iter()
+            .any(|((vx, vy), visited_time)| {
+                // Check if still in cooldown
+                if now.duration_since(*visited_time).as_secs_f32() > self.visited_cooldown_secs {
+                    return false;
+                }
+                // Check if frontier is near this visited location
+                let dx = frontier.centroid.x - vx;
+                let dy = frontier.centroid.y - vy;
+                (dx * dx + dy * dy) < radius_sq
+            })
     }
 
     /// Clean up expired entries from recently_visited list.
@@ -774,6 +776,7 @@ impl ExplorationStrategy for FrontierExploration {
         current_pose: &Pose2D,
         _scan: &PointCloud2D,
         hazard: Option<&HazardEvent>,
+        _contact: bool,
     ) -> ExplorationAction {
         // Store map for surrounded detection
         self.last_map = Some(map.clone());
@@ -1077,8 +1080,10 @@ impl ExplorationStrategy for FrontierExploration {
 
             // Add to recently visited cooldown list to prevent immediate re-selection
             // This handles the case where we reached "close enough" but didn't fully clear the frontier
-            self.recently_visited
-                .push(((target.centroid.x, target.centroid.y), std::time::Instant::now()));
+            self.recently_visited.push((
+                (target.centroid.x, target.centroid.y),
+                std::time::Instant::now(),
+            ));
         }
 
         // Clear current target - navigation completed
@@ -1189,7 +1194,7 @@ mod tests {
 
         // Simulate bumper trigger using HazardEvent
         let hazard = HazardEvent::new(HazardType::BumperLeft, &pose);
-        let action = strategy.next_action(&map, &pose, &PointCloud2D::new(), Some(&hazard));
+        let action = strategy.next_action(&map, &pose, &PointCloud2D::new(), Some(&hazard), true);
 
         // Should get a backing up action
         assert!(matches!(action, ExplorationAction::MoveTo { .. }));
@@ -1208,7 +1213,7 @@ mod tests {
 
         // Simulate cliff sensor trigger
         let hazard = HazardEvent::new(HazardType::CliffLeftFront, &pose);
-        let action = strategy.next_action(&map, &pose, &PointCloud2D::new(), Some(&hazard));
+        let action = strategy.next_action(&map, &pose, &PointCloud2D::new(), Some(&hazard), true);
 
         // Should get a backing up action
         assert!(matches!(action, ExplorationAction::MoveTo { .. }));

@@ -486,6 +486,7 @@ impl ExplorationStrategy for WallFollower {
         current_pose: &Pose2D,
         scan: &PointCloud2D,
         hazard: Option<&HazardEvent>,
+        _contact: bool,
     ) -> ExplorationAction {
         self.track(current_pose);
         let before = self.phase;
@@ -571,7 +572,7 @@ mod tests {
     }
 
     fn tick(f: &mut WallFollower, scan: &PointCloud2D) -> (f32, f32) {
-        drive(f.next_action(&no_map(), &Pose2D::identity(), scan, None))
+        drive(f.next_action(&no_map(), &Pose2D::identity(), scan, None, false))
     }
 
     fn wall_at(y: f32) -> PointCloud2D {
@@ -648,11 +649,11 @@ mod tests {
         let r = f.config.robot_radius;
         let mut wall = PointCloud2D::new();
         segment_scan(&mut wall, (r, -0.3), (r, 0.3));
-        let (v, w) = drive(f.next_action(&no_map(), &pose, &wall, Some(&bump)));
+        let (v, w) = drive(f.next_action(&no_map(), &pose, &wall, Some(&bump), true));
         assert!(v < 0.0 && w == 0.0, "backs off: {v} {w}");
         // The pose does not move here, so the back-off ends by its tick limit.
         for _ in 0..MAX_BACKOFF_TICKS {
-            f.next_action(&no_map(), &pose, &wall, None);
+            f.next_action(&no_map(), &pose, &wall, None, false);
         }
         let Phase::Turn { heading, .. } = f.phase else {
             panic!("turns after backing off: {:?}", f.phase);
@@ -662,7 +663,7 @@ mod tests {
         // On the side away from the wall, the nudge is towards it.
         let mut f = following(WallSide::Right);
         let bump = HazardEvent::new(HazardType::BumperLeft, &pose);
-        f.next_action(&no_map(), &pose, &wall, Some(&bump));
+        f.next_action(&no_map(), &pose, &wall, Some(&bump), true);
         assert!(matches!(f.phase, Phase::BackOff { turn, .. } if turn == -nudge));
     }
 
@@ -671,7 +672,7 @@ mod tests {
         let mut f = following(WallSide::Right);
         let pose = Pose2D::identity();
         let bump = HazardEvent::new(HazardType::BumperBoth, &pose);
-        f.next_action(&no_map(), &pose, &PointCloud2D::new(), Some(&bump));
+        f.next_action(&no_map(), &pose, &PointCloud2D::new(), Some(&bump), true);
         let Phase::BackOff { turn, .. } = f.phase else {
             panic!("backs off: {:?}", f.phase);
         };
@@ -696,7 +697,7 @@ mod tests {
             ys: vec![0.0, -0.3, -0.6, 0.5],
             ..Default::default()
         };
-        let (v, w) = drive(f.next_action(&no_map(), &Pose2D::identity(), &scan, None));
+        let (v, w) = drive(f.next_action(&no_map(), &Pose2D::identity(), &scan, None, false));
         assert!(v == 0.0 && w < 0.0, "turns right on the spot: {v} {w}");
         // Facing it, it drives straight at it.
         let mut f = WallFollower::new(WallFollowConfig::default());
@@ -717,7 +718,7 @@ mod tests {
         let start = Pose2D::identity();
         let at = |f: &mut WallFollower, travelled: f32| {
             f.travelled = travelled;
-            f.next_action(&map, &start, &scan, None)
+            f.next_action(&map, &start, &scan, None, false)
         };
         assert!(matches!(at(&mut f, 0.0), ExplorationAction::Drive { .. }));
         assert!(
@@ -734,7 +735,7 @@ mod tests {
         let mut f = WallFollower::new(WallFollowConfig::default());
         let at = Pose2D::new(1.0, 2.0, 0.0);
         let bump = HazardEvent::new(HazardType::BumperBoth, &at);
-        f.next_action(&no_map(), &at, &PointCloud2D::new(), Some(&bump));
+        f.next_action(&no_map(), &at, &PointCloud2D::new(), Some(&bump), true);
         assert_eq!(f.lap_start.map(|(p, _)| (p.x, p.y)), Some((1.0, 2.0)));
     }
 }

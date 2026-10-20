@@ -71,8 +71,8 @@ pub enum Command {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tick {
-    /// Stop at once first: something is touched (the drive interlock lets the strategy
-    /// back off or turn right after).
+    /// Stop at once first: something was just touched (the drive interlock lets the
+    /// strategy back off or turn right after).
     pub halt: bool,
     pub command: Command,
     pub status: String,
@@ -198,7 +198,9 @@ impl Session {
         let hazard = self.new_contact(inputs);
         let new_contact = hazard.is_some();
         self.pending_hazard = hazard.or(self.pending_hazard.take());
-        let halt = inputs.contact();
+        // Stop once at a new contact; the drive interlock keeps it from pushing on while
+        // the strategy backs off or turns.
+        let halt = new_contact;
 
         // SLAM publishes every scan it processes, also standing still: no new one is a
         // stall. Nothing moves before scans flow: SangamIO holds its command channel while
@@ -235,7 +237,7 @@ impl Session {
         }
 
         let scan = inputs.scan.data.seen_from(&inputs.pose);
-        self.act(map, &inputs.pose, &scan, halt)
+        self.act(map, &inputs.pose, &scan, halt, inputs.contact())
     }
 
     /// A contact that was not there last tick, the most urgent first.
@@ -320,10 +322,14 @@ impl Session {
         pose: &Pose2D,
         scan: &PointCloud2D,
         halt: bool,
+        contact: bool,
     ) -> Tick {
         let hazard = self.pending_hazard.take();
         let motion = &self.motion;
-        match self.strategy.next_action(map, pose, scan, hazard.as_ref()) {
+        match self
+            .strategy
+            .next_action(map, pose, scan, hazard.as_ref(), contact)
+        {
             ExplorationAction::MoveTo { target, reason } => {
                 let velocity = compute_velocity_to_target(
                     pose.x, pose.y, pose.theta, target.x, target.y, motion,
@@ -477,6 +483,7 @@ mod tests {
             _pose: &Pose2D,
             scan: &PointCloud2D,
             hazard: Option<&HazardEvent>,
+            _contact: bool,
         ) -> ExplorationAction {
             let mut seen = self.0.lock().unwrap();
             seen.scan = Some(scan.clone());
@@ -569,14 +576,14 @@ mod tests {
     }
 
     #[test]
-    fn a_contact_halts_and_the_strategy_hears_of_it_once() {
+    fn a_new_contact_halts_once_and_the_strategy_hears_of_it_once() {
         let (mut session, seen) = session_seeing();
         let t0 = Instant::now();
         let origin = Pose2D::identity();
         let mut pressed = inputs(1, origin, origin);
         pressed.bumper = (true, false);
         assert!(session.tick(&pressed, t0).halt);
-        assert!(session.tick(&pressed, t0).halt, "halts while pressed");
+        assert!(!session.tick(&pressed, t0).halt, "once, not while pressed");
         assert!(!session.tick(&inputs(1, origin, origin), t0).halt);
         assert_eq!(seen.lock().unwrap().hazards, 1);
     }

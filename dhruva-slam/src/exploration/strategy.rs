@@ -137,6 +137,7 @@ pub trait ExplorationStrategy: Send + Sync {
     /// * `current_pose` - Current robot pose in map frame
     /// * `scan` - Latest preprocessed scan (robot frame)
     /// * `hazard` - Optional hazard event if bumper/cliff triggered since last call
+    /// * `contact` - Whether a bumper or cliff sensor is pressed now
     ///
     /// # Returns
     /// The next action the robot should take.
@@ -146,6 +147,7 @@ pub trait ExplorationStrategy: Send + Sync {
         current_pose: &Pose2D,
         scan: &PointCloud2D,
         hazard: Option<&HazardEvent>,
+        contact: bool,
     ) -> ExplorationAction;
 
     /// Reset strategy state (e.g., when starting new map).
