@@ -95,6 +95,13 @@ const LAG: f32 = 0.2;
 const LINK: f32 = 0.03;
 /// An outer corner is decided on once its vertex is this near ahead of the axle (m).
 const CORNER_SIGHT: f32 = 0.15;
+/// A face's heading is fitted to its last this much before the vertex (m), and only to a
+/// stretch at least this long (m)…
+const FACE_FIT: f32 = 0.25;
+const FACE_MIN: f32 = 0.1;
+/// …and the robot drives past its vertex only running within this of it (rad): skewed
+/// (turning off a bump) one scan is no plan to commit to.
+const PARALLEL: f32 = 0.25;
 
 /// Which side the wall is kept on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -441,31 +448,57 @@ impl WallFollower {
         self.config.robot_radius + self.config.tuning.hover_gap
     }
 
-    /// The foremost point of the surface the edge point `p` (robot frame, mirrored) lies on:
-    /// the points on the wall side linked to it, each within `LINK` of the next.
-    fn face_end(points: &[Point2D], p: Point2D) -> Point2D {
+    /// The surface the edge point `p` (robot frame, mirrored) lies on: the points on the wall
+    /// side linked to it, each within `LINK` of the next.
+    fn face(points: &[Point2D], p: Point2D) -> Vec<Point2D> {
         let mut linked = vec![false; points.len()];
         let mut frontier = vec![p];
-        let mut end = p;
+        let mut face = vec![p];
         while let Some(f) = frontier.pop() {
             for (i, q) in points.iter().enumerate() {
                 if !linked[i] && q.y < 0.0 && (q.x - f.x).hypot(q.y - f.y) < LINK {
                     linked[i] = true;
                     frontier.push(*q);
-                    if q.x > end.x {
-                        end = *q;
-                    }
+                    face.push(*q);
                 }
             }
         }
-        end
+        face
+    }
+
+    /// The heading (rad, robot frame, mirrored) of the last `FACE_FIT` of `face` before its
+    /// foremost point `vertex`, by its principal axis; `None` if that stretch is shorter than
+    /// `FACE_MIN` (a leg, a fin's end), too short to tell a heading from.
+    fn face_heading(face: &[Point2D], vertex: Point2D) -> Option<f32> {
+        let near: Vec<&Point2D> = (face.iter())
+            .filter(|q| vertex.x - q.x < FACE_FIT)
+            .collect();
+        let n = near.len() as f32;
+        let (mx, my) = near
+            .iter()
+            .fold((0.0, 0.0), |(x, y), q| (x + q.x / n, y + q.y / n));
+        let (sxx, sxy, syy) = near.iter().fold((0.0, 0.0, 0.0), |(a, b, c), q| {
+            let (dx, dy) = (q.x - mx, q.y - my);
+            (a + dx * dx, b + dx * dy, c + dy * dy)
+        });
+        let span = near.iter().map(|q| vertex.x - q.x).fold(0.0, f32::max);
+        (span >= FACE_MIN).then(|| 0.5 * (2.0 * sxy).atan2(sxx - syy))
     }
 
     /// An outer corner (a fin's end, a block's) in sight: the vertex where the surface
     /// followed (at `p`) ends, at most `CORNER_SIGHT` ahead, with nothing in the way of
-    /// driving on past it. The vertex, and the face's heading (rad, robot frame, mirrored).
+    /// driving on past it, and the robot running within `PARALLEL` along that surface, at
+    /// least `FACE_MIN` of it (round a leg the edge rule hugs). The vertex, and the face's
+    /// heading (rad, robot frame, mirrored).
     fn outer_corner(&self, points: &[Point2D], p: Point2D) -> Option<(Point2D, f32)> {
-        let vertex = Self::face_end(points, p);
+        let face = Self::face(points, p);
+        let vertex = *(face.iter())
+            .max_by(|a, b| a.x.total_cmp(&b.x))
+            .unwrap_or(&p);
+        let along = Self::face_heading(&face, vertex)?;
+        if along.abs() > PARALLEL {
+            return None;
+        }
         // A beam or two missing along a wall breaks the chain, but the wall goes on beyond.
         let goes_on = (points.iter()).any(|q| {
             q.x > vertex.x + LINK && q.x < vertex.x + EDGE_SPAN && (q.y - vertex.y).abs() < LINK
@@ -476,9 +509,6 @@ impl WallFollower {
         let past = vertex.x + self.clear_past();
         let blocked = (points.iter())
             .any(|q| q.x > vertex.x + LINK && self.free_travel(q).is_some_and(|s| s < past));
-        let along = (vertex.x - p.x > LINK)
-            .then(|| (vertex.y - p.y).atan2(vertex.x - p.x))
-            .unwrap_or(0.0);
         let in_the_way = self.blocking(points).is_some();
         (vertex.x <= CORNER_SIGHT && !blocked && !in_the_way).then_some((vertex, along))
     }
@@ -952,7 +982,10 @@ mod tests {
         let turned = Pose2D::new(r + gap, 0.0, -FRAC_PI_2);
         let none = PointCloud2D::new();
         let (v, w) = drive(f.next_action(&no_map(), &turned, &none, None, None));
-        assert!(v > 0.0 && w.abs() < 1e-3, "onto the face beyond: v {v} w {w}");
+        assert!(
+            v > 0.0 && w.abs() < 1e-3,
+            "onto the face beyond: v {v} w {w}"
+        );
         let beside = Pose2D::new(r + gap, -r - gap, -FRAC_PI_2);
         f.next_action(&no_map(), &beside, &none, None, None);
         assert_eq!(f.phase, Phase::Edge);
