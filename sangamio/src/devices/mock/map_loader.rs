@@ -185,9 +185,10 @@ impl SimulationMap {
 
     /// Convert world coordinates to pixel coordinates
     fn world_to_pixel(&self, x: f32, y: f32) -> Option<(u32, u32)> {
-        let px = ((x - self.origin.0) / self.resolution) as i32;
+        let px = ((x - self.origin.0) / self.resolution).floor() as i32;
         // Y is inverted: bottom of image = origin, top of image = +Y
-        let py = (self.pixels.height() as i32 - 1) - ((y - self.origin.1) / self.resolution) as i32;
+        let py = (self.pixels.height() as i32 - 1)
+            - ((y - self.origin.1) / self.resolution).floor() as i32;
 
         if px >= 0
             && py >= 0
@@ -211,13 +212,20 @@ impl SimulationMap {
         }
     }
 
-    /// Whether any cell within `radius` of the world point (x, y) is occupied.
+    /// Whether any occupied cell reaches within `radius` of the world point (x, y): each
+    /// cell's nearest point counts, so the disc never overlaps a wall cell.
     pub fn disc_occupied(&self, x: f32, y: f32, radius: f32) -> bool {
-        let n = (radius / self.resolution).ceil() as i32;
-        (-n..=n).any(|i| {
-            (-n..=n).any(|j| {
-                let (dx, dy) = (i as f32 * self.resolution, j as f32 * self.resolution);
-                dx.hypot(dy) <= radius && self.is_occupied(x + dx, y + dy)
+        let res = self.resolution;
+        let cells = |c: f32, o: f32| {
+            let first = ((c - radius - o) / res).floor() as i32;
+            let last = ((c + radius - o) / res).floor() as i32;
+            (first..=last).map(move |i| o + (i as f32 + 0.5) * res)
+        };
+        let near = |c: f32, centre: f32| (c - centre).abs() - res / 2.0;
+        cells(x, self.origin.0).any(|cx| {
+            cells(y, self.origin.1).any(|cy| {
+                let (dx, dy) = (near(x, cx).max(0.0), near(y, cy).max(0.0));
+                dx.hypot(dy) <= radius && self.is_occupied(cx, cy)
             })
         })
     }
@@ -324,6 +332,32 @@ mod tests {
         // Out of bounds should return None
         assert_eq!(map.world_to_pixel(-10.0, 0.0), None);
         assert_eq!(map.world_to_pixel(10.0, 0.0), None);
+        assert_eq!(
+            map.world_to_pixel(-5.05, 0.0),
+            None,
+            "under a cell past the edge"
+        );
+    }
+
+    #[test]
+    fn a_disc_reaches_a_cell_by_its_nearest_point() {
+        // One occupied 1 cm cell, [0.50, 0.51) x [0.50, 0.51), on a map with its origin off zero.
+        let img = GrayImage::from_fn(200, 200, |px, py| {
+            image::Luma([if (px, py) == (150, 49) { 0 } else { 255 }])
+        });
+        let map = SimulationMap::from_image(img, 0.01, (-1.0, -1.0));
+        assert!(map.is_occupied(0.505, 0.505));
+        let r = 0.175;
+        // Off the cell's left face, level with an off-grid point of it.
+        let y = 0.5037;
+        assert!(
+            map.disc_occupied(0.5 - r + 0.004, y, r),
+            "just over the face"
+        );
+        assert!(
+            !map.disc_occupied(0.5 - r - 0.0001, y, r),
+            "just short of it"
+        );
     }
 
     /// A 2 x 1 m floor at 1 cm per cell; `column` paints both layers per pixel column.

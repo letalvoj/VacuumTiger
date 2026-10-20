@@ -150,9 +150,8 @@ impl MockRobot {
         let (linear, angular) = self.wheels(dt);
         let from = self.pose();
         let robot = &self.config.robot;
-        if self.physics.update(dt, linear, angular, &self.map, robot)
-            && self.config.log_level != "minimal"
-        {
+        let stopped = self.physics.update(dt, linear, angular, &self.map, robot);
+        if stopped && self.config.log_level != "minimal" {
             log::debug!(
                 "Collision at ({:.3}, {:.3})",
                 self.physics.x(),
@@ -166,9 +165,12 @@ impl MockRobot {
         let imu = self.imu.generate(angular, linear, dt);
         let to = self.pose();
         let (x, y, theta) = to;
+        // Only driving forward pushes the shell; reversing into something scrapes the back,
+        // which has none.
+        let pushed = stopped && linear > 0.0;
         let (bumper_left, bumper_right) =
             self.bumpers
-                .check(&self.map, x, y, theta, robot.robot_radius);
+                .check(&self.map, x, y, theta, robot.robot_radius, pushed);
         let cliffs = self.cliffs.check(&self.map, x, y, theta);
         self.bumped = bumper_left || bumper_right;
         self.steps += 1;

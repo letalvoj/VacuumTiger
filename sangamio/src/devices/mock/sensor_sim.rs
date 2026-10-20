@@ -21,8 +21,10 @@ impl BumperSimulator {
     }
 
     /// Which bumpers (left, right) touch something: a zone is pressed when any point of
-    /// its arc, `trigger_distance` out from the body, is occupied. The arc is sampled every
-    /// half cell, so a thin chair leg anywhere along it presses it, as on the real shell.
+    /// its arc is occupied. `pushed` into something (the body was stopped), the shell gives
+    /// all round, the arc `trigger_distance` out from the body; otherwise it is held only as
+    /// far as it slides back, by `cos` of the bearing. The arc is sampled every half cell, so
+    /// a thin chair leg anywhere along it presses it, as on the real shell.
     pub fn check(
         &self,
         map: &SimulationMap,
@@ -30,13 +32,17 @@ impl BumperSimulator {
         y: f32,
         theta: f32,
         robot_radius: f32,
+        pushed: bool,
     ) -> (bool, bool) {
-        let radius = robot_radius + self.config.trigger_distance;
+        let reach = robot_radius + self.config.trigger_distance;
         let pressed = |zone: &BumperZoneConfig| {
             let span = zone.end_angle - zone.start_angle;
-            let samples = (span.abs() * radius / (map.resolution() / 2.0)).ceil() as usize;
+            let samples = (span.abs() * reach / (map.resolution() / 2.0)).ceil() as usize;
             (0..=samples).any(|i| {
-                let angle = theta + zone.start_angle + span * i as f32 / samples.max(1) as f32;
+                let bearing = zone.start_angle + span * i as f32 / samples.max(1) as f32;
+                let travel = if pushed { 1.0 } else { bearing.cos().max(0.0) };
+                let radius = robot_radius + self.config.trigger_distance * travel;
+                let angle = theta + bearing;
                 map.is_occupied(x + radius * angle.cos(), y + radius * angle.sin())
             })
         };
@@ -160,7 +166,7 @@ mod tests {
         let img = image::GrayImage::from_fn(100, 100, |_, _| image::Luma([255u8]));
         let map = SimulationMap::from_image(img, 0.1, (0.0, 0.0));
 
-        let (left, right) = bumper.check(&map, 5.0, 5.0, 0.0, 0.17);
+        let (left, right) = bumper.check(&map, 5.0, 5.0, 0.0, 0.17, true);
 
         assert!(!left);
         assert!(!right);
@@ -180,7 +186,7 @@ mod tests {
             });
             SimulationMap::from_image(img, 0.01, (0.0, 0.0))
         };
-        let pressed = |bearing: f32| bumper.check(&leg(bearing), 1.0, 1.0, 0.0, 0.17);
+        let pressed = |bearing: f32| bumper.check(&leg(bearing), 1.0, 1.0, 0.0, 0.17, false);
 
         // Every 0.05 rad along the shell (finer than the old 16 samples per zone), away
         // from the overlap's edges, where the 2 cm leg straddles them.
@@ -199,6 +205,32 @@ mod tests {
             (false, false),
             "the back has no shell"
         );
+    }
+
+    #[test]
+    fn the_shell_slides_back_so_a_wall_alongside_does_not_press_it() {
+        let bumper = BumperSimulator::new(&BumpersConfig::default());
+        let trigger = BumpersConfig::default().trigger_distance;
+        // A wall up to y = 0.01 on a 1 mm map.
+        let img = image::GrayImage::from_fn(1000, 1000, |_, py| {
+            image::Luma([if py >= 990 { 0 } else { 255 }])
+        });
+        let map = SimulationMap::from_image(img, 0.001, (0.0, 0.0));
+        // The robot `gap` (m) off it, heading `theta`.
+        let pressed = |gap: f32, theta: f32, pushed: bool| {
+            let y = 0.01 + 0.17 + gap;
+            let (left, right) = bumper.check(&map, 0.5, y, theta, 0.17, pushed);
+            left || right
+        };
+        let into = -std::f32::consts::FRAC_PI_2;
+        assert!(
+            pressed(trigger * 0.8, into, false),
+            "head on, within the travel"
+        );
+        assert!(!pressed(trigger * 1.2, into, false), "head on, beyond it");
+        assert!(pressed(0.003, -1.2, false), "at a slant, slid back");
+        assert!(!pressed(0.003, 0.0, false), "alongside, no longer pushing");
+        assert!(pressed(0.003, 0.0, true), "alongside, pushing into it");
     }
 
     #[test]
