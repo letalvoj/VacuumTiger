@@ -57,6 +57,20 @@ impl HazardType {
         }
     }
 
+    /// The same hazard with left and right swapped.
+    pub fn mirrored(self) -> Self {
+        use HazardType::*;
+        match self {
+            BumperLeft => BumperRight,
+            BumperRight => BumperLeft,
+            BumperBoth => BumperBoth,
+            CliffLeftSide => CliffRightSide,
+            CliffRightSide => CliffLeftSide,
+            CliffLeftFront => CliffRightFront,
+            CliffRightFront => CliffLeftFront,
+        }
+    }
+
     /// Whether this is a cliff hazard (vs bumper).
     pub fn is_cliff(&self) -> bool {
         matches!(

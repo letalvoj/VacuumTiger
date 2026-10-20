@@ -2,11 +2,14 @@
 //!
 //! - [`wall_follow`]: the corner sweep, ours: follows the nearest edge point, touches the wall
 //!   to learn the lidar's offset, plans outer corners.
+//! - [`stock`]: the stock firmware's, ported: a P law on gaps ahead to the side, a virtual
+//!   bumper turning part of a corner, small retracts on a graze.
 //!
 //! Each is an [`ExplorationStrategy`](super::ExplorationStrategy) of its own; they share
 //! the side, the odometer and the lap.
 
 mod lap;
+pub mod stock;
 pub mod wall_follow;
 
 pub use lap::Lap;

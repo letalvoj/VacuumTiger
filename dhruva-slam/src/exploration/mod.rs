@@ -38,6 +38,7 @@ mod steady;
 mod strategy;
 
 pub use edge::WallSide;
+pub use edge::stock::{StockFollowConfig, StockFollower};
 pub use edge::wall_follow::{WallFollowConfig, WallFollower};
 pub use frontier::{FrontierConfig, FrontierExploration};
 pub use strategy::{ExplorationAction, ExplorationStrategy, HazardEvent, HazardType};
