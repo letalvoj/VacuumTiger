@@ -87,7 +87,7 @@ pub struct WallFollowConfig {
     pub robot_radius: f32,
     /// Forward speed (m/s).
     pub speed: f32,
-    /// Turn rate on the spot (rad/s).
+    /// Cap on the turn rate, on the spot and while driving (rad/s).
     pub turn_rate: f32,
     /// A lap is closed back within this distance of where following started (m)…
     pub lap_radius: f32,
@@ -108,7 +108,7 @@ impl Default for WallFollowConfig {
             side: WallSide::Right,
             robot_radius: 0.17,
             speed: 0.17,
-            turn_rate: 0.67,
+            turn_rate: 0.8,
             lap_radius: 0.3,
             lap_min_distance: 3.0,
             lap_overlap: 0.25,
@@ -145,10 +145,10 @@ impl Default for Tuning {
         Self {
             hover_gap: 0.02,
             k_gap: 5.5,
-            k_turn: 2.6,
-            spin_angle: 0.45,
+            k_turn: 2.0,
+            spin_angle: 0.35,
             front_look: 0.067,
-            backoff_distance: 0.033,
+            backoff_distance: 0.05,
             nudge: 0.6,
         }
     }
