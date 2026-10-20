@@ -1,5 +1,5 @@
-//! The scenes the corner sweep is scored on, after what the real runs met
-//! (`captures/CATALOG.md`), and their maps for the SangamIO mock.
+//! The scenes the corner sweep is scored on, and their maps for the SangamIO mock: rooms
+//! after what the real runs met (`captures/CATALOG.md`), and primitives, one move each.
 
 use std::f32::consts::PI;
 
@@ -67,6 +67,8 @@ pub struct Scene {
     /// Where the robot starts: x, y (m), heading (rad).
     pub start: (f32, f32, f32),
     pub seconds: f32,
+    /// People's legs per lidar turn (the mock's `lidar.noise.legs`), if not as `--sim` says.
+    pub walkers: Option<f32>,
 }
 
 impl Scene {
@@ -79,6 +81,7 @@ impl Scene {
             curtains: Vec::new(),
             start,
             seconds,
+            walkers: None,
         }
     }
 
@@ -174,7 +177,81 @@ pub fn inside(polygon: &[Point], p: Point) -> bool {
 
 const BOX: [Point; 4] = [(0.0, 0.0), (3.0, 0.0), (3.0, 2.0), (0.0, 2.0)];
 
-/// The scenes, each a few metres and a few minutes.
+/// A set of scenes.
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum Kit {
+    /// After the real runs: a whole lap each.
+    Rooms,
+    /// One move each, in a tiny room.
+    Primitives,
+}
+
+impl Kit {
+    pub fn scenes(self) -> Vec<Scene> {
+        match self {
+            Kit::Rooms => scenes(),
+            Kit::Primitives => primitives(),
+        }
+    }
+}
+
+/// A room `room_w` x `room_h` (m) with a fin `fin_w` wide and `fin_len` long out of the
+/// middle of its bottom wall.
+fn finned(room_w: f32, room_h: f32, fin_w: f32, fin_len: f32) -> Vec<Point> {
+    debug_assert!(fin_w < room_w);
+    let (a, b) = ((room_w - fin_w) / 2.0, (room_w + fin_w) / 2.0);
+    vec![
+        (0.0, 0.0),
+        (a, 0.0),
+        (a, fin_len),
+        (b, fin_len),
+        (b, 0.0),
+        (room_w, 0.0),
+        (room_w, room_h),
+        (0.0, room_h),
+    ]
+}
+
+/// The moves of a sweep, one per scene, tuned one at a time: along a wall, round the end of
+/// a thin one and of a thick one, round a leg; then along the wall with people about. No
+/// one walks about but in `people`. Each starts by its bottom wall, facing along it.
+pub fn primitives() -> Vec<Scene> {
+    let quiet = |name, room: &[Point], start, seconds| Scene {
+        walkers: Some(0.0),
+        ..Scene::new(name, room, start, seconds)
+    };
+    let start = (0.35, 0.25, 0.0);
+    let room = [(0.0, 0.0), (1.4, 0.0), (1.4, 1.0), (0.0, 1.0)];
+    // Along 4 m of wall, a U-turn at each end (its corners are scored too).
+    let corridor = quiet(
+        "wall",
+        &[(0.0, 0.0), (4.0, 0.0), (4.0, 0.7), (0.0, 0.7)],
+        (0.5, 0.3, 0.0),
+        90.0,
+    );
+    let mut out = vec![corridor.clone()];
+
+    // Round the end of a 2 cm partition (a desk side): a half turn about one point.
+    out.push(quiet("fin_thin", &finned(1.4, 1.2, 0.02, 0.6), start, 60.0));
+
+    // Round a 40 cm block (a cabinet): two quarter turns, a short side between.
+    out.push(quiet("fin_thick", &finned(1.6, 1.2, 0.4, 0.6), start, 60.0));
+
+    // A 3 cm leg too near the wall to pass behind: round it and back to the wall.
+    let mut scene = quiet("leg", &room, start, 60.0);
+    scene.legs.push(((0.7, 0.2), 0.03));
+    out.push(scene);
+
+    // The corridor with people walking past: not taking their legs for the wall.
+    out.push(Scene {
+        name: "people",
+        walkers: Some(2.0),
+        ..corridor
+    });
+    out
+}
+
+/// The scenes after the real runs, each a few metres and a few minutes.
 pub fn scenes() -> Vec<Scene> {
     let start = (1.5, 1.0, 0.3);
     let mut out = Vec::new();
@@ -274,6 +351,42 @@ mod tests {
 
     fn scene(name: &str) -> Scene {
         scenes().into_iter().find(|s| s.name == name).unwrap()
+    }
+
+    #[test]
+    fn every_scene_is_named_once_wound_anticlockwise_and_starts_on_free_floor() {
+        let all: Vec<Scene> = [Kit::Rooms, Kit::Primitives]
+            .into_iter()
+            .flat_map(Kit::scenes)
+            .collect();
+        for (i, s) in all.iter().enumerate() {
+            // `--dump` names a run's file by its scene.
+            assert!(
+                all[..i].iter().all(|o| o.name != s.name),
+                "{} twice",
+                s.name
+            );
+            let area: f32 = (polygon(&s.room).iter())
+                .map(|&((ax, ay), (bx, by))| ax * by - bx * ay)
+                .sum();
+            assert!(
+                area > 0.0,
+                "{}: the floor must be on the edges' left",
+                s.name
+            );
+            // The body's rim, a little out: nothing solid under it.
+            let (x, y, _) = s.start;
+            let r = 0.175 + 0.01;
+            for k in 0..64 {
+                let a = k as f32 * PI / 32.0;
+                let rim = (x + r * a.cos(), y + r * a.sin());
+                assert!(
+                    !s.solid((x, y)) && !s.solid(rim),
+                    "{}: starts in a wall",
+                    s.name
+                );
+            }
+        }
     }
 
     #[test]

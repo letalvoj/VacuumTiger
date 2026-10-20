@@ -1,9 +1,10 @@
 //! The corner-sweep bench: dhruva-slam's exploration and SLAM against SangamIO's mock of
-//! the v8, closed loop and faster than real time, in small scenes after what the real runs
-//! met. It prints a row per scene and seed and a total cost; `--climb` hill-climbs the
-//! sweep's settings on that cost.
+//! the v8, closed loop and faster than real time, in small scenes: rooms after what the real
+//! runs met, or primitives that each test one move. It prints a row per scene and seed and
+//! a total cost; `--climb` hill-climbs the sweep's settings on that cost.
 //!
-//!     cargo run --release --bin sweep -- [--seeds N] [--only NAME] [--set K=V,...]
+//!     cargo run --release --bin sweep -- [--kit rooms|primitives] [--seeds N] [--only NAME]
+//!         [--set K=V,...]
 //!         [--climb TRIALS] [--dump DIR] [--reasons]
 //!
 //! - The robot is `--sim` (default `sangamio/mock_bench.toml`, the v8 as measured), the
@@ -25,7 +26,7 @@ use dhruva_slam::config::Config;
 use sangamio::devices::mock::config::SimulationConfig;
 
 use crate::run::Run;
-use crate::scene::Scene;
+use crate::scene::{Kit, Scene};
 use crate::score::Score;
 
 /// The software as on the robot, and the robot as measured.
@@ -43,7 +44,10 @@ struct Args {
     /// Runs per scene, each with its own noise.
     #[arg(long, default_value_t = 2)]
     seeds: u64,
-    /// Only this scene.
+    /// The scenes.
+    #[arg(long, value_enum, default_value_t = Kit::Rooms)]
+    kit: Kit,
+    /// Only this scene of the kit.
     #[arg(long)]
     only: Option<String>,
     /// Settings to change first: KEY=VALUE[,KEY=VALUE...].
@@ -135,11 +139,11 @@ fn main() -> Result<(), String> {
         let value = value.parse().map_err(|e| format!("--set {kv}: {e}"))?;
         *climb::knob(key)?.at(&mut config.exploration.wall_follow) = value;
     }
-    let scenes: Vec<Scene> = (scene::scenes().into_iter())
+    let scenes: Vec<Scene> = (args.kit.scenes().into_iter())
         .filter(|s| args.only.as_ref().is_none_or(|o| o == s.name))
         .collect();
     if scenes.is_empty() {
-        return Err(format!("no scene {:?}", args.only));
+        return Err(format!("no scene {:?} in this kit", args.only));
     }
     if args.climb > 0 {
         climb::climb(&scenes, &mut config, &sim, args.seeds, args.climb)?;

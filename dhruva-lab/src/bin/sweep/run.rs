@@ -132,6 +132,9 @@ pub fn run(
     let start = scene.start;
     (sim.start_x, sim.start_y, sim.start_theta) = start;
     sim.random_seed = seed;
+    if let Some(walkers) = scene.walkers {
+        sim.lidar.noise.legs = walkers;
+    }
     let (exploration, strategy) = build_exploration(dhruva)?;
     let mut session = Session::new(
         strategy,
