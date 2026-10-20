@@ -228,18 +228,18 @@ pub fn primitives() -> Vec<Scene> {
         "wall",
         &[(0.0, 0.0), (8.0, 0.0), (8.0, 0.7), (0.0, 0.7)],
         (0.25, 0.22, 0.0),
-        150.0,
+        200.0,
     );
     let mut out = vec![corridor.clone()];
 
     // Round the end of a 2 cm partition (a desk side): a half turn about one point.
-    out.push(quiet("fin_thin", &finned(1.4, 1.2, 0.02, 0.6), start, 60.0));
+    out.push(quiet("fin_thin", &finned(1.4, 1.2, 0.02, 0.6), start, 90.0));
 
     // Round a 40 cm block (a cabinet): two quarter turns, a short side between.
-    out.push(quiet("fin_thick", &finned(1.6, 1.2, 0.4, 0.6), start, 60.0));
+    out.push(quiet("fin_thick", &finned(1.6, 1.2, 0.4, 0.6), start, 90.0));
 
     // A 3 cm leg too near the wall to pass behind: round it and back to the wall.
-    let mut scene = quiet("leg", &room, start, 60.0);
+    let mut scene = quiet("leg", &room, start, 90.0);
     scene.legs.push(((0.7, 0.2), 0.03));
     out.push(scene);
 

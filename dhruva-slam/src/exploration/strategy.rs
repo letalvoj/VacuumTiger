@@ -43,6 +43,18 @@ impl HazardType {
         }
     }
 
+    /// The bearings (rad, from the heading, + left) of the shell a bumper's press may come
+    /// from: the zones reach round to the sides and overlap at the front (as the mock's
+    /// `mock_bench.toml` has them; the v8's are not measured). `None` for cliffs.
+    pub fn bumper_arc(&self) -> Option<(f32, f32)> {
+        match self {
+            HazardType::BumperLeft => Some((-0.3, 1.7)),
+            HazardType::BumperRight => Some((-1.7, 0.3)),
+            HazardType::BumperBoth => Some((-1.7, 1.7)),
+            _ => None,
+        }
+    }
+
     /// Whether this is a cliff hazard (vs bumper).
     pub fn is_cliff(&self) -> bool {
         matches!(

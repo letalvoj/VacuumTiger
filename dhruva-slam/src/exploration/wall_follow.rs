@@ -50,11 +50,24 @@ const BACKOFF_SPEED: f32 = 0.08;
 const CONTACT_KEEP: f32 = 1.5;
 const CONTACT_STEP: f32 = 0.02;
 const CONTACT_SPAN: f32 = 0.1;
-/// A scan point this near a contact (m) is what was touched: the bumper's position is only
-/// known to within its zone.
-const EXPLAINED: f32 = 0.06;
+/// A scan point this near the shell (m), where the pressed bumper reaches, is what was
+/// touched: the shell's travel and the range noise, not the hover gap (a wall hovered beside
+/// is not what a bump ahead pressed on).
+const EXPLAINED: f32 = 0.015;
 /// Following has started once the body is this close to the edge (m).
 const ON_EDGE: f32 = 0.05;
+/// A planned touch aims this far into the wall (m), so the shell surely presses…
+const TOUCH_DEPTH: f32 = 0.01;
+/// …and agrees with the offset learnt if within this of it (m), about the range noise. A
+/// touch that measures more than `TOUCH_MAX` off (m) pressed on something else, and the
+/// offset learnt is at most `OFFSET_MAX` (m) either way.
+const TOUCH_AGREE: f32 = 0.004;
+const TOUCH_MAX: f32 = 0.03;
+const OFFSET_MAX: f32 = 0.02;
+/// After a planned touch, reverse this far (m): still angled in, that lifts the shell off…
+const TOUCH_BACKOFF: f32 = 0.015;
+/// …then turn away by this much (rad).
+const TOUCH_TURN: f32 = 0.1;
 /// A turn in place is done within this angle (rad); it turns at `SPIN_GAIN` per radian
 /// left (1/s), at least `MIN_SPIN` (rad/s).
 const TURN_TOLERANCE: f32 = 0.06;
@@ -139,6 +152,13 @@ pub struct Tuning {
     pub backoff_distance: f32,
     /// …then nudge away by this much (rad).
     pub nudge: f32,
+    /// The edge is touched this far (m of travel) after it is reached, to learn how far the
+    /// lidar's ranges are off, and again this far after a touch that disagreed with what was
+    /// learnt…
+    pub first_touch: f32,
+    /// …while each one that agrees doubles the way to the next, up to this (m): bisecting
+    /// the offset, touches grow rare along a wall.
+    pub bump_every: f32,
 }
 
 impl Default for Tuning {
@@ -151,6 +171,33 @@ impl Default for Tuning {
             front_look: 0.067,
             backoff_distance: 0.05,
             nudge: 0.6,
+            first_touch: 0.5,
+            bump_every: 4.0,
+        }
+    }
+}
+
+/// What touching the wall taught.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Calibration {
+    /// How much farther the lidar puts what is near than it is (m): taken off its ranges.
+    /// It belongs to the lidar, so it outlives a sweep.
+    offset: f32,
+    /// Whether a touch has measured it yet.
+    measured: bool,
+    /// `travelled` at the last touch or bump (m), and how far on the next touch is planned
+    /// (m); `None` until the edge is reached.
+    touched_at: Option<f32>,
+    interval: f32,
+}
+
+impl Calibration {
+    fn new(tuning: &Tuning) -> Self {
+        Self {
+            offset: 0.0,
+            measured: false,
+            touched_at: None,
+            interval: tuning.first_touch,
         }
     }
 }
@@ -192,6 +239,7 @@ pub struct WallFollower {
     last_edge: Option<Point2D>,
     /// Virtual wall points (world frame), followed like real ones.
     fence: Vec<Point2D>,
+    calibration: Calibration,
 }
 
 impl WallFollower {
@@ -212,6 +260,7 @@ impl WallFollower {
             lap_back: None,
             last_edge: None,
             fence,
+            calibration: Calibration::new(&config.tuning),
         }
     }
 
@@ -235,12 +284,59 @@ impl WallFollower {
         Point2D::new(w.x, w.y)
     }
 
-    /// Scan points in the (mirrored) robot frame.
+    /// Scan points in the (mirrored) robot frame, the learnt offset taken off their range
+    /// (from the centre: near enough to from the lidar for what is beside the body).
     fn seen(&self, scan: &PointCloud2D) -> Vec<Point2D> {
         let m = self.mirror();
+        let offset = self.calibration.offset;
         (scan.xs.iter().zip(&scan.ys))
-            .map(|(&x, &y)| Point2D::new(x, m * y))
+            .map(|(&x, &y)| {
+                let range = x.hypot(y);
+                let k = (range - offset).max(0.0) / range.max(f32::EPSILON);
+                Point2D::new(k * x, k * m * y)
+            })
             .collect()
+    }
+
+    /// The gap wanted to the edge now (m): `hover_gap`, until the next touch is due; then
+    /// `TOUCH_DEPTH` into it, a gentle bend in.
+    fn wanted_gap(&self) -> f32 {
+        let c = &self.calibration;
+        match c.touched_at {
+            Some(at) if self.travelled - at >= c.interval => -TOUCH_DEPTH,
+            _ => self.config.tuning.hover_gap,
+        }
+    }
+
+    /// A touch beside the body on something the lidar sees: the gap the lidar puts there,
+    /// `error` (m), is what is off its ranges. The first measure is taken whole, later ones
+    /// halfway (the residual of one scan is noisy). Plans the next touch: twice as far on if
+    /// this one agreed with what was learnt, else `first_touch` on. A wild one pressed on
+    /// something else: it only defers the next touch.
+    fn calibrate(&mut self, error: f32) {
+        let tuning = self.config.tuning;
+        let c = &mut self.calibration;
+        c.touched_at = Some(self.travelled);
+        if error.abs() > TOUCH_MAX {
+            return;
+        }
+        let agrees = c.measured && error.abs() < TOUCH_AGREE;
+        let step = if c.measured { error / 2.0 } else { error };
+        c.offset = (c.offset + step).clamp(-OFFSET_MAX, OFFSET_MAX);
+        c.measured = true;
+        c.interval = if agrees {
+            (2.0 * c.interval).min(tuning.bump_every)
+        } else {
+            tuning.first_touch
+        };
+    }
+
+    /// Notes where following started (the first time) and plans the first touch from there.
+    fn start_lap(&mut self, pose: &Pose2D) {
+        if self.lap_start.is_none() {
+            self.lap_start = Some((Point2D::new(pose.x, pose.y), self.travelled));
+            self.calibration.touched_at = Some(self.travelled);
+        }
     }
 
     /// Scan points, kept contacts and the fence, in the (mirrored) robot frame.
@@ -353,21 +449,55 @@ impl WallFollower {
             .is_some_and(|(_, at)| self.travelled - at >= self.config.lap_overlap)
     }
 
-    /// Whether the scan has a point within `EXPLAINED` of the contact `at` (world frame).
-    fn explains(&self, pose: &Pose2D, scan: &PointCloud2D, at: &Point2D) -> bool {
-        let at = self.to_robot(pose, at);
-        (self.seen(scan).iter()).any(|p| (p.x - at.x).hypot(p.y - at.y) < EXPLAINED)
+    /// Whether the scan has a point within `EXPLAINED` of the shell where `hazard`'s bumper
+    /// may have been pressed: then the lidar sees what was touched.
+    fn explains(&self, scan: &PointCloud2D, hazard: HazardType) -> bool {
+        let Some((a, b)) = hazard.bumper_arc() else {
+            return false;
+        };
+        let (a, b) = match self.config.side {
+            WallSide::Right => (a, b),
+            WallSide::Left => (-b, -a),
+        };
+        let r = self.config.robot_radius;
+        (self.seen(scan).iter())
+            .any(|p| (p.x.hypot(p.y) - r).abs() < EXPLAINED && (a..=b).contains(&p.y.atan2(p.x)))
     }
 
     /// Records a bump or cliff and starts backing off it.
     fn on_hazard(&mut self, hazard: &HazardEvent, pose: &Pose2D, scan: &PointCloud2D) {
         let at = Point2D::new(hazard.world_position.x, hazard.world_position.y);
         let nudge = self.config.tuning.nudge;
-        let away_side = match self.config.side {
-            WallSide::Right => HazardType::BumperLeft,
-            WallSide::Left => HazardType::BumperRight,
+        let (wall_side, away_side) = match self.config.side {
+            WallSide::Right => (HazardType::BumperRight, HazardType::BumperLeft),
+            WallSide::Left => (HazardType::BumperLeft, HazardType::BumperRight),
         };
-        let turn = if !hazard.hazard_type.is_cliff() && self.explains(pose, scan, &at) {
+        let seen = self.explains(scan, hazard.hazard_type);
+        self.start_lap(pose);
+        // Any bump tells how near the body is: the next planned touch is put off.
+        self.calibration.touched_at = Some(self.travelled);
+        // The edge the lidar sees, if it is beside the body (more to the side than ahead).
+        let points = self.seen(scan);
+        let last = self.last_edge.map(|w| self.to_robot(pose, &w));
+        let beside = (self.edge(&points, last)).filter(|(p, _)| p.y < -p.x.abs());
+        if let Some((_, d)) = beside
+            && seen
+            && hazard.hazard_type == wall_side
+            && self.phase == Phase::Edge
+        {
+            // A touch alongside, as planned: it measures the lidar. Still angled in, a short
+            // reverse lifts the shell off (forward is refused while it is pressed), a small
+            // turn away, and following goes on, wanting the hover gap again.
+            self.calibrate(d - self.config.robot_radius);
+            self.phase = Phase::BackOff {
+                from: *pose,
+                distance: TOUCH_BACKOFF,
+                turn: TOUCH_TURN,
+                ticks: 0,
+            };
+            return;
+        }
+        let turn = if seen {
             // The lidar sees what was touched: nudge away from the wall, unless the bump is
             // on the side away from it.
             if hazard.hazard_type == away_side {
@@ -389,8 +519,6 @@ impl WallFollower {
             let c = self.to_robot(pose, &at);
             c.y.atan2(c.x) + FRAC_PI_2
         };
-        let here = (Point2D::new(pose.x, pose.y), self.travelled);
-        self.lap_start.get_or_insert(here);
         self.phase = Phase::BackOff {
             from: *pose,
             distance: self.config.tuning.backoff_distance,
@@ -421,15 +549,14 @@ impl WallFollower {
                     self.last_edge = Some(self.to_world(pose, &p));
                     let gap = d - r;
                     if gap < ON_EDGE {
-                        let here = (Point2D::new(pose.x, pose.y), self.travelled);
-                        self.lap_start.get_or_insert(here);
+                        self.start_lap(pose);
                     }
                     // Run along the edge point (it on the right), bent towards it when the
                     // gap is wider than wanted (from far away, straight at it), away when
                     // narrower.
                     let tuning = cfg.tuning;
                     let bend =
-                        (tuning.k_gap * (gap - tuning.hover_gap)).clamp(-FRAC_PI_2, FRAC_PI_2);
+                        (tuning.k_gap * (gap - self.wanted_gap())).clamp(-FRAC_PI_2, FRAC_PI_2);
                     let error = p.y.atan2(p.x) + FRAC_PI_2 - bend;
                     if error > TURN_TOLERANCE && self.blocking(points).is_some() {
                         // In the way (a corner, a leg): one turn on the spot that puts it
@@ -527,7 +654,10 @@ impl ExplorationStrategy for WallFollower {
     }
 
     fn reset(&mut self) {
+        let learnt = self.calibration;
         *self = Self::fenced(self.config, std::mem::take(&mut self.fence));
+        self.calibration.offset = learnt.offset;
+        self.calibration.measured = learnt.measured;
     }
 }
 
@@ -565,6 +695,7 @@ mod tests {
             ..WallFollowConfig::default()
         });
         follower.lap_start = Some((Point2D::new(100.0, 100.0), 0.0));
+        follower.calibration.touched_at = Some(0.0);
         follower
     }
 
@@ -671,6 +802,96 @@ mod tests {
         let bump = HazardEvent::new(HazardType::BumperLeft, &pose);
         f.next_action(&no_map(), &pose, &wall, Some(&bump), true);
         assert!(matches!(f.phase, Phase::BackOff { turn, .. } if turn == -nudge));
+    }
+
+    #[test]
+    fn a_touch_alongside_learns_the_lidar_offset_and_touches_rarer_as_it_agrees() {
+        let mut f = following(WallSide::Right);
+        let pose = Pose2D::identity();
+        let bump = HazardEvent::new(HazardType::BumperRight, &pose);
+        let first = f.config.tuning.first_touch;
+        assert_eq!(
+            f.wanted_gap(),
+            f.config.tuning.hover_gap,
+            "hovers at first…"
+        );
+        f.travelled = first;
+        assert!(f.wanted_gap() < 0.0, "…then goes to touch");
+        // Touching a wall the lidar puts 8 mm off the body.
+        let wall = wall_at(-(f.config.robot_radius + 0.008));
+        let touch = |f: &mut WallFollower| {
+            f.phase = Phase::Edge;
+            f.next_action(&no_map(), &pose, &wall, Some(&bump), true)
+        };
+        let (v, w) = drive(touch(&mut f));
+        assert!(v < 0.0 && w == 0.0, "lifts the shell off: {v} {w}");
+        assert!(matches!(f.phase, Phase::BackOff { distance, turn, .. }
+            if distance == TOUCH_BACKOFF && turn == TOUCH_TURN));
+        let c = f.calibration;
+        assert!((c.offset - 0.008).abs() < 1e-3, "learnt {}", c.offset);
+        assert_eq!(c.interval, first, "a first measure: soon again");
+        touch(&mut f);
+        assert_eq!(
+            f.calibration.interval,
+            2.0 * first,
+            "it agreed: twice as far"
+        );
+        for _ in 0..10 {
+            touch(&mut f);
+        }
+        assert_eq!(f.calibration.interval, f.config.tuning.bump_every);
+        assert_eq!(
+            f.wanted_gap(),
+            f.config.tuning.hover_gap,
+            "hovers after a touch"
+        );
+
+        // A touch 6 mm off what was learnt starts over.
+        let wall = wall_at(-(f.config.robot_radius + 0.014));
+        f.phase = Phase::Edge;
+        f.next_action(&no_map(), &pose, &wall, Some(&bump), true);
+        assert_eq!(f.calibration.interval, first, "it disagreed");
+
+        // What was learnt outlives the sweep; the plan does not.
+        let learnt = f.calibration.offset;
+        f.reset();
+        assert_eq!(f.calibration.offset, learnt);
+        assert_eq!(f.calibration.touched_at, None);
+    }
+
+    #[test]
+    fn a_bump_that_is_no_touch_puts_the_next_touch_off() {
+        let mut f = following(WallSide::Right);
+        f.travelled = 10.0;
+        assert!(f.wanted_gap() < 0.0, "a touch is due");
+        let pose = Pose2D::identity();
+        let bump = HazardEvent::new(HazardType::BumperBoth, &pose);
+        f.next_action(&no_map(), &pose, &PointCloud2D::new(), Some(&bump), true);
+        assert!(!f.calibration.measured, "glass measures nothing");
+        assert_eq!(f.wanted_gap(), f.config.tuning.hover_gap, "but it was near");
+    }
+
+    #[test]
+    fn a_side_touch_is_seen_on_either_side() {
+        for side in [WallSide::Right, WallSide::Left] {
+            let f = following(side);
+            let m = f.mirror();
+            let r = f.config.robot_radius;
+            let wall = wall_at(-m * (r + 0.005));
+            let (near, far) = match side {
+                WallSide::Right => (HazardType::BumperRight, HazardType::BumperLeft),
+                WallSide::Left => (HazardType::BumperLeft, HazardType::BumperRight),
+            };
+            assert!(f.explains(&wall, near), "{side:?}: the wall beside");
+            assert!(
+                !f.explains(&wall, far),
+                "{side:?}: not the other side's bumper"
+            );
+            assert!(
+                !f.explains(&wall_at(-m * (r + 0.03)), near),
+                "{side:?}: hovered"
+            );
+        }
     }
 
     #[test]

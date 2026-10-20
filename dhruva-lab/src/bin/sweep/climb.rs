@@ -28,6 +28,8 @@ const KNOBS: &[Knob] = &[
     Knob { name: "tuning.front_look", at: |c| &mut c.tuning.front_look, min: 0.005, max: 0.08, factor: 1.5 },
     Knob { name: "tuning.backoff_distance", at: |c| &mut c.tuning.backoff_distance, min: 0.01, max: 0.1, factor: 1.5 },
     Knob { name: "tuning.nudge", at: |c| &mut c.tuning.nudge, min: 0.1, max: 0.8, factor: 1.3 },
+    Knob { name: "tuning.first_touch", at: |c| &mut c.tuning.first_touch, min: 0.2, max: 2.0, factor: 1.5 },
+    Knob { name: "tuning.bump_every", at: |c| &mut c.tuning.bump_every, min: 1.0, max: 8.0, factor: 1.4 },
 ];
 
 impl Knob {
