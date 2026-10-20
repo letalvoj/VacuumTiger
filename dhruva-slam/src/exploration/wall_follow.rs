@@ -88,6 +88,13 @@ const MAX_POSE_STEP: f32 = 0.1;
 /// dithering by an unseen edge piles travel up and turns back and forth, and a small room
 /// keeps the whole lap near its start.
 const LAP_TURN: f32 = 1.5 * PI;
+/// The wheels answer a command this late (s): dead time plus time constant (sweep8, see
+/// `captures/CATALOG.md`). Driving past a corner stops this much early.
+const LAG: f32 = 0.2;
+/// Scan points this near each other (m) are one surface.
+const LINK: f32 = 0.03;
+/// An outer corner is decided on once its vertex is this near ahead of the axle (m).
+const CORNER_SIGHT: f32 = 0.15;
 
 /// Which side the wall is kept on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -224,7 +231,25 @@ enum Phase {
         heading: f32,
         ticks: u32,
     },
+    /// The edge followed ended at `vertex` (world frame), an outer corner: straight on along
+    /// `heading` until the body is clear of the face beyond it, a quarter turn towards it on
+    /// the spot, and straight on again until the vertex is beside the axle, the face beyond
+    /// alongside. The brushes sweep past the vertex on the way; rounding it on an arc keeps
+    /// it level with the axle, out of their reach, and leaves a wedge behind it.
+    Past {
+        vertex: Point2D,
+        heading: f32,
+        leg: Leg,
+    },
     Done,
+}
+
+/// Where in driving round an outer corner (`Phase::Past`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Leg {
+    Out,
+    Turn,
+    In,
 }
 
 /// Corner sweep: follow the room's edge into every corner and around the room.
@@ -408,6 +433,54 @@ impl WallFollower {
         let p = self.blocking(points).or_else(side)?;
         let c = Self::centroid_near(points, p);
         Some((c, c.x.hypot(c.y)))
+    }
+
+    /// How far past a vertex the centre goes before turning (m): the body then clears the
+    /// face beyond it by the hover gap.
+    fn clear_past(&self) -> f32 {
+        self.config.robot_radius + self.config.tuning.hover_gap
+    }
+
+    /// The foremost point of the surface the edge point `p` (robot frame, mirrored) lies on:
+    /// the points on the wall side linked to it, each within `LINK` of the next.
+    fn face_end(points: &[Point2D], p: Point2D) -> Point2D {
+        let mut linked = vec![false; points.len()];
+        let mut frontier = vec![p];
+        let mut end = p;
+        while let Some(f) = frontier.pop() {
+            for (i, q) in points.iter().enumerate() {
+                if !linked[i] && q.y < 0.0 && (q.x - f.x).hypot(q.y - f.y) < LINK {
+                    linked[i] = true;
+                    frontier.push(*q);
+                    if q.x > end.x {
+                        end = *q;
+                    }
+                }
+            }
+        }
+        end
+    }
+
+    /// An outer corner (a fin's end, a block's) in sight: the vertex where the surface
+    /// followed (at `p`) ends, at most `CORNER_SIGHT` ahead, with nothing in the way of
+    /// driving on past it. The vertex, and the face's heading (rad, robot frame, mirrored).
+    fn outer_corner(&self, points: &[Point2D], p: Point2D) -> Option<(Point2D, f32)> {
+        let vertex = Self::face_end(points, p);
+        // A beam or two missing along a wall breaks the chain, but the wall goes on beyond.
+        let goes_on = (points.iter()).any(|q| {
+            q.x > vertex.x + LINK && q.x < vertex.x + EDGE_SPAN && (q.y - vertex.y).abs() < LINK
+        });
+        if goes_on {
+            return None;
+        }
+        let past = vertex.x + self.clear_past();
+        let blocked = (points.iter())
+            .any(|q| q.x > vertex.x + LINK && self.free_travel(q).is_some_and(|s| s < past));
+        let along = (vertex.x - p.x > LINK)
+            .then(|| (vertex.y - p.y).atan2(vertex.x - p.x))
+            .unwrap_or(0.0);
+        let in_the_way = self.blocking(points).is_some();
+        (vertex.x <= CORNER_SIGHT && !blocked && !in_the_way).then_some((vertex, along))
     }
 
     /// The centroid of the points about as near as `p` and next to it. On a flat wall the
@@ -618,6 +691,17 @@ impl WallFollower {
                         self.phase = Phase::Turn { heading, ticks: 0 };
                         continue;
                     }
+                    if gap < ON_EDGE
+                        && self.lap_heading.is_some()
+                        && let Some((vertex, along)) = self.outer_corner(points, p)
+                    {
+                        self.phase = Phase::Past {
+                            vertex: self.to_world(pose, &vertex),
+                            heading: pose.theta + self.mirror() * along,
+                            leg: Leg::Out,
+                        };
+                        continue;
+                    }
                     let reason = if gap < ON_EDGE {
                         "following the wall"
                     } else {
@@ -655,6 +739,39 @@ impl WallFollower {
                     }
                     _ => self.phase = Phase::Edge,
                 },
+                Phase::Past {
+                    vertex,
+                    heading,
+                    leg,
+                } => {
+                    let v = self.to_robot(pose, &vertex);
+                    let lead = cfg.speed * LAG;
+                    let next = match leg {
+                        Leg::Out if v.x <= lead - self.clear_past() => Some(Phase::Past {
+                            vertex,
+                            heading: heading - self.mirror() * FRAC_PI_2,
+                            leg: Leg::Turn,
+                        }),
+                        Leg::Turn => match self.turn_to(pose, heading) {
+                            Some(command) => return command,
+                            None => Some(Phase::Past {
+                                vertex,
+                                heading,
+                                leg: Leg::In,
+                            }),
+                        },
+                        Leg::In if v.x <= lead => Some(Phase::Edge),
+                        // Something in the way after all: the edge rule takes it.
+                        _ if self.blocking(points).is_some() => Some(Phase::Edge),
+                        _ => None,
+                    };
+                    if let Some(phase) = next {
+                        self.phase = phase;
+                        continue;
+                    }
+                    let error = self.mirror() * angle_diff(pose.theta, heading);
+                    return self.steer(error, "driving round an outer corner");
+                }
                 Phase::Done => return (0.0, 0.0, "lap closed"),
             }
         }
@@ -813,16 +930,32 @@ mod tests {
         let (v, w) = tick(&mut f, &corner);
         assert!(v == 0.0 && w > 0.0, "inner corner: v {v} w {w}");
 
-        // The wall just followed ends just behind the body: round its end, towards it.
+        // The wall just followed ends level with the axle: straight on past its end…
         let mut f = following(WallSide::Right);
-        let mut ended = PointCloud2D::new();
-        segment_scan(
-            &mut ended,
-            (-1.0, -r - Tuning::default().hover_gap),
-            (-0.03, -r - Tuning::default().hover_gap),
-        );
-        let (_, w) = tick(&mut f, &ended);
-        assert!(w < 0.0, "outer corner: w {w}");
+        let gap = Tuning::default().hover_gap;
+        let ended = |at: f32| {
+            let mut scan = PointCloud2D::new();
+            segment_scan(&mut scan, (-1.0 - at, -r - gap), (-0.03 - at, -r - gap));
+            scan
+        };
+        let (v, w) = tick(&mut f, &ended(0.0));
+        assert!(v > 0.0 && w.abs() < 1e-3, "outer corner: v {v} w {w}");
+        // …until the body clears the face beyond it, then a quarter turn towards it.
+        let past = Pose2D::new(r + gap, 0.0, 0.0);
+        let (v, w) = drive(f.next_action(&no_map(), &past, &ended(r + gap), None, None));
+        assert!(v == 0.0 && w < 0.0, "past it: v {v} w {w}");
+        let Phase::Past { heading, .. } = f.phase else {
+            panic!("{:?}", f.phase)
+        };
+        assert!((heading + FRAC_PI_2).abs() < 1e-5, "{heading}");
+        // Turned: straight on until the vertex is beside the axle, then following again.
+        let turned = Pose2D::new(r + gap, 0.0, -FRAC_PI_2);
+        let none = PointCloud2D::new();
+        let (v, w) = drive(f.next_action(&no_map(), &turned, &none, None, None));
+        assert!(v > 0.0 && w.abs() < 1e-3, "onto the face beyond: v {v} w {w}");
+        let beside = Pose2D::new(r + gap, -r - gap, -FRAC_PI_2);
+        f.next_action(&no_map(), &beside, &none, None, None);
+        assert_eq!(f.phase, Phase::Edge);
     }
 
     #[test]
