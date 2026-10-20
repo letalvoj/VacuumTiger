@@ -47,9 +47,13 @@ const EDGE_SPAN: f32 = 0.15;
 const BACKOFF_SPEED: f32 = 0.08;
 /// Contacts the lidar did not see (glass, cliffs) are obstacles for this much travel (m):
 /// points every `CONTACT_STEP` (m) along a line across the contact, this far each side (m).
+/// Short for a bump (fitted on the bench): past the corner of what was touched a longer line
+/// is a phantom edge, rounded wide (into the far wall of a narrow bay); a short one is
+/// rounded tight, and touched again. Longer for a cliff, which must not be touched again.
 const CONTACT_KEEP: f32 = 1.5;
 const CONTACT_STEP: f32 = 0.02;
-const CONTACT_SPAN: f32 = 0.1;
+const CONTACT_SPAN: f32 = 0.04;
+const CLIFF_SPAN: f32 = 0.1;
 /// A scan point this near the shell (m), where the pressed bumper reaches, is what was
 /// touched: the shell's travel and the range noise, not the hover gap (a wall hovered beside
 /// is not what a bump ahead pressed on).
@@ -520,7 +524,12 @@ impl WallFollower {
             // along it there: a short line across the contact's bearing, a wall ahead, turned
             // alongside as one seen.
             let (s, c) = hazard.world_position.theta.sin_cos();
-            let n = (CONTACT_SPAN / CONTACT_STEP).round() as i32;
+            let span = if hazard.hazard_type.is_cliff() {
+                CLIFF_SPAN
+            } else {
+                CONTACT_SPAN
+            };
+            let n = (span / CONTACT_STEP).round() as i32;
             for k in -n..=n {
                 let along = k as f32 * CONTACT_STEP;
                 let p = Point2D::new(at.x - along * s, at.y + along * c);
@@ -1039,7 +1048,28 @@ mod tests {
         let r = f.config.robot_radius;
         assert!(f.contacts.iter().all(|(p, _)| (p.x - r).abs() < 1e-4));
         let ys = f.contacts.iter().map(|(p, _)| p.y);
-        assert!(ys.clone().fold(0.0, f32::min) < -0.05 && ys.fold(0.0, f32::max) > 0.05);
+        let span = CONTACT_SPAN - CONTACT_STEP / 2.0;
+        assert!(ys.clone().fold(0.0, f32::min) < -span && ys.fold(0.0, f32::max) > span);
+    }
+
+    #[test]
+    fn an_unseen_side_bump_is_round_the_side_and_a_cliff_fenced_wider() {
+        let pose = Pose2D::identity();
+        let unseen = |kind: HazardType| {
+            let mut f = WallFollower::new(WallFollowConfig::default());
+            f.on_hazard(&HazardEvent::new(kind, &pose), &pose, &PointCloud2D::new());
+            let Phase::BackOff { turn, .. } = f.phase else {
+                panic!("backs off: {:?}", f.phase);
+            };
+            (turn, f.contacts.len())
+        };
+        // Pressed alone, the right bumper was touched round the side (about 57° right), not
+        // ahead: a third of a quarter turn left puts it alongside.
+        let (turn, _) = unseen(HazardType::BumperRight);
+        assert!((0.4..0.8).contains(&turn), "{turn}");
+        let (_, bumped) = unseen(HazardType::BumperBoth);
+        let (_, fell) = unseen(HazardType::CliffRightFront);
+        assert!(fell > bumped, "a cliff {fell} points, a bump {bumped}");
     }
 
     #[test]

@@ -23,19 +23,22 @@ pub enum HazardType {
     CliffRightSide,
 }
 
+/// The bumper zones (rad from the heading): each reaches round its side this far and past
+/// the front by `BUMPER_OVERLAP`, where both press (as the mock's `mock_bench.toml` has
+/// them; the v8's are not measured).
+const BUMPER_REACH: f32 = 1.7;
+const BUMPER_OVERLAP: f32 = 0.3;
+
 impl HazardType {
-    /// Get the relative angle offset from robot heading where the hazard was detected.
-    /// Returns (angle_offset_rad, distance_from_center_m).
-    /// Positive angle = left of center, negative = right of center.
+    /// Where the hazard was sensed: (bearing from the heading, rad, + left; distance from
+    /// the centre, m). A bumper pressed alone was touched round its side, not at the front
+    /// where both press: the middle of the shell only it reaches.
     pub fn sensor_offset(&self) -> (f32, f32) {
-        // Robot dimensions (approximate for CRL-200S):
-        // - Robot radius: ~0.17m
-        // - Bumper arc: ~120° front
-        // - Cliff sensors at corners
+        let alone = (BUMPER_OVERLAP + BUMPER_REACH) / 2.0;
         match self {
-            HazardType::BumperLeft => (0.3, 0.17), // ~17° left, at front edge
-            HazardType::BumperRight => (-0.3, 0.17), // ~17° right, at front edge
-            HazardType::BumperBoth => (0.0, 0.17), // Dead center front
+            HazardType::BumperLeft => (alone, 0.17),
+            HazardType::BumperRight => (-alone, 0.17),
+            HazardType::BumperBoth => (0.0, 0.17),
             HazardType::CliffLeftSide => (1.57, 0.15), // 90° left (side)
             HazardType::CliffLeftFront => (0.52, 0.16), // ~30° left front
             HazardType::CliffRightFront => (-0.52, 0.16), // ~30° right front
@@ -44,13 +47,12 @@ impl HazardType {
     }
 
     /// The bearings (rad, from the heading, + left) of the shell a bumper's press may come
-    /// from: the zones reach round to the sides and overlap at the front (as the mock's
-    /// `mock_bench.toml` has them; the v8's are not measured). `None` for cliffs.
+    /// from (`BUMPER_REACH`, `BUMPER_OVERLAP`). `None` for cliffs.
     pub fn bumper_arc(&self) -> Option<(f32, f32)> {
         match self {
-            HazardType::BumperLeft => Some((-0.3, 1.7)),
-            HazardType::BumperRight => Some((-1.7, 0.3)),
-            HazardType::BumperBoth => Some((-1.7, 1.7)),
+            HazardType::BumperLeft => Some((-BUMPER_OVERLAP, BUMPER_REACH)),
+            HazardType::BumperRight => Some((-BUMPER_REACH, BUMPER_OVERLAP)),
+            HazardType::BumperBoth => Some((-BUMPER_REACH, BUMPER_REACH)),
             _ => None,
         }
     }
