@@ -25,7 +25,7 @@
 //! robot-frame inputs (y → -y) and the turn direction.
 
 use std::collections::VecDeque;
-use std::f32::consts::FRAC_PI_2;
+use std::f32::consts::{FRAC_PI_2, PI};
 
 use serde::Deserialize;
 
@@ -79,6 +79,11 @@ const MAX_BACKOFF_TICKS: u32 = 15;
 const MAX_TURN_TICKS: u32 = 100;
 /// Pose steps longer than this are relocalisation jumps, not travel (m).
 const MAX_POSE_STEP: f32 = 0.1;
+/// Going round a room turns the robot round once (±2π, the sign by the side it follows);
+/// a lap closes only after this much of it. Not travel or distance from the start:
+/// dithering by an unseen edge piles travel up and turns back and forth, and a small room
+/// keeps the whole lap near its start.
+const LAP_TURN: f32 = 1.5 * PI;
 
 /// Which side the wall is kept on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -104,8 +109,6 @@ pub struct WallFollowConfig {
     pub turn_rate: f32,
     /// A lap is closed back within this distance of where following started (m)…
     pub lap_radius: f32,
-    /// …after at least this much travel (m)…
-    pub lap_min_distance: f32,
     /// …and followed on this far past the nearest it came to that start while following
     /// (m), over the seam: the robot came at the wall there on a curve. Generous: sweeping a
     /// little twice costs less than a corner missed.
@@ -124,7 +127,6 @@ impl Default for WallFollowConfig {
             speed: 0.17,
             turn_rate: 0.8,
             lap_radius: 0.3,
-            lap_min_distance: 3.0,
             lap_overlap: 0.5,
             max_distance: 300.0,
             tuning: Tuning::default(),
@@ -229,8 +231,9 @@ pub struct WallFollower {
     contacts: VecDeque<(Point2D, f32)>,
     last_pose: Option<Pose2D>,
     travelled: f32,
-    /// Where following started (world frame, not moved by loop closures) and the distance
-    /// travelled by then.
+    /// Where following started (world frame, not moved by loop closures) and how far the
+    /// robot has turned since `lap_heading` was set (rad, + left): the turn from facing a
+    /// wall it bumped into to running along it is not part of the lap.
     lap_start: Option<(Point2D, f32)>,
     /// The heading the first tick on the edge (rad): the lap closes going that way, not
     /// passing its start the other way (down the far side of a narrow bay). Not the heading
@@ -339,7 +342,7 @@ impl WallFollower {
     /// Notes where following started (the first time) and plans the first touch from there.
     fn start_lap(&mut self, pose: &Pose2D) {
         if self.lap_start.is_none() {
-            self.lap_start = Some((Point2D::new(pose.x, pose.y), self.travelled));
+            self.lap_start = Some((Point2D::new(pose.x, pose.y), 0.0));
             self.calibration.touched_at = Some(self.travelled);
         }
     }
@@ -356,8 +359,12 @@ impl WallFollower {
     fn track(&mut self, pose: &Pose2D) {
         if let Some(last) = self.last_pose {
             let step = (pose.x - last.x).hypot(pose.y - last.y);
+            // A longer step is SLAM correcting the pose, not the robot moving or turning.
             if step < MAX_POSE_STEP {
                 self.travelled += step;
+                if let Some((_, turned)) = &mut self.lap_start {
+                    *turned += angle_diff(last.theta, pose.theta);
+                }
             }
         }
         self.last_pose = Some(*pose);
@@ -436,20 +443,18 @@ impl WallFollower {
             .then(|| (0.0, self.spin(remaining), "turning on the spot"))
     }
 
-    /// Back within `lap_radius` of the lap's start, going the way it started, and
-    /// `lap_overlap` on from the nearest it came to it while following: over the seam, not
-    /// short of it (the start may lie in a corner still ahead).
+    /// Back within `lap_radius` of the lap's start having turned round (`LAP_TURN`), going
+    /// the way it started, and `lap_overlap` on from the nearest it came to it while
+    /// following: over the seam, not short of it (the start may lie in a corner still ahead).
     fn lap_done(&mut self, pose: &Pose2D) -> bool {
-        let Some((start, at)) = self.lap_start else {
+        let Some((start, turned)) = self.lap_start else {
             return false;
         };
         let d = (pose.x - start.x).hypot(pose.y - start.y);
         let same_way = self
             .lap_heading
             .is_none_or(|h| angle_diff(pose.theta, h).abs() < FRAC_PI_2);
-        let back = self.travelled - at > self.config.lap_min_distance
-            && d < self.config.lap_radius
-            && same_way;
+        let back = turned.abs() >= LAP_TURN && d < self.config.lap_radius && same_way;
         match &mut self.lap_back {
             Some(nearest) if d < nearest.0 => *nearest = (d, self.travelled),
             None if back => self.lap_back = Some((d, self.travelled)),
@@ -583,7 +588,12 @@ impl WallFollower {
                     let gap = d - r;
                     if gap < ON_EDGE {
                         self.start_lap(pose);
-                        self.lap_heading.get_or_insert(pose.theta);
+                        if self.lap_heading.is_none() {
+                            self.lap_heading = Some(pose.theta);
+                            if let Some((_, turned)) = &mut self.lap_start {
+                                *turned = 0.0;
+                            }
+                        }
                     }
                     // Run along the edge point (it on the right), bent towards it when the
                     // gap is wider than wanted (from far away, straight at it), away when
@@ -702,6 +712,7 @@ impl ExplorationStrategy for WallFollower {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::math::normalize_angle;
 
     fn no_map() -> CurrentMapData {
         CurrentMapData {
@@ -1071,6 +1082,13 @@ mod tests {
         ));
         let overlap = f.config.lap_overlap;
         assert!(
+            matches!(at(&mut f, -0.2, 2.0), ExplorationAction::Drive { .. }),
+            "dithering by the start is no lap…"
+        );
+        assert!(f.lap_back.is_none());
+        // Round the room (the poses here all face along the wall).
+        f.lap_start.as_mut().unwrap().1 = 2.0 * PI;
+        assert!(
             matches!(at(&mut f, -0.2, 10.0), ExplorationAction::Drive { .. }),
             "back near the start, it goes on to the seam…"
         );
@@ -1093,11 +1111,35 @@ mod tests {
     }
 
     #[test]
+    fn a_lap_counts_the_turn_round_not_turns_back_and_forth() {
+        let mut f = WallFollower::new(WallFollowConfig::default());
+        f.lap_start = Some((Point2D::new(0.0, 0.0), 0.0));
+        let turned = |f: &WallFollower| f.lap_start.unwrap().1;
+        // Dithering by an unseen edge: left and right again, many times.
+        for _ in 0..20 {
+            for theta in [0.0, 0.8, 0.0, -0.8] {
+                f.track(&Pose2D::new(0.0, 0.0, theta));
+            }
+        }
+        assert!(turned(&f).abs() < 1.0, "{}", turned(&f));
+        // Round a room: a quarter at each corner, across ±π.
+        for k in 1..=8 {
+            f.track(&Pose2D::new(
+                0.0,
+                0.0,
+                normalize_angle(k as f32 * FRAC_PI_2 / 2.0),
+            ));
+        }
+        assert!((turned(&f) - 2.0 * PI).abs() < 1.0, "{}", turned(&f));
+    }
+
+    #[test]
     fn passing_the_start_the_other_way_is_no_lap() {
         // Down the far side of a narrow bay, 12 cm from where following started going up.
         let mut f = WallFollower::new(WallFollowConfig::default());
         let up = FRAC_PI_2;
-        f.lap_start = Some((Point2D::new(0.0, 0.0), 0.0));
+        // Having been round the room.
+        f.lap_start = Some((Point2D::new(0.0, 0.0), 2.0 * PI));
         f.lap_heading = Some(up);
         f.travelled = 5.0;
         assert!(!f.lap_done(&Pose2D::new(0.12, 0.0, -up)));
@@ -1126,5 +1168,16 @@ mod tests {
         );
         assert_eq!(f.lap_start.map(|(p, _)| (p.x, p.y)), Some((1.0, 2.0)));
         assert_eq!(f.lap_heading, None, "into the wall is not the way along it");
+    }
+
+    #[test]
+    fn the_turn_alongside_after_a_bump_is_not_counted_in_the_lap() {
+        let mut f = following(WallSide::Right);
+        // Turned from facing the wall it bumped into to along it.
+        f.lap_start.as_mut().unwrap().1 = FRAC_PI_2;
+        let r = f.config.robot_radius;
+        tick(&mut f, &wall_at(-r - Tuning::default().hover_gap));
+        assert_eq!(f.lap_heading, Some(0.0));
+        assert_eq!(f.lap_start.unwrap().1, 0.0);
     }
 }
