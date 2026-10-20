@@ -4,7 +4,7 @@
 //! a total cost; `--climb` hill-climbs the sweep's settings on that cost.
 //!
 //!     cargo run --release --bin sweep -- [--kit rooms|primitives] [--seeds N] [--only NAME]
-//!         [--set K=V,...]
+//!         [--strategy wall_follow|stock_follow] [--set K=V,...]
 //!         [--climb TRIALS] [--dump DIR] [--reasons]
 //!
 //! - The robot is `--sim` (default `sangamio/mock_bench.toml`, the v8 as measured), the
@@ -22,7 +22,7 @@ mod score;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use dhruva_slam::config::Config;
+use dhruva_slam::config::{Config, StrategyKind};
 use sangamio::devices::mock::config::SimulationConfig;
 
 use crate::run::Run;
@@ -50,6 +50,9 @@ struct Args {
     /// Only this scene of the kit.
     #[arg(long)]
     only: Option<String>,
+    /// The strategy to run instead of `--config`'s: wall_follow or stock_follow.
+    #[arg(long, value_parser = strategy)]
+    strategy: Option<StrategyKind>,
     /// Settings to change first: KEY=VALUE[,KEY=VALUE...].
     #[arg(long, value_delimiter = ',')]
     set: Vec<String>,
@@ -126,6 +129,11 @@ pub fn settings(config: &Path, sim: &Path) -> Result<(Config, SimulationConfig),
     Ok((Config::from_file(config)?, simulation))
 }
 
+/// A strategy by its name in the config.
+fn strategy(name: &str) -> Result<StrategyKind, String> {
+    serde_json::from_value(name.into()).map_err(|e| e.to_string())
+}
+
 pub fn total(outcomes: &[Outcome]) -> f32 {
     outcomes.iter().map(|o| cost(&o.score)).sum()
 }
@@ -134,6 +142,9 @@ fn main() -> Result<(), String> {
     env_logger::init();
     let args = Args::parse();
     let (mut config, sim) = settings(&args.config, &args.sim)?;
+    if let Some(kind) = args.strategy {
+        config.exploration.strategy = kind;
+    }
     for kv in &args.set {
         let (key, value) = kv.split_once('=').ok_or(format!("--set {kv}: KEY=VALUE"))?;
         let value = value.parse().map_err(|e| format!("--set {kv}: {e}"))?;

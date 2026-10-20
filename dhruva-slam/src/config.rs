@@ -19,7 +19,8 @@ use crate::engine::slam::{
     SubmapManagerConfig,
 };
 use crate::exploration::{
-    ExplorationStrategy, FrontierConfig, FrontierExploration, WallFollowConfig, WallFollower,
+    ExplorationStrategy, FrontierConfig, FrontierExploration, StockFollowConfig, StockFollower,
+    WallFollowConfig, WallFollower,
 };
 use crate::io::motion_controller::MotionConfig;
 use crate::sensors::odometry::{
@@ -444,6 +445,8 @@ pub enum StrategyKind {
     Frontier,
     /// The corner sweep (`[exploration.wall_follow]`).
     WallFollow,
+    /// The stock firmware's edge pass, ported (`[exploration.stock_follow]`).
+    StockFollow,
 }
 
 impl StrategyKind {
@@ -452,7 +455,7 @@ impl StrategyKind {
     pub fn runs_on_simulated_clock(self) -> bool {
         match self {
             StrategyKind::Frontier => false,
-            StrategyKind::WallFollow => true,
+            StrategyKind::WallFollow | StrategyKind::StockFollow => true,
         }
     }
 }
@@ -474,6 +477,8 @@ pub struct ExplorationCfg {
     pub frontier: ExplorationFrontierConfig,
     #[serde(default)]
     pub wall_follow: WallFollowConfig,
+    #[serde(default)]
+    pub stock_follow: StockFollowConfig,
 }
 
 impl Default for ExplorationCfg {
@@ -486,6 +491,7 @@ impl Default for ExplorationCfg {
             motion: ExplorationMotionConfig::default(),
             frontier: ExplorationFrontierConfig::default(),
             wall_follow: WallFollowConfig::default(),
+            stock_follow: StockFollowConfig::default(),
         }
     }
 }
@@ -801,6 +807,12 @@ pub fn build_exploration(config: &Config) -> (ExplorationConfig, Box<dyn Explora
         StrategyKind::WallFollow => Box::new(WallFollower::new(WallFollowConfig {
             robot_radius: config.navigation.robot_radius,
             ..exploration.wall_follow
+        })),
+        StrategyKind::StockFollow => Box::new(StockFollower::new(StockFollowConfig {
+            lidar_x: config.lidar.mounting_x,
+            optical_offset: config.lidar.optical_offset,
+            tick: 1.0 / exploration.loop_rate_hz,
+            ..exploration.stock_follow
         })),
     };
     (thread, strategy)
