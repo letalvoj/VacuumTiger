@@ -32,6 +32,8 @@ use crate::scene::{Point, Scene};
 
 /// The groups' clock starts here (µs): any fixed time, so runs replay exactly.
 const EPOCH_US: u64 = 1_700_000_000_000_000;
+/// An occupied cell in the shared state's map (`CurrentMapData::cells`).
+const OCCUPIED: u8 = 100;
 
 /// What happened in a run.
 #[derive(Debug, Clone, Default)]
@@ -47,6 +49,10 @@ pub struct Run {
     pub belief: Vec<(f32, f32, f32)>,
     /// Where the bumper was pressed (a new press).
     pub bumps: Vec<Point>,
+    /// Where the robot was each tick it was told to reverse (backing off a contact).
+    pub reversing: Vec<Point>,
+    /// SLAM's last published map: its occupied cells, in the scene's frame.
+    pub seen: Vec<Point>,
     /// The session's status every tick, with the speed it commanded.
     pub ticks: Vec<(String, f32)>,
 }
@@ -183,6 +189,10 @@ pub fn run(
                 let (linear, angular) = exploration.motion.limit(linear, angular);
                 bench.robot.drive(linear, angular);
                 speed = linear;
+                if linear < 0.0 {
+                    let (x, y, _) = bench.robot.pose();
+                    bench.run.reversing.push((x, y));
+                }
             }
             Command::Drive { .. } => {}
             Command::Finish { completed } => {
@@ -190,17 +200,35 @@ pub fn run(
                 if !completed {
                     bench.run.ended = Some(tick.status);
                 }
-                return Ok(bench.run);
+                break;
             }
             Command::NavigateTo(target) => {
                 bench.run.ended = Some(format!("asked to navigate to {target:?}"));
-                return Ok(bench.run);
+                break;
             }
         }
         bench.run.ticks.push((tick.status, speed));
         bench.advance(started + period)?;
     }
-    bench.run.ended = Some("out of time".into());
+    if bench.run.ended.is_none() && !bench.run.completed {
+        bench.run.ended = Some("out of time".into());
+    }
+    let state = bench.shared.read().expect("shared state poisoned");
+    if let Some(map) = &state.current_map {
+        let at = |n: u32, o: f32| o + (n as f32 + 0.5) * map.resolution;
+        bench.run.seen = (0..map.width * map.height)
+            .filter(|&k| map.cells[k as usize] == OCCUPIED)
+            .map(|k| {
+                let (x, y) = (
+                    at(k % map.width, map.origin_x),
+                    at(k / map.width, map.origin_y),
+                );
+                let (x, y, _) = in_scene(x, y, 0.0);
+                (x, y)
+            })
+            .collect();
+    }
+    drop(state);
     Ok(bench.run)
 }
 

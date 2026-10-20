@@ -53,6 +53,8 @@ pub struct Score {
     pub pockets: Vec<Point>,
     /// …and their area (m²).
     pub pockets_m2: f32,
+    /// The swept cells (centres), for the render.
+    pub swept: Vec<Point>,
     /// The longest time the path stayed within `LOITER_RADIUS` of a point (s).
     pub loiter: f32,
     /// Every edge sample: where it is, the inward normal, and how deep the miss is (m).
@@ -291,6 +293,10 @@ pub fn score(scene: &Scene, run: &Run) -> Score {
         .map(|k| swept.centre(k))
         .collect();
     Score {
+        swept: (0..swept.cells.len())
+            .filter(|&k| swept.cells[k])
+            .map(|k| swept.centre(k))
+            .collect(),
         pockets_m2: pockets.len() as f32 * CELL * CELL,
         pockets,
         completed: run.completed,
@@ -320,6 +326,8 @@ pub fn to_json(scene: &Scene, run: &Run, score: &Score) -> Value {
         "path": path,
         "belief": run.belief,
         "bumps": run.bumps,
+        "reversing": run.reversing,
+        "seen": run.seen,
         "completed": run.completed,
         "ended": run.ended,
         "seconds": score.seconds,
@@ -330,6 +338,7 @@ pub fn to_json(scene: &Scene, run: &Run, score: &Score) -> Value {
         "misses": misses,
         "pockets": score.pockets,
         "pockets_m2": score.pockets_m2,
+        "swept": score.swept,
         "side_brush": SIDE_BRUSH,
         "side_brush_radius": SIDE_BRUSH_RADIUS,
         "main_brush_half": MAIN_BRUSH_HALF,
