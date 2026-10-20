@@ -25,7 +25,7 @@ random_seed = 42      # bench: deterministic
 log_level = "standard"  # "minimal", "standard", "verbose"
 
 [device.simulation.robot]
-wheel_base = 0.238         # dhruva-v8.toml
+wheel_base = 0.235         # measured, wheel centres (dhruva-v8.toml assumes 0.238)
 ticks_per_meter = 4516.7   # dhruva-v8.toml (calibrated on flat1)
 max_linear_speed = 0.3
 max_angular_speed = 1.0
