@@ -29,6 +29,6 @@ max_total_mb = 128        # no new recording beyond this
 [robot]
 name = "VacuumTiger"
 model = "CRL-200S"
-lidar_offset_x = -0.110
+lidar_offset_x = -0.105
 lidar_offset_y = 0.0
 radius = 0.175

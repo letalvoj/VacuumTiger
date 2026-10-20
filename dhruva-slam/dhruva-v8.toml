@@ -40,9 +40,10 @@ wheel_base = 0.238
 
 [lidar]
 # SangamIO (kaiaai delta2d) already rotates points by its lidar_mounting.angle_offset;
-# only the position offsets are left to the consumer. Values are CRL-200S reference
-# geometry, UNVERIFIED on the v8 (HANDOVER T5).
-mounting_x = -0.110
+# only the position offsets are left to the consumer. mounting_x: the stock firmware's
+# shell table, 10.5 cm behind the centre (the golden eval can't tell it from -0.110). The
+# optical offset is CRL-200S reference geometry, unverified on the v8.
+mounting_x = -0.105
 mounting_y = 0.0
 optical_offset = 0.025
 angle_offset = 0.0

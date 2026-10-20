@@ -50,8 +50,9 @@ wheel_track_m = 0.238
 safe_start = true
 
 [device.hardware.lidar_mounting]
-# CRL-200S reference geometry (Proscenic M6 Pro); verify on v8 in T5.
-offset_x = -0.110
+# offset_x: the stock firmware's shell table, 10.5 cm behind the centre; delta2d applies
+# only angle_offset. The rest is CRL-200S reference geometry, unverified on the v8.
+offset_x = -0.105
 offset_y = 0.0
 optical_offset = 0.025
 angle_offset = 0.2182

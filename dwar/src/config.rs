@@ -134,7 +134,7 @@ impl Default for Robot {
         Self {
             name: "VacuumTiger".into(),
             model: "CRL-200S".into(),
-            lidar_offset_x: -0.110,
+            lidar_offset_x: -0.105,
             lidar_offset_y: 0.0,
             radius: 0.175,
         }
