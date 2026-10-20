@@ -24,7 +24,7 @@
 //! The control logic is written for a wall on the right; a wall on the left mirrors the
 //! robot-frame inputs (y → -y) and the turn direction.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::f32::consts::{FRAC_PI_2, PI};
 
 use serde::Deserialize;
@@ -54,6 +54,8 @@ const CONTACT_KEEP: f32 = 1.5;
 const CONTACT_STEP: f32 = 0.02;
 const CONTACT_SPAN: f32 = 0.04;
 const CLIFF_SPAN: f32 = 0.1;
+/// …and for a bump among fabric (m): the wall behind a curtain, along it.
+const FABRIC_SPAN: f32 = 0.15;
 /// A scan point this near the shell (m), where the pressed bumper reaches, is what was
 /// touched: the shell's travel and the range noise, not the hover gap (a wall hovered beside
 /// is not what a bump ahead pressed on).
@@ -81,6 +83,20 @@ const OFFSET_MAX: f32 = 0.02;
 const TOUCH_BACKOFF: f32 = 0.015;
 /// …then turn away by this much (rad).
 const TOUCH_TURN: f32 = 0.2;
+/// Fabric, see `WallFollower::on_fabric`: a return of a quality (the Delta-2D's) below
+/// `DIM_QUALITY` is dim; on sweep7 27% of the curtain's returns were, 2-6% of walls', legs'
+/// and chairs'. Returns are counted in world cells `FABRIC_CELL` wide (m). The thresholds
+/// are the bench's, on the mock's fabric modelled on sweep7: dark furniture is unmeasured.
+const DIM_QUALITY: u8 = 100;
+const FABRIC_MIN_RETURNS: u32 = 8;
+const FABRIC_MIN_DIM_SHARE: f32 = 0.15;
+const FABRIC_PATCH: usize = 2;
+const FABRIC_CELL: f32 = 0.05;
+/// A return on fabric is taken this much farther to the wall side (m): about where the
+/// wall behind a curtain is (sweep7's folds hung 3-18 cm out). Sideways, not along the
+/// beam: the end of a curtain met head-on moves out of the way, and the body drives into
+/// the folds, along the wall behind them.
+const FABRIC_DEPTH: f32 = 0.15;
 /// The slowest driving gets near what is ahead (m/s): see `regulated_speed`.
 const SLOW_SPEED: f32 = 0.12;
 /// A turn in place is done within this angle (rad); it turns at `SPIN_GAIN` per radian
@@ -277,6 +293,14 @@ enum Leg {
     In,
 }
 
+/// The `FABRIC_CELL` a world point is in.
+fn fabric_cell(x: f32, y: f32) -> (i32, i32) {
+    (
+        (x / FABRIC_CELL).floor() as i32,
+        (y / FABRIC_CELL).floor() as i32,
+    )
+}
+
 /// Corner sweep: follow the room's edge into every corner and around the room.
 pub struct WallFollower {
     config: WallFollowConfig,
@@ -308,6 +332,8 @@ pub struct WallFollower {
     /// How far the edge overhung (m) at the last unseen bump beside it, and `travelled`
     /// then: see `OVERHANG_MAX`.
     overhang_felt: Option<(f32, f32)>,
+    /// The returns and the dim ones per world cell (see `on_fabric`).
+    returns: HashMap<(i32, i32), (u32, u32)>,
 }
 
 impl WallFollower {
@@ -332,6 +358,7 @@ impl WallFollower {
             calibration: Calibration::new(&config.tuning),
             rounded: None,
             overhang_felt: None,
+            returns: HashMap::new(),
         }
     }
 
@@ -356,17 +383,59 @@ impl WallFollower {
     }
 
     /// Scan points in the (mirrored) robot frame, the learnt offset taken off their range
-    /// (from the centre: near enough to from the lidar for what is beside the body).
-    fn seen(&self, scan: &PointCloud2D) -> Vec<Point2D> {
+    /// (from the centre: near enough to from the lidar for what is beside the body), and
+    /// those on fabric (`on_fabric`) on the wall side put `FABRIC_DEPTH` farther that way
+    /// (fabric on the other side is kept clear of, as anything else).
+    fn seen(&self, pose: &Pose2D, scan: &PointCloud2D) -> Vec<Point2D> {
         let m = self.mirror();
         let offset = self.calibration.offset;
+        let world = scan.transform(pose);
         (scan.xs.iter().zip(&scan.ys))
-            .map(|(&x, &y)| {
+            .enumerate()
+            .map(|(i, (&x, &y))| {
                 let range = x.hypot(y);
                 let k = (range - offset).max(0.0) / range.max(f32::EPSILON);
-                Point2D::new(k * x, k * m * y)
+                let p = Point2D::new(k * x, k * m * y);
+                if p.y < 0.0 && self.on_fabric(fabric_cell(world.xs[i], world.ys[i])) {
+                    Point2D::new(p.x, p.y - FABRIC_DEPTH)
+                } else {
+                    p
+                }
             })
             .collect()
+    }
+
+    /// Counts the returns of `scan`, and the dim ones (below `DIM_QUALITY`), in world cells: see
+    /// `on_fabric`.
+    fn note_returns(&mut self, pose: &Pose2D, scan: &PointCloud2D) {
+        let Some(quality) = &scan.intensities else {
+            return;
+        };
+        let world = scan.transform(pose);
+        for i in 0..scan.len() {
+            let (total, dim) = self
+                .returns
+                .entry(fabric_cell(world.xs[i], world.ys[i]))
+                .or_default();
+            *total += 1;
+            *dim += u32::from(quality[i] < DIM_QUALITY);
+        }
+    }
+
+    /// Whether a world cell is fabric (a curtain): it and `FABRIC_PATCH` of the cells round
+    /// it each had `FABRIC_MIN_RETURNS` or more returns, `FABRIC_MIN_DIM_SHARE` of them dim (a
+    /// curtain hangs a patch of them; one dark spot is not one). The body drives through
+    /// fabric, so the edge followed there is the wall behind it (`FABRIC_DEPTH`), seen
+    /// through the folds or felt. Counted in the world frame of the run: what SLAM moves
+    /// after it is counted stays where it was.
+    fn on_fabric(&self, (x, y): (i32, i32)) -> bool {
+        let dim = |cell| {
+            self.returns.get(&cell).is_some_and(|&(total, dim)| {
+                total >= FABRIC_MIN_RETURNS && dim as f32 >= FABRIC_MIN_DIM_SHARE * total as f32
+            })
+        };
+        let around = (-1..=1).flat_map(|dx| (-1..=1).map(move |dy| (x + dx, y + dy)));
+        dim((x, y)) && around.filter(|&c| c != (x, y) && dim(c)).count() >= FABRIC_PATCH
     }
 
     /// The gap wanted to the edge the lidar sees now (m): `hover_gap` beyond any overhang,
@@ -422,7 +491,7 @@ impl WallFollower {
     /// Scan points, kept contacts and the fence, in the (mirrored) robot frame.
     fn obstacles(&self, pose: &Pose2D, scan: &PointCloud2D) -> Vec<Point2D> {
         let remembered = (self.contacts.iter().map(|(c, _)| c)).chain(&self.fence);
-        let mut points = self.seen(scan);
+        let mut points = self.seen(pose, scan);
         points.extend(remembered.map(|c| self.to_robot(pose, c)));
         points
     }
@@ -634,7 +703,7 @@ impl WallFollower {
 
     /// Whether the scan has a point within `EXPLAINED` of the shell where `hazard`'s bumper
     /// may have been pressed: then the lidar sees what was touched.
-    fn explains(&self, scan: &PointCloud2D, hazard: HazardType) -> bool {
+    fn explains(&self, pose: &Pose2D, scan: &PointCloud2D, hazard: HazardType) -> bool {
         let Some((a, b)) = hazard.bumper_arc() else {
             return false;
         };
@@ -643,7 +712,7 @@ impl WallFollower {
             WallSide::Left => (-b, -a),
         };
         let r = self.config.robot_radius;
-        (self.seen(scan).iter())
+        (self.seen(pose, scan).iter())
             .any(|p| (p.x.hypot(p.y) - r).abs() < EXPLAINED && (a..=b).contains(&p.y.atan2(p.x)))
     }
 
@@ -655,12 +724,12 @@ impl WallFollower {
             WallSide::Right => (HazardType::BumperRight, HazardType::BumperLeft),
             WallSide::Left => (HazardType::BumperLeft, HazardType::BumperRight),
         };
-        let seen = self.explains(scan, hazard.hazard_type);
+        let seen = self.explains(pose, scan, hazard.hazard_type);
         self.start_lap(pose);
         // Any bump tells how near the body is: the next planned touch is put off.
         self.calibration.touched_at = Some(self.travelled);
         // The edge the lidar sees, if it is beside the body (more to the side than ahead).
-        let points = self.seen(scan);
+        let points = self.seen(pose, scan);
         let last = self.last_edge.map(|w| self.to_robot(pose, &w));
         let beside = (self.edge(&points, last)).filter(|(p, _)| p.y < -p.x.abs());
         if let Some((_, d)) = beside
@@ -688,8 +757,13 @@ impl WallFollower {
             // along it there: a short line across the contact's bearing, a wall ahead, turned
             // alongside as one seen.
             let (s, c) = hazard.world_position.theta.sin_cos();
+            let (cx, cy) = fabric_cell(at.x, at.y);
+            let among_fabric =
+                (-1..=1).any(|dx| (-1..=1).any(|dy| self.on_fabric((cx + dx, cy + dy))));
             let span = if hazard.hazard_type.is_cliff() {
                 CLIFF_SPAN
+            } else if among_fabric {
+                FABRIC_SPAN
             } else {
                 CONTACT_SPAN
             };
@@ -895,6 +969,7 @@ impl ExplorationStrategy for WallFollower {
         held: Option<HazardType>,
     ) -> ExplorationAction {
         self.track(current_pose);
+        self.note_returns(current_pose, scan);
         let before = self.phase;
         if let Some(h) = hazard {
             self.on_hazard(h, current_pose, scan);
@@ -1008,6 +1083,54 @@ mod tests {
         // Into it: it turns out on the spot.
         let (v, w) = tick(&mut f, &wall_at(-r + 0.01));
         assert!(v == 0.0 && w > 0.0, "v {v} w {w}");
+    }
+
+    #[test]
+    fn fabric_found_by_its_dim_returns_is_followed_as_the_wall_behind_it() {
+        // An edge 0.325 m off, a point in each cell along it, on the side followed and on
+        // the other; in every fourth scan the returns ahead of the robot come back dim
+        // (fabric), the ones behind never (a wall).
+        let xs = || (0..20).map(|k| -0.475 + 0.05 * k as f32);
+        for (side, y, followed) in [
+            (WallSide::Right, -0.325, true),
+            (WallSide::Left, 0.325, true),
+            (WallSide::Right, 0.325, false),
+        ] {
+            let scan = |n: u32| {
+                let mut scan = PointCloud2D::new();
+                for x in xs() {
+                    let dim = x > 0.0 && n % 4 == 0;
+                    scan.push_with_intensity(Point2D::new(x, y), if dim { 50 } else { 200 });
+                }
+                scan
+            };
+            let mut f = following(side);
+            let pose = Pose2D::identity();
+            // Mirrored: the side followed is -y.
+            let seen = |f: &WallFollower| -> Vec<f32> {
+                (f.seen(&pose, &scan(1)).iter()).map(|p| p.y).collect()
+            };
+            let at = if followed { -0.325 } else { 0.325 };
+            assert!(
+                seen(&f).iter().all(|&y| (y - at).abs() < 1e-3),
+                "{side:?}: as seen"
+            );
+            for n in 0..FABRIC_MIN_RETURNS {
+                f.note_returns(&pose, &scan(n));
+            }
+            // The end cells of the fabric have only one beside them: not a patch.
+            for (x, got) in xs().zip(seen(&f)) {
+                let want = if followed && (0.05..0.45).contains(&x) {
+                    at - FABRIC_DEPTH
+                } else {
+                    at
+                };
+                assert!(
+                    (got - want).abs() < 1e-3,
+                    "{side:?} at x {x}: {got}, want {want}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1273,13 +1396,16 @@ mod tests {
                 WallSide::Right => (HazardType::BumperRight, HazardType::BumperLeft),
                 WallSide::Left => (HazardType::BumperLeft, HazardType::BumperRight),
             };
-            assert!(f.explains(&wall, near), "{side:?}: the wall beside");
             assert!(
-                !f.explains(&wall, far),
+                f.explains(&Pose2D::identity(), &wall, near),
+                "{side:?}: the wall beside"
+            );
+            assert!(
+                !f.explains(&Pose2D::identity(), &wall, far),
                 "{side:?}: not the other side's bumper"
             );
             assert!(
-                !f.explains(&wall_at(-m * (r + 0.03)), near),
+                !f.explains(&Pose2D::identity(), &wall_at(-m * (r + 0.03)), near),
                 "{side:?}: hovered"
             );
         }
