@@ -15,6 +15,25 @@ pub type Scan = Vec<(f32, f32, u8)>;
 /// A robot pose in the map: (x, y, theta).
 pub type Pose = (f32, f32, f32);
 
+/// A person's leg's radius (m).
+const LEG_RADIUS: f32 = 0.05;
+/// How far from the lidar a leg may stand (m).
+const LEG_RANGE: std::ops::Range<f32> = 0.3..2.5;
+
+/// The distance along the ray from `origin` at `heading` (map frame) to the nearest leg
+/// (centres in the map frame) in its way.
+fn leg_in_the_way(legs: &[(f32, f32)], origin: (f32, f32), heading: f32) -> Option<f32> {
+    let (s, c) = heading.sin_cos();
+    (legs.iter())
+        .filter_map(|&(x, y)| {
+            let (dx, dy) = (x - origin.0, y - origin.1);
+            let (along, off) = (dx * c + dy * s, dy * c - dx * s);
+            (along > 0.0 && off.abs() < LEG_RADIUS)
+                .then(|| along - (LEG_RADIUS * LEG_RADIUS - off * off).sqrt())
+        })
+        .min_by(f32::total_cmp)
+}
+
 /// Lidar simulator
 pub struct LidarSimulator {
     config: LidarConfig,
@@ -23,6 +42,8 @@ pub struct LidarSimulator {
     turned: f32,
     beams: usize,
     points: Scan,
+    /// People's legs in this revolution: their centres in the map frame.
+    legs: Vec<(f32, f32)>,
 }
 
 impl LidarSimulator {
@@ -34,6 +55,28 @@ impl LidarSimulator {
             turned: 0.0,
             beams: 0,
             points: Vec::with_capacity(config.num_rays),
+            legs: Vec::new(),
+        }
+    }
+
+    /// Places this revolution's legs round the lidar at `origin` (map frame): a Poisson
+    /// number of them, `noise.legs` on average. Draws nothing when there are none, so the
+    /// beams' noise is as it was without them.
+    fn place_legs(&mut self, origin: (f32, f32)) {
+        self.legs.clear();
+        let mean = self.config.noise.legs;
+        if mean <= 0.0 {
+            return;
+        }
+        // Knuth: count uniforms until their product drops below e^-mean.
+        let (floor, mut product) = ((-mean).exp(), self.noise.uniform());
+        let span = LEG_RANGE.end - LEG_RANGE.start;
+        while product > floor {
+            let bearing = self.noise.uniform() * TAU;
+            let range = LEG_RANGE.start + self.noise.uniform() * span;
+            let (s, c) = bearing.sin_cos();
+            self.legs.push((origin.0 + range * c, origin.1 + range * s));
+            product *= self.noise.uniform();
         }
     }
 
@@ -55,6 +98,14 @@ impl LidarSimulator {
         let n = self.config.num_rays;
         let due = (self.turned.min(1.0) * n as f32) as usize;
         let rotation = (to.2 - from.2 + PI).rem_euclid(TAU) - PI;
+        let (mx, my) = (self.config.mounting_x, self.config.mounting_y);
+        let mount = |(x, y, theta): Pose| {
+            let (s, c) = theta.sin_cos();
+            (x + c * mx - s * my, y + s * mx + c * my)
+        };
+        if self.beams == 0 && due > 0 {
+            self.place_legs(mount(from));
+        }
         while self.beams < due {
             let phase = self.beams as f32 / n as f32;
             let f = ((phase - start) / (self.turned - start)).clamp(0.0, 1.0);
@@ -63,9 +114,7 @@ impl LidarSimulator {
                 from.1 + f * (to.1 - from.1),
                 from.2 + f * rotation,
             );
-            let (s, c) = theta.sin_cos();
-            let (mx, my) = (self.config.mounting_x, self.config.mounting_y);
-            let origin = (x + c * mx - s * my, y + s * mx + c * my);
+            let origin = mount((x, y, theta));
             let angle = self.config.sweep_start_angle - phase * TAU;
             self.beams += 1;
             if let Some(point) = self.beam(map, origin, theta, angle) {
@@ -88,6 +137,7 @@ impl LidarSimulator {
         theta: f32,
         angle: f32,
     ) -> Option<(f32, f32, u8)> {
+        let leg = leg_in_the_way(&self.legs, origin, theta + angle);
         let cfg = &self.config;
         let noise = &cfg.noise;
         let rng = &mut self.noise;
@@ -95,6 +145,7 @@ impl LidarSimulator {
             let opacity = map.lidar_opacity(x, y);
             opacity >= 1.0 || (opacity > 0.0 && rng.chance(opacity))
         });
+        let hit = leg.map_or(hit, |leg| hit.min(leg));
         if hit >= cfg.max_range || self.noise.chance(noise.miss_rate) {
             return None;
         }
@@ -223,6 +274,39 @@ mod tests {
             .iter()
             .fold((f32::MAX, 0.0f32), |(lo, hi), &r| (lo.min(r), hi.max(r)));
         assert!(far - near > 0.01, "not all at the first fold: {ahead:?}");
+    }
+
+    #[test]
+    fn a_leg_blocks_the_rays_through_it_at_its_near_side() {
+        let legs = [(1.0, 0.0)];
+        let at = |heading: f32| leg_in_the_way(&legs, (0.0, 0.0), heading);
+        assert!((at(0.0).unwrap() - 0.95).abs() < 1e-5);
+        assert!(at(0.049).is_some() && at(-0.049).is_some());
+        assert_eq!(at(0.06), None);
+        assert_eq!(at(PI), None, "not behind");
+    }
+
+    #[test]
+    fn people_walking_about_block_a_few_beams_each_revolution() {
+        let map = room();
+        let at = (2.0, 2.0, 0.0);
+        let clear = scan_at(&mut lidar(LidarConfig::default()), &map, at, 0.01);
+        let mut people = lidar(LidarConfig::default());
+        people.config.noise.legs = 2.0;
+        let blocked: Vec<usize> = (0..20)
+            .map(|_| {
+                let scan = scan_at(&mut people, &map, at, 0.01);
+                assert_eq!(scan.len(), clear.len());
+                (scan.iter().zip(&clear))
+                    .filter(|(p, q)| p.1 < q.1 - 0.01)
+                    .count()
+            })
+            .collect();
+        // A 10 cm leg spans 2-19 beams at 2.5-0.3 m (none when beyond the wall); two of
+        // them, now here, now there.
+        assert!(blocked.iter().all(|&n| n <= 40), "{blocked:?}");
+        assert!(blocked.iter().sum::<usize>() > 20 * 4, "{blocked:?}");
+        assert!(blocked.windows(2).any(|w| w[0] != w[1]), "{blocked:?}");
     }
 
     #[test]

@@ -57,6 +57,7 @@ angle_stddev = 0.0
 quality_base = 200
 quality_distance_decay = 10
 miss_rate = 0.05           # beams with no return on plain walls
+legs = 2.0                 # bench: a person walking about, two legs on average (not measured)
 
 [device.simulation.imu]
 gyro_scale = 5729.6        # 0.0100 deg/s per LSB, measured (dhruva-slam assumes 0.01025)

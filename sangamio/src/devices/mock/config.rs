@@ -91,6 +91,13 @@ pub struct LidarNoiseConfig {
     /// Probability of invalid reading (0.0-1.0)
     #[serde(default = "default_miss_rate")]
     pub miss_rate: f32,
+
+    /// Legs of people walking about, per revolution on average (Poisson): each a 5 cm
+    /// disc somewhere 0.3-2.5 m from the lidar, standing there for that revolution only. They
+    /// block the beams behind them; the body never touches them. An obstacle, not noise, but
+    /// it is what the lidar sees and the map does not hold.
+    #[serde(default)]
+    pub legs: f32,
 }
 
 fn default_lidar_range_stddev() -> f32 {
@@ -119,6 +126,7 @@ impl Default for LidarNoiseConfig {
             quality_base: default_quality_base(),
             quality_distance_decay: default_quality_distance_decay(),
             miss_rate: default_miss_rate(),
+            legs: 0.0,
         }
     }
 }
