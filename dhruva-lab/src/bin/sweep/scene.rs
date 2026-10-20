@@ -116,23 +116,14 @@ impl Scene {
                 origin.1 + ((h - 1 - py) as f32 + 0.5) * RES,
             )
         };
-        // Glass is the cells it crosses or touches: one or two thick.
-        let glass = |p: Point| self.glass.iter().any(|&g| distance_to_segment(p, g) < RES);
-        let solid = |p: Point| {
-            !inside(&self.room, p)
-                || glass(p)
-                || (self.legs.iter()).any(|&(c, side)| {
-                    (p.0 - c.0).abs() <= side / 2.0 + TIE && (p.1 - c.1).abs() <= side / 2.0 + TIE
-                })
-        };
         let occupancy = GrayImage::from_fn(w, h, |px, py| {
-            Luma([if solid(centre(px, py)) { 0 } else { 255 }])
+            Luma([if self.solid(centre(px, py)) { 0 } else { 255 }])
         });
         let mask = GrayImage::from_fn(w, h, |px, py| {
             let p = centre(px, py);
-            let gray = if glass(p) {
+            let gray = if self.glass_at(p) {
                 255
-            } else if solid(p) {
+            } else if self.solid(p) {
                 0
             } else {
                 (self.curtains.iter().find(|c| c.holds(p))).map_or(255, Curtain::gray)
@@ -140,6 +131,20 @@ impl Scene {
             Luma([gray])
         });
         SimulationMap::from_image(occupancy, RES, origin).with_lidar_mask(mask)
+    }
+
+    /// Whether `p` is not floor: outside the room, in a leg or on the glass.
+    pub fn solid(&self, p: Point) -> bool {
+        !inside(&self.room, p)
+            || self.glass_at(p)
+            || (self.legs.iter()).any(|&(c, side)| {
+                (p.0 - c.0).abs() <= side / 2.0 + TIE && (p.1 - c.1).abs() <= side / 2.0 + TIE
+            })
+    }
+
+    /// Glass is the map cells it crosses or touches: one or two thick.
+    fn glass_at(&self, p: Point) -> bool {
+        self.glass.iter().any(|&g| distance_to_segment(p, g) < RES)
     }
 }
 

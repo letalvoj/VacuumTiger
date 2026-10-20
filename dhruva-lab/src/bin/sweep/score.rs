@@ -9,7 +9,7 @@
 use serde_json::{Value, json};
 
 use crate::run::Run;
-use crate::scene::{Point, Scene, inside};
+use crate::scene::{Point, Scene};
 
 /// Side brush centre (robot frame, m; right is -y) and the radius it sweeps (m).
 pub const SIDE_BRUSH: Point = (0.105, -0.11);
@@ -52,8 +52,8 @@ impl Score {
     }
 }
 
-/// The floor the brushes swept, on a `CELL` grid. Only the room's floor (cells whose centre
-/// is in it): a brush reaching past a wall sweeps nothing.
+/// The floor the brushes swept, on a `CELL` grid. Only floor (cells whose centre is in the
+/// room and not in a leg or the glass): a brush reaching past a wall sweeps nothing.
 struct Swept {
     origin: Point,
     width: usize,
@@ -74,10 +74,7 @@ impl Swept {
         let floor = (0..width * height)
             .map(|k| {
                 let centre = |n: usize, o: f32| o + (n as f32 + 0.5) * CELL;
-                inside(
-                    &scene.room,
-                    (centre(k % width, origin.0), centre(k / width, origin.1)),
-                )
+                !scene.solid((centre(k % width, origin.0), centre(k / width, origin.1)))
             })
             .collect();
         let mut swept = Self {
