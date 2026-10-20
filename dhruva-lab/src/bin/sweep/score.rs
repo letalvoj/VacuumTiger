@@ -5,11 +5,15 @@
 //! The main term is the floor left along the edges. Each edge is sampled every centimetre,
 //! and each sample measures how far in from the wall the swept floor starts; their sum is
 //! the area missed. Corners report the distance from the corner to the nearest swept floor.
+//!
+//! Pockets are unswept floor the path closed round, away from the room's sides, too small
+//! for the body: inside a loop round a leg, say. Sweeping them later means coming back for
+//! each, so they cost more than the open middle the lanes will sweep.
 
 use serde_json::{Value, json};
 
 use crate::run::Run;
-use crate::scene::{Point, Scene};
+use crate::scene::{Point, Scene, inside};
 
 /// Side brush centre (robot frame, m; right is -y) and the radius it sweeps (m).
 pub const SIDE_BRUSH: Point = (0.105, -0.11);
@@ -25,6 +29,11 @@ const EDGE_STEP: f32 = 0.01;
 /// …and a corner's miss is measured from this far inside it along the bisector (m), where
 /// the floor actually is.
 const CORNER_INSET: f32 = 0.005;
+/// Pockets: gaps in a loop up to twice this many cells wide (6 cm) are closed; a wider
+/// one joins the pocket to the middle…
+const GAP: usize = 3;
+/// …and an enclosed patch with less area than the body's (radius, m) is one.
+const BODY_RADIUS: f32 = 0.175;
 /// A path that does not leave a circle this big (m) for long loiters.
 const LOITER_RADIUS: f32 = 1.0;
 
@@ -40,6 +49,10 @@ pub struct Score {
     pub missed_depth: f32,
     /// Distance from each inner corner to the nearest swept floor (m), in edge order.
     pub corners: Vec<f32>,
+    /// The pockets' cells (centres)…
+    pub pockets: Vec<Point>,
+    /// …and their area (m²).
+    pub pockets_m2: f32,
     /// The longest time the path stayed within `LOITER_RADIUS` of a point (s).
     pub loiter: f32,
     /// Every edge sample: where it is, the inward normal, and how deep the miss is (m).
@@ -58,6 +71,9 @@ struct Swept {
     origin: Point,
     width: usize,
     height: usize,
+    /// Cells in the room…
+    room: Vec<bool>,
+    /// …and its floor.
     floor: Vec<bool>,
     cells: Vec<bool>,
 }
@@ -71,19 +87,17 @@ impl Swept {
         let origin = (min(&xs) - margin, min(&ys) - margin);
         let width = ((max(&xs) - origin.0 + margin) / CELL) as usize + 1;
         let height = ((max(&ys) - origin.1 + margin) / CELL) as usize + 1;
-        let floor = (0..width * height)
-            .map(|k| {
-                let centre = |n: usize, o: f32| o + (n as f32 + 0.5) * CELL;
-                !scene.solid((centre(k % width, origin.0), centre(k / width, origin.1)))
-            })
-            .collect();
         let mut swept = Self {
             origin,
             width,
             height,
-            floor,
+            room: Vec::new(),
+            floor: Vec::new(),
             cells: vec![false; width * height],
         };
+        let centres: Vec<Point> = (0..width * height).map(|k| swept.centre(k)).collect();
+        swept.room = centres.iter().map(|&p| inside(&scene.room, p)).collect();
+        swept.floor = centres.iter().map(|&p| !scene.solid(p)).collect();
         for &(x, y, theta) in &run.path {
             let (s, c) = theta.sin_cos();
             let brush = (
@@ -105,6 +119,69 @@ impl Swept {
         let j = ((p.1 - self.origin.1) / CELL).floor();
         (i >= 0.0 && j >= 0.0 && (i as usize) < self.width && (j as usize) < self.height)
             .then(|| j as usize * self.width + i as usize)
+    }
+
+    fn centre(&self, k: usize) -> Point {
+        let at = |n: usize, o: f32| o + (n as f32 + 0.5) * CELL;
+        (
+            at(k % self.width, self.origin.0),
+            at(k / self.width, self.origin.1),
+        )
+    }
+
+    /// The cells within `r` cells of `k` (a square).
+    fn around(&self, k: usize, r: usize) -> impl Iterator<Item = usize> + '_ {
+        let (i, j) = (k % self.width, k / self.width);
+        let is = i.saturating_sub(r)..=(i + r).min(self.width - 1);
+        let js = j.saturating_sub(r)..=(j + r).min(self.height - 1);
+        js.flat_map(move |j| is.clone().map(move |i| j * self.width + i))
+    }
+
+    /// The pockets' cells. Unswept floor is split into patches (4-connected) with the swept
+    /// floor grown by `GAP` first, which closes narrow gaps in a loop and drops specks; a
+    /// patch is a pocket if it does not touch the room's sides and has less area than the
+    /// body (shrunk by `GAP` too). Its cells are the patch grown back by `GAP` over unswept
+    /// floor.
+    fn pockets(&self) -> Vec<usize> {
+        let unswept = |k: usize| self.floor[k] && !self.cells[k];
+        let body = std::f32::consts::PI * (BODY_RADIUS - GAP as f32 * CELL).powi(2);
+        let open: Vec<bool> = (0..self.cells.len())
+            .map(|k| unswept(k) && !self.around(k, GAP).any(|n| self.cells[n]))
+            .collect();
+        let mut seen = vec![false; self.cells.len()];
+        let mut pocket = vec![false; self.cells.len()];
+        for start in 0..self.cells.len() {
+            if seen[start] || !open[start] {
+                continue;
+            }
+            seen[start] = true;
+            let (mut patch, mut todo, mut walled) = (Vec::new(), vec![start], false);
+            while let Some(k) = todo.pop() {
+                patch.push(k);
+                let (i, j) = (k % self.width, k / self.width);
+                let neighbours = [
+                    (i > 0).then(|| k - 1),
+                    (i + 1 < self.width).then(|| k + 1),
+                    (j > 0).then(|| k - self.width),
+                    (j + 1 < self.height).then(|| k + self.width),
+                ];
+                for n in neighbours.into_iter().flatten() {
+                    walled |= !self.room[n];
+                    if !seen[n] && open[n] {
+                        seen[n] = true;
+                        todo.push(n);
+                    }
+                }
+            }
+            if !walled && (patch.len() as f32) * CELL * CELL < body {
+                for k in patch {
+                    for n in self.around(k, GAP) {
+                        pocket[n] |= unswept(n);
+                    }
+                }
+            }
+        }
+        (0..pocket.len()).filter(|&k| pocket[k]).collect()
     }
 
     fn mark(&mut self, p: Point) {
@@ -210,7 +287,12 @@ pub fn score(scene: &Scene, run: &Run) -> Score {
         );
         corners.push(swept.nearest(inside));
     }
+    let pockets: Vec<Point> = (swept.pockets().into_iter())
+        .map(|k| swept.centre(k))
+        .collect();
     Score {
+        pockets_m2: pockets.len() as f32 * CELL * CELL,
+        pockets,
         completed: run.completed,
         seconds: run.seconds(),
         bumps: run.bumps.len(),
@@ -246,6 +328,8 @@ pub fn to_json(scene: &Scene, run: &Run, score: &Score) -> Value {
         "missed_depth": score.missed_depth,
         "corners": score.corners,
         "misses": misses,
+        "pockets": score.pockets,
+        "pockets_m2": score.pockets_m2,
         "side_brush": SIDE_BRUSH,
         "side_brush_radius": SIDE_BRUSH_RADIUS,
         "main_brush_half": MAIN_BRUSH_HALF,
@@ -254,6 +338,8 @@ pub fn to_json(scene: &Scene, run: &Run, score: &Score) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::f32::consts::FRAC_PI_2;
+
     use super::*;
 
     fn room(corners: &[Point]) -> Scene {
@@ -324,6 +410,55 @@ mod tests {
             ..Run::default()
         };
         assert_eq!(score(&scene, &run).corners.len(), 5);
+    }
+
+    #[test]
+    fn a_loop_round_a_leg_leaves_a_pocket_and_the_middle_is_not_one() {
+        // Clockwise 0.3 m round a 4 cm leg at (1, 1), the side brush towards it: its centre
+        // runs hypot(0.3 - 0.11, 0.105) = 21.7 cm from the leg, so it reaches in to 13.9 cm
+        // and a disc that big less the leg is left, about 590 cm² (570 on the grid). The rest
+        // of the room is
+        // the middle.
+        let (scene, run) = round_a_leg(0.3);
+        let s = score(&scene, &run);
+        assert!((0.054..0.061).contains(&s.pockets_m2), "{}", s.pockets_m2);
+        let near = |p: &Point| (p.0 - 1.0).hypot(p.1 - 1.0) < 0.14;
+        assert!(s.pockets.iter().all(near));
+    }
+
+    #[test]
+    fn a_narrow_gap_in_the_loop_still_leaves_a_pocket() {
+        // A 2 cm channel cut through the swept ring, out to the middle.
+        let (scene, run) = round_a_leg(0.3);
+        let mut swept = Swept::new(&scene, &run);
+        for k in 0..swept.cells.len() {
+            let (x, y) = swept.centre(k);
+            if x > 1.0 && (1.0..1.02).contains(&y) {
+                swept.cells[k] = false;
+            }
+        }
+        let area = swept.pockets().len() as f32 * CELL * CELL;
+        assert!((0.054..0.062).contains(&area), "{area}");
+    }
+
+    #[test]
+    fn a_loop_the_body_fits_in_leaves_no_pocket() {
+        let (scene, run) = round_a_leg(0.6);
+        assert_eq!(score(&scene, &run).pockets_m2, 0.0);
+    }
+
+    /// Clockwise round a 4 cm leg at (1, 1), `r` off, a step per mm.
+    fn round_a_leg(r: f32) -> (Scene, Run) {
+        let (mut scene, mut run) = square(Vec::new());
+        scene.legs.push(((1.0, 1.0), 0.04));
+        let steps = (2.0 * std::f32::consts::PI * r * 1000.0) as usize;
+        run.path = (0..=steps)
+            .map(|k| {
+                let a = -(k as f32) / (r * 1000.0);
+                (1.0 + r * a.cos(), 1.0 + r * a.sin(), a - FRAC_PI_2)
+            })
+            .collect();
+        (scene, run)
     }
 
     #[test]

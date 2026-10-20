@@ -98,11 +98,11 @@ pub fn evaluate(
 }
 
 /// One number per run to minimise. A point is a centimetre of mean unswept depth along
-/// the edges (the main term), or 3.3 cm of a corner missed beyond 5 cm, or 2 bumps, or
-/// 30 s, or 10 s of loitering beyond 30 s; a lap not closed costs 10.
+/// the edges (the main term), or 100 cm² of pockets, or 3.3 cm of a corner missed beyond
+/// 5 cm, or 2 bumps, or 30 s, or 10 s of loitering beyond 30 s; a lap not closed costs 10.
 pub fn cost(s: &Score) -> f32 {
     let corners: f32 = s.corners.iter().map(|c| (c - 0.05).max(0.0) * 100.0).sum();
-    let mut c = s.missed_depth * 100.0 + 0.3 * corners;
+    let mut c = s.missed_depth * 100.0 + s.pockets_m2 * 100.0 + 0.3 * corners;
     c += s.seconds / 30.0;
     c += 0.5 * s.bumps as f32;
     c += (s.loiter - 30.0).max(0.0) / 10.0;
@@ -147,19 +147,20 @@ fn main() -> Result<(), String> {
 
     let outcomes = evaluate(&scenes, &config, &sim, args.seeds)?;
     println!(
-        "{:<16} {:>4} {:>6} {:>5} {:>8} {:>8} {:>7} {:>6}",
-        "scene", "lap", "s", "bumps", "miss cm", "corner", "loiter", "cost"
+        "{:<16} {:>4} {:>6} {:>5} {:>8} {:>8} {:>8} {:>7} {:>6}",
+        "scene", "lap", "s", "bumps", "miss cm", "corner", "pkt cm²", "loiter", "cost"
     );
     for o in &outcomes {
         let s = &o.score;
         println!(
-            "{:<16} {:>4} {:>6.0} {:>5} {:>8.1} {:>8.1} {:>7.0} {:>6.1}  {}",
+            "{:<16} {:>4} {:>6.0} {:>5} {:>8.1} {:>8.1} {:>8.0} {:>7.0} {:>6.1}  {}",
             format!("{}#{}", o.scene, o.seed),
             if s.completed { "yes" } else { "NO" },
             s.seconds,
             s.bumps,
             s.missed_depth * 100.0,
             s.worst_corner() * 100.0,
+            s.pockets_m2 * 1e4,
             s.loiter,
             cost(s),
             o.run.ended.as_deref().unwrap_or_default()
