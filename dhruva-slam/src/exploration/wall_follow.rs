@@ -103,8 +103,8 @@ impl Default for WallFollowConfig {
         Self {
             side: WallSide::Right,
             robot_radius: 0.17,
-            speed: 0.15,
-            turn_rate: 0.5,
+            speed: 0.17,
+            turn_rate: 0.67,
             lap_radius: 0.3,
             lap_min_distance: 3.0,
             max_distance: 300.0,
@@ -141,13 +141,13 @@ impl Default for Tuning {
     fn default() -> Self {
         Self {
             hover_gap: 0.02,
-            k_gap: 7.7,
-            max_bend_away: 0.27,
-            k_turn: 2.0,
-            spin_angle: 0.35,
+            k_gap: 5.5,
+            max_bend_away: 0.21,
+            k_turn: 2.6,
+            spin_angle: 0.45,
             front_look: 0.067,
             backoff_distance: 0.033,
-            nudge: 0.8,
+            nudge: 0.6,
         }
     }
 }
