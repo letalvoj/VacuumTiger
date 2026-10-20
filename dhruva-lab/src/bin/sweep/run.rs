@@ -50,8 +50,8 @@ pub struct Run {
     /// Where SLAM believed the robot was every tick, in the scene's frame (SLAM's starts
     /// where the robot does).
     pub belief: Vec<(f32, f32, f32)>,
-    /// Where the bumper was pressed (a new press).
-    pub bumps: Vec<Point>,
+    /// Where the bumper was pressed (a new press), and which side: "left", "right", "both".
+    pub bumps: Vec<(f32, f32, &'static str)>,
     /// Where the robot was each tick it was told to reverse (backing off a contact).
     pub reversing: Vec<Point>,
     /// SLAM's last published map: its occupied cells, in the scene's frame.
@@ -105,7 +105,12 @@ impl Loop {
                 let pressed = status.bumper_left || status.bumper_right;
                 if pressed && !self.pressed {
                     let (x, y, _) = self.robot.pose();
-                    self.run.bumps.push((x, y));
+                    let side = match (status.bumper_left, status.bumper_right) {
+                        (true, true) => "both",
+                        (true, false) => "left",
+                        _ => "right",
+                    };
+                    self.run.bumps.push((x, y, side));
                 }
                 self.pressed = pressed;
                 self.slam.process_udp_sensor_status(&status, &self.shared);
