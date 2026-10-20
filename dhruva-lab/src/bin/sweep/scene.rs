@@ -1,7 +1,7 @@
 //! The scenes the corner sweep is scored on, and their maps for the SangamIO mock: rooms
 //! after what the real runs met (`captures/CATALOG.md`), and primitives, one move each.
 
-use std::f32::consts::PI;
+use std::f32::consts::{FRAC_PI_2, PI};
 
 use image::{GrayImage, Luma};
 use sangamio::devices::mock::map_loader::SimulationMap;
@@ -21,6 +21,14 @@ const MARGIN: f32 = 0.3;
 const FABRIC: f32 = 0.02;
 /// …that folds every this far (m).
 const FOLD_PITCH: f32 = 0.15;
+/// Floor beside a fin (m): one lap sweeps a band about 26 cm wide (the side brush reaches
+/// 18.5 cm to the wall's side, the main brush 8 cm to the other), so the pass along the
+/// wall and the one along the fin overlap, and what is left unswept is the turn's. A wider
+/// bay leaves a strip down its middle that one lap cannot sweep: the rooms kit scores that.
+const BAY: f32 = 0.5;
+/// The bay right of a fin is this much narrower (m): two alike, the lidar cannot tell them
+/// apart from their corners, and SLAM jumps from one to the other.
+const BAY_SKEW: f32 = 0.05;
 
 /// A curtain: fabric hanging in folds behind `front` (towards its left), bulging up to
 /// `depth` back. A lidar beam crossing it square is returned with probability `seen`
@@ -195,11 +203,11 @@ impl Kit {
     }
 }
 
-/// A room `room_w` x `room_h` (m) with a fin `fin_w` wide and `fin_len` long out of the
-/// middle of its bottom wall.
-fn finned(room_w: f32, room_h: f32, fin_w: f32, fin_len: f32) -> Vec<Point> {
-    debug_assert!(fin_w < room_w);
-    let (a, b) = ((room_w - fin_w) / 2.0, (room_w + fin_w) / 2.0);
+/// A fin `fin_w` wide and `fin_len` long (m) out of a room's bottom wall, `BAY` of floor
+/// left of it and beyond its end, `BAY_SKEW` less right of it.
+fn finned(fin_w: f32, fin_len: f32) -> Vec<Point> {
+    let (a, b) = (BAY, BAY + fin_w);
+    let (room_w, room_h) = (b + BAY - BAY_SKEW, fin_len + BAY);
     vec![
         (0.0, 0.0),
         (a, 0.0),
@@ -233,10 +241,12 @@ pub fn primitives() -> Vec<Scene> {
     let mut out = vec![corridor.clone()];
 
     // Round the end of a 2 cm partition (a desk side): a half turn about one point.
-    out.push(quiet("fin_thin", &finned(1.4, 1.2, 0.02, 0.6), start, 90.0));
+    // In the middle of the left bay, beside the fin, facing up along it.
+    let in_bay = (BAY / 2.0, 0.3, FRAC_PI_2);
+    out.push(quiet("fin_thin", &finned(0.02, 0.6), in_bay, 90.0));
 
     // Round a 40 cm block (a cabinet): two quarter turns, a short side between.
-    out.push(quiet("fin_thick", &finned(1.6, 1.2, 0.4, 0.6), start, 90.0));
+    out.push(quiet("fin_thick", &finned(0.4, 0.6), in_bay, 90.0));
 
     // A 3 cm leg too near the wall to pass behind: round it and back to the wall.
     let mut scene = quiet("leg", &room, start, 90.0);
