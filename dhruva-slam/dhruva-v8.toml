@@ -173,7 +173,9 @@ side = "right"
 
 [exploration.motion]
 max_linear_vel = 0.4
-max_angular_vel = 0.8
+# The stock firmware spins at 1.4 rad/s; wall_follow caps itself lower (`turn_rate`). This
+# also caps frontier and its MoveTo.
+max_angular_vel = 1.4
 obstacle_clearance = 0.15
 linear_vel = 0.3
 angular_vel = 0.5
