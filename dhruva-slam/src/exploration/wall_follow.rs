@@ -58,6 +58,15 @@ const CLIFF_SPAN: f32 = 0.1;
 /// touched: the shell's travel and the range noise, not the hover gap (a wall hovered beside
 /// is not what a bump ahead pressed on).
 const EXPLAINED: f32 = 0.015;
+/// An unseen bump beside an edge the lidar sees no farther than this from the shell (m) is
+/// on something overhanging that edge (a cabinet's top over its plinth). For `OVERHANG_KEEP`
+/// of travel after (m) the edge is hovered beside, and its corners rounded, that much
+/// farther off: round the piece of furniture, not just the side felt.
+const OVERHANG_MAX: f32 = 0.08;
+/// How long an overhang felt is kept (m of travel). It is not forgotten sooner when the edge
+/// changes, so the next 0.6 m may run that much off a wall; nor held through a corner, so
+/// the clearance past one may shrink while it is turned.
+const OVERHANG_KEEP: f32 = 0.6;
 /// Following has started once the body is this close to the edge (m).
 const ON_EDGE: f32 = 0.05;
 /// A planned touch aims this far into the wall (m), so the shell surely presses…
@@ -102,6 +111,9 @@ const FACE_MIN: f32 = 0.1;
 /// …and the robot drives past its vertex only running within this of it (rad): skewed
 /// (turning off a bump) one scan is no plan to commit to.
 const PARALLEL: f32 = 0.25;
+/// A face shorter than `FACE_MIN` met within this travel (m) after rounding a corner runs
+/// the way it was rounded to. Set on fin_thin: a fin's 2 cm end is behind it in 10 cm.
+const ROUNDED_KEEP: f32 = 0.1;
 
 /// Which side the wall is kept on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -283,6 +295,13 @@ pub struct WallFollower {
     /// Virtual wall points (world frame), followed like real ones.
     fence: Vec<Point2D>,
     calibration: Calibration,
+    /// The heading (world, rad) the last outer corner was turned to, and `travelled` then: a
+    /// face too short to fit, met within `ROUNDED_KEEP`, is taken to run that way (a thin
+    /// fin's end). Unmeasured: just after the turn the robot is near that heading anyway.
+    rounded: Option<(f32, f32)>,
+    /// How far the edge overhung (m) at the last unseen bump beside it, and `travelled`
+    /// then: see `OVERHANG_MAX`.
+    overhang_felt: Option<(f32, f32)>,
 }
 
 impl WallFollower {
@@ -305,6 +324,8 @@ impl WallFollower {
             last_edge: None,
             fence,
             calibration: Calibration::new(&config.tuning),
+            rounded: None,
+            overhang_felt: None,
         }
     }
 
@@ -342,14 +363,23 @@ impl WallFollower {
             .collect()
     }
 
-    /// The gap wanted to the edge now (m): `hover_gap`, until the next touch is due; then
-    /// `TOUCH_DEPTH` into it, a gentle bend in.
+    /// The gap wanted to the edge the lidar sees now (m): `hover_gap` beyond any overhang,
+    /// until the next touch is due; then `TOUCH_DEPTH` into it, a gentle bend in. Beside an
+    /// overhang the touch still goes in: it measures the overhang anew (deferring it lost the
+    /// cabinet's bay on the bench).
     fn wanted_gap(&self) -> f32 {
         let c = &self.calibration;
         match c.touched_at {
             Some(at) if self.travelled - at >= c.interval => -TOUCH_DEPTH,
-            _ => self.config.tuning.hover_gap,
+            _ => self.config.tuning.hover_gap + self.overhang(),
         }
+    }
+
+    /// How far the edge followed overhangs where the lidar sees it (m): see `OVERHANG_MAX`.
+    fn overhang(&self) -> f32 {
+        (self.overhang_felt)
+            .filter(|&(_, at)| self.travelled - at < OVERHANG_KEEP)
+            .map_or(0.0, |(depth, _)| depth)
     }
 
     /// A touch beside the body on something the lidar sees: the gap the lidar puts there,
@@ -445,7 +475,7 @@ impl WallFollower {
     /// How far past a vertex the centre goes before turning (m): the body then clears the
     /// face beyond it by the hover gap.
     fn clear_past(&self) -> f32 {
-        self.config.robot_radius + self.config.tuning.hover_gap
+        self.config.robot_radius + self.config.tuning.hover_gap + self.overhang()
     }
 
     /// The surface the edge point `p` (robot frame, mirrored) lies on: the points on the wall
@@ -488,14 +518,22 @@ impl WallFollower {
     /// An outer corner (a fin's end, a block's) in sight: the vertex where the surface
     /// followed (at `p`) ends, at most `CORNER_SIGHT` ahead, with nothing in the way of
     /// driving on past it, and the robot running within `PARALLEL` along that surface, at
-    /// least `FACE_MIN` of it (round a leg the edge rule hugs). The vertex, and the face's
-    /// heading (rad, robot frame, mirrored).
-    fn outer_corner(&self, points: &[Point2D], p: Point2D) -> Option<(Point2D, f32)> {
+    /// least `FACE_MIN` of it (round a leg the edge rule hugs), or just round the corner
+    /// before it. The vertex, and the face's heading (rad, robot frame, mirrored).
+    fn outer_corner(
+        &self,
+        pose: &Pose2D,
+        points: &[Point2D],
+        p: Point2D,
+    ) -> Option<(Point2D, f32)> {
         let face = Self::face(points, p);
         let vertex = *(face.iter())
             .max_by(|a, b| a.x.total_cmp(&b.x))
             .unwrap_or(&p);
-        let along = Self::face_heading(&face, vertex)?;
+        let rounded = (self.rounded)
+            .filter(|&(_, at)| self.travelled - at < ROUNDED_KEEP)
+            .map(|(heading, _)| self.mirror() * angle_diff(pose.theta, heading));
+        let along = Self::face_heading(&face, vertex).or(rounded)?;
         if along.abs() > PARALLEL {
             return None;
         }
@@ -638,6 +676,14 @@ impl WallFollower {
                 let p = Point2D::new(at.x - along * s, at.y + along * c);
                 self.contacts.push_back((p, self.travelled));
             }
+            if let Some((_, d)) = beside
+                && !hazard.hazard_type.is_cliff()
+            {
+                let depth = d - self.config.robot_radius;
+                if (EXPLAINED..OVERHANG_MAX).contains(&depth) {
+                    self.overhang_felt = Some((depth, self.travelled));
+                }
+            }
             let c = self.to_robot(pose, &at);
             c.y.atan2(c.x) + FRAC_PI_2
         };
@@ -723,7 +769,7 @@ impl WallFollower {
                     }
                     if gap < ON_EDGE
                         && self.lap_heading.is_some()
-                        && let Some((vertex, along)) = self.outer_corner(points, p)
+                        && let Some((vertex, along)) = self.outer_corner(pose, points, p)
                     {
                         self.phase = Phase::Past {
                             vertex: self.to_world(pose, &vertex),
@@ -790,7 +836,10 @@ impl WallFollower {
                                 leg: Leg::In,
                             }),
                         },
-                        Leg::In if v.x <= lead => Some(Phase::Edge),
+                        Leg::In if v.x <= lead => {
+                            self.rounded = Some((heading, self.travelled));
+                            Some(Phase::Edge)
+                        }
                         // Something in the way after all: the edge rule takes it.
                         _ if self.blocking(points).is_some() => Some(Phase::Edge),
                         _ => None,
