@@ -20,6 +20,12 @@ const LEG_RADIUS: f32 = 0.05;
 /// How far from the lidar a leg may stand (m).
 const LEG_RANGE: std::ops::Range<f32> = 0.3..2.5;
 
+/// Chance that a beam returned by fabric (what is gray in the lidar mask) comes back dim: on
+/// sweep7, 27% of the curtain's returns were below 100 (walls, legs and chairs 2-6%)…
+const FABRIC_DIM_CHANCE: f32 = 0.27;
+/// …and the quality it then has (sweep7's curtain: p10 67).
+const FABRIC_DIM_QUALITY: std::ops::Range<f32> = 30.0..100.0;
+
 /// The distance along the ray from `origin` at `heading` (map frame) to the nearest leg
 /// (centres in the map frame) in its way.
 fn leg_in_the_way(legs: &[(f32, f32)], origin: (f32, f32), heading: f32) -> Option<f32> {
@@ -141,10 +147,14 @@ impl LidarSimulator {
         let cfg = &self.config;
         let noise = &cfg.noise;
         let rng = &mut self.noise;
+        // Whether the beam stopped on fabric: the cast ends on the cell the closure stops at.
+        let mut fabric = false;
         let hit = map.ray_cast(origin.0, origin.1, theta + angle, cfg.max_range, |x, y| {
             let opacity = map.lidar_opacity(x, y);
+            fabric = opacity < 1.0;
             opacity >= 1.0 || (opacity > 0.0 && rng.chance(opacity))
         });
+        let fabric = fabric && leg.is_none_or(|leg| leg >= hit);
         let hit = leg.map_or(hit, |leg| hit.min(leg));
         if hit >= cfg.max_range || self.noise.chance(noise.miss_rate) {
             return None;
@@ -159,7 +169,13 @@ impl LidarSimulator {
         let angle = (angle + self.noise.gaussian(noise.angle_stddev)).rem_euclid(TAU);
         let angle = if angle < TAU { angle } else { 0.0 };
         let decay = noise.quality_distance_decay as f32 * distance;
-        let quality = (noise.quality_base as f32 - decay).clamp(1.0, 255.0) as u8;
+        let quality = if fabric && self.noise.chance(FABRIC_DIM_CHANCE) {
+            let span = FABRIC_DIM_QUALITY.end - FABRIC_DIM_QUALITY.start;
+            FABRIC_DIM_QUALITY.start + self.noise.uniform() * span
+        } else {
+            noise.quality_base as f32 - decay
+        };
+        let quality = quality.clamp(1.0, 255.0) as u8;
         Some((angle, distance, quality))
     }
 }
@@ -246,9 +262,9 @@ mod tests {
     }
 
     #[test]
-    fn beams_stop_among_the_folds_of_a_curtain() {
+    fn beams_stop_among_the_folds_of_a_curtain_and_some_come_back_dim() {
         // A 10 cm curtain at x in [3, 3.1), gray in the lidar mask: 60% of the beams return
-        // from each centimetre of it.
+        // from each centimetre of it, about `FABRIC_DIM_CHANCE` of them dim; the walls never are.
         let map = room().with_lidar_mask(image::GrayImage::from_fn(400, 400, |i, j| {
             let wall = i < 10 || j < 10 || i >= 390 || j >= 390;
             image::Luma([if wall {
@@ -261,10 +277,27 @@ mod tests {
         }));
         let mut lidar = lidar(LidarConfig::default());
         let at = (2.0, 2.0, 0.0);
-        let ahead: Vec<f32> = (0..1000)
+        let scans: Vec<Scan> = (0..1000)
             .filter_map(|_| lidar.sweep(&map, at, at, 0.01))
-            .flat_map(|scan| scan.into_iter().filter(|p| p.0.abs() < 1e-3).map(|p| p.1))
             .collect();
+        let beams = |near: fn(f32) -> bool| -> Vec<(f32, u8)> {
+            (scans.iter().flatten())
+                .filter(|p| near(p.0))
+                .map(|p| (p.1, p.2))
+                .collect()
+        };
+        let dim = |beams: &[(f32, u8)]| {
+            let dim = beams
+                .iter()
+                .filter(|b| f32::from(b.1) < FABRIC_DIM_QUALITY.end)
+                .count();
+            dim as f32 / beams.len() as f32
+        };
+        let curtain = beams(|a| a.abs() < 0.3);
+        let wall = beams(|a| (a - PI).abs() < 0.3);
+        assert!((0.15..0.4).contains(&dim(&curtain)), "{}", dim(&curtain));
+        assert_eq!(dim(&wall), 0.0);
+        let ahead: Vec<f32> = beams(|a| a.abs() < 1e-3).iter().map(|b| b.0).collect();
         assert!(ahead.len() > 40);
         assert!(
             ahead.iter().all(|&r| (0.999..1.1).contains(&r)),
