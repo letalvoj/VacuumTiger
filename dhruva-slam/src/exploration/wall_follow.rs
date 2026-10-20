@@ -119,10 +119,8 @@ impl Default for WallFollowConfig {
 pub struct Tuning {
     /// Gap kept between the body and an edge the lidar sees where it is (m).
     pub hover_gap: f32,
-    /// Bend towards the edge per metre of gap beyond the wanted one (rad/m)…
+    /// Bend towards the edge per metre of gap beyond the wanted one, away when nearer (rad/m).
     pub k_gap: f32,
-    /// …and at most this far away from it when too close (rad).
-    pub max_bend_away: f32,
     /// Turn rate per radian of heading error while driving (1/s).
     pub k_turn: f32,
     /// A heading error above this (rad) is turned on the spot; below it the robot drives.
@@ -142,7 +140,6 @@ impl Default for Tuning {
         Self {
             hover_gap: 0.02,
             k_gap: 5.5,
-            max_bend_away: 0.21,
             k_turn: 2.6,
             spin_angle: 0.45,
             front_look: 0.067,
@@ -407,10 +404,11 @@ impl WallFollower {
                         self.lap_start.get_or_insert(here);
                     }
                     // Run along the edge point (it on the right), bent towards it when the
-                    // gap is wider than wanted: from far away, straight at it.
+                    // gap is wider than wanted (from far away, straight at it), away when
+                    // narrower.
                     let tuning = cfg.tuning;
-                    let bend = (tuning.k_gap * (gap - tuning.hover_gap))
-                        .clamp(-tuning.max_bend_away, FRAC_PI_2);
+                    let bend =
+                        (tuning.k_gap * (gap - tuning.hover_gap)).clamp(-FRAC_PI_2, FRAC_PI_2);
                     let error = p.y.atan2(p.x) + FRAC_PI_2 - bend;
                     if error > TURN_TOLERANCE && self.blocking(points).is_some() {
                         // In the way (a corner, a leg): one turn on the spot that puts it
