@@ -80,7 +80,7 @@ const OFFSET_MAX: f32 = 0.02;
 /// After a planned touch, reverse this far (m): still angled in, that lifts the shell off…
 const TOUCH_BACKOFF: f32 = 0.015;
 /// …then turn away by this much (rad).
-const TOUCH_TURN: f32 = 0.1;
+const TOUCH_TURN: f32 = 0.2;
 /// A turn in place is done within this angle (rad); it turns at `SPIN_GAIN` per radian
 /// left (1/s), at least `MIN_SPIN` (rad/s).
 const TURN_TOLERANCE: f32 = 0.06;
