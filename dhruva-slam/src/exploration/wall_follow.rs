@@ -93,8 +93,9 @@ pub struct WallFollowConfig {
     pub lap_radius: f32,
     /// …after at least this much travel (m)…
     pub lap_min_distance: f32,
-    /// …and followed on this far after coming back within it (m), over the seam where
-    /// following started: the robot came at the wall there on a curve.
+    /// …and followed on this far past the nearest it came to that start while following
+    /// (m), over the seam: the robot came at the wall there on a curve. Generous: sweeping a
+    /// little twice costs less than a corner missed.
     pub lap_overlap: f32,
     /// Stop after this much travel in total (m).
     pub max_distance: f32,
@@ -111,7 +112,7 @@ impl Default for WallFollowConfig {
             turn_rate: 0.8,
             lap_radius: 0.3,
             lap_min_distance: 3.0,
-            lap_overlap: 0.25,
+            lap_overlap: 0.5,
             max_distance: 300.0,
             tuning: Tuning::default(),
         }
@@ -184,8 +185,9 @@ pub struct WallFollower {
     /// Where following started (world frame, not moved by loop closures) and the distance
     /// travelled by then.
     lap_start: Option<(Point2D, f32)>,
-    /// The distance travelled when the lap came back to its start.
-    lap_back: Option<f32>,
+    /// Once the lap is back at its start, the nearest it has come to it (m) and the distance
+    /// travelled then.
+    lap_back: Option<(f32, f32)>,
     /// The edge point followed last tick (world frame).
     last_edge: Option<Point2D>,
     /// Virtual wall points (world frame), followed like real ones.
@@ -333,18 +335,22 @@ impl WallFollower {
             .then(|| (0.0, self.spin(remaining), "turning on the spot"))
     }
 
-    /// Back within `lap_radius` of the lap's start, and `lap_overlap` on since; notes when it
-    /// came back. Checked only while following, so a bump or spin there lengthens the overlap.
+    /// Back within `lap_radius` of the lap's start, and `lap_overlap` on from the nearest it
+    /// came to it while following: over the seam, not short of it (the start may lie in a
+    /// corner still ahead).
     fn lap_done(&mut self, pose: &Pose2D) -> bool {
-        let back = self.lap_start.is_some_and(|(start, at)| {
-            self.travelled - at > self.config.lap_min_distance
-                && (pose.x - start.x).hypot(pose.y - start.y) < self.config.lap_radius
-        });
-        if back {
-            self.lap_back.get_or_insert(self.travelled);
+        let Some((start, at)) = self.lap_start else {
+            return false;
+        };
+        let d = (pose.x - start.x).hypot(pose.y - start.y);
+        let back = self.travelled - at > self.config.lap_min_distance && d < self.config.lap_radius;
+        match &mut self.lap_back {
+            Some(nearest) if d < nearest.0 => *nearest = (d, self.travelled),
+            None if back => self.lap_back = Some((d, self.travelled)),
+            _ => {}
         }
         self.lap_back
-            .is_some_and(|at| self.travelled - at >= self.config.lap_overlap)
+            .is_some_and(|(_, at)| self.travelled - at >= self.config.lap_overlap)
     }
 
     /// Whether the scan has a point within `EXPLAINED` of the contact `at` (world frame).
@@ -715,18 +721,37 @@ mod tests {
         let mut f = WallFollower::new(WallFollowConfig::default());
         let scan = wall_at(-0.175);
         let map = no_map();
-        let start = Pose2D::identity();
-        let at = |f: &mut WallFollower, travelled: f32| {
+        // At `x` (m) along the wall from the start, having travelled `travelled` (m).
+        let at = |f: &mut WallFollower, x: f32, travelled: f32| {
             f.travelled = travelled;
-            f.next_action(&map, &start, &scan, None, false)
+            f.last_pose = None;
+            f.next_action(&map, &Pose2D::new(x, 0.0, 0.0), &scan, None, false)
         };
-        assert!(matches!(at(&mut f, 0.0), ExplorationAction::Drive { .. }));
+        assert!(matches!(
+            at(&mut f, 0.0, 0.0),
+            ExplorationAction::Drive { .. }
+        ));
+        let overlap = f.config.lap_overlap;
         assert!(
-            matches!(at(&mut f, 10.0), ExplorationAction::Drive { .. }),
-            "back at the start, it goes on over the seam"
+            matches!(at(&mut f, -0.2, 10.0), ExplorationAction::Drive { .. }),
+            "back near the start, it goes on to the seam…"
         );
-        let past = 10.0 + f.config.lap_overlap;
-        assert!(matches!(at(&mut f, past), ExplorationAction::Complete));
+        assert!(
+            matches!(at(&mut f, 0.0, 10.2), ExplorationAction::Drive { .. }),
+            "…and over it…"
+        );
+        assert!(
+            matches!(
+                at(&mut f, 0.1, 10.1 + overlap),
+                ExplorationAction::Drive { .. }
+            ),
+            "…not counting the way to it…"
+        );
+        let past = 10.2 + overlap;
+        assert!(matches!(
+            at(&mut f, overlap, past),
+            ExplorationAction::Complete
+        ));
     }
 
     #[test]
