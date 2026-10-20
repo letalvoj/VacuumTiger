@@ -48,10 +48,41 @@ impl Inputs {
         }
     }
 
-    /// A bumper pressed or a cliff seen.
-    pub fn contact(&self) -> bool {
-        self.bumper.0 || self.bumper.1 || self.cliff.any_triggered()
+    /// The contact held now. A cliff first: backing off a bumper must not creep over it.
+    pub fn held(&self) -> Option<HazardType> {
+        cliff_kind(cliffs(&self.cliff)).or(bumper_kind(self.bumper))
     }
+}
+
+/// The cliff sensors' flags: left front, right front, left side, right side.
+fn cliffs(cliff: &CliffState) -> [bool; 4] {
+    [
+        cliff.left_front,
+        cliff.right_front,
+        cliff.left_side,
+        cliff.right_side,
+    ]
+}
+
+/// The bumper contact of these flags (left, right): both, or one.
+fn bumper_kind((left, right): (bool, bool)) -> Option<HazardType> {
+    match (left, right) {
+        (true, true) => Some(HazardType::BumperBoth),
+        (true, false) => Some(HazardType::BumperLeft),
+        (false, true) => Some(HazardType::BumperRight),
+        (false, false) => None,
+    }
+}
+
+/// The first cliff of these flags (as [`cliffs`] orders them), front first.
+fn cliff_kind(flags: [bool; 4]) -> Option<HazardType> {
+    let kinds = [
+        HazardType::CliffLeftFront,
+        HazardType::CliffRightFront,
+        HazardType::CliffLeftSide,
+        HazardType::CliffRightSide,
+    ];
+    (flags.into_iter().zip(kinds)).find_map(|(on, kind)| on.then_some(kind))
 }
 
 /// What to do until the next tick.
@@ -237,7 +268,7 @@ impl Session {
         }
 
         let scan = inputs.scan.data.seen_from(&inputs.pose);
-        self.act(map, &inputs.pose, &scan, halt, inputs.contact())
+        self.act(map, &inputs.pose, &scan, halt, inputs.held())
     }
 
     /// A contact that was not there last tick, the most urgent first.
@@ -245,25 +276,10 @@ impl Session {
         let (left, right) = inputs.bumper;
         let (was_left, was_right) = std::mem::replace(&mut self.last_bumper, inputs.bumper);
         let was = std::mem::replace(&mut self.last_cliff, inputs.cliff.clone());
-        let cliff = &inputs.cliff;
-        let (new_left, new_right) = (left && !was_left, right && !was_right);
-        let kind = if new_left && new_right {
-            HazardType::BumperBoth
-        } else if new_left {
-            HazardType::BumperLeft
-        } else if new_right {
-            HazardType::BumperRight
-        } else if cliff.left_front && !was.left_front {
-            HazardType::CliffLeftFront
-        } else if cliff.right_front && !was.right_front {
-            HazardType::CliffRightFront
-        } else if cliff.left_side && !was.left_side {
-            HazardType::CliffLeftSide
-        } else if cliff.right_side && !was.right_side {
-            HazardType::CliffRightSide
-        } else {
-            return None;
-        };
+        let (now, was) = (cliffs(&inputs.cliff), cliffs(&was));
+        let new_cliffs = std::array::from_fn(|i| now[i] && !was[i]);
+        let kind = bumper_kind((left && !was_left, right && !was_right))
+            .or_else(|| cliff_kind(new_cliffs))?;
         Some(HazardEvent::new(kind, &inputs.pose))
     }
 
@@ -322,13 +338,13 @@ impl Session {
         pose: &Pose2D,
         scan: &PointCloud2D,
         halt: bool,
-        contact: bool,
+        held: Option<HazardType>,
     ) -> Tick {
         let hazard = self.pending_hazard.take();
         let motion = &self.motion;
         match self
             .strategy
-            .next_action(map, pose, scan, hazard.as_ref(), contact)
+            .next_action(map, pose, scan, hazard.as_ref(), held)
         {
             ExplorationAction::MoveTo { target, reason } => {
                 let velocity = compute_velocity_to_target(
@@ -483,7 +499,7 @@ mod tests {
             _pose: &Pose2D,
             scan: &PointCloud2D,
             hazard: Option<&HazardEvent>,
-            _contact: bool,
+            _held: Option<HazardType>,
         ) -> ExplorationAction {
             let mut seen = self.0.lock().unwrap();
             seen.scan = Some(scan.clone());
@@ -535,6 +551,20 @@ mod tests {
             cliff: CliffState::default(),
             docked: false,
         }
+    }
+
+    #[test]
+    fn a_held_cliff_outranks_a_held_bumper_and_a_new_bumper_a_new_cliff() {
+        let mut held = inputs(1, Pose2D::identity(), Pose2D::identity());
+        held.bumper = (true, true);
+        held.cliff.right_side = true;
+        assert_eq!(held.held(), Some(HazardType::CliffRightSide));
+        let (mut session, _) = session_seeing();
+        let new = session.new_contact(&held).map(|h| h.hazard_type);
+        assert_eq!(new, Some(HazardType::BumperBoth));
+        held.bumper = (false, false);
+        assert_eq!(held.held(), Some(HazardType::CliffRightSide));
+        assert!(session.new_contact(&held).is_none(), "the cliff is not new");
     }
 
     fn drive(tick: &Tick) -> (f32, f32) {

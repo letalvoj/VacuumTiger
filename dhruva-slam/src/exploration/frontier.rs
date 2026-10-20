@@ -9,7 +9,7 @@ use crate::algorithms::planning::{AStarConfig, AStarPlanner};
 use crate::core::types::{PointCloud2D, Pose2D};
 use crate::state::CurrentMapData;
 
-use super::strategy::{ExplorationAction, ExplorationStrategy, HazardEvent};
+use super::strategy::{ExplorationAction, ExplorationStrategy, HazardEvent, HazardType};
 
 /// Configuration for frontier exploration.
 #[derive(Debug, Clone)]
@@ -776,7 +776,7 @@ impl ExplorationStrategy for FrontierExploration {
         current_pose: &Pose2D,
         _scan: &PointCloud2D,
         hazard: Option<&HazardEvent>,
-        _contact: bool,
+        _held: Option<HazardType>,
     ) -> ExplorationAction {
         // Store map for surrounded detection
         self.last_map = Some(map.clone());
@@ -1194,7 +1194,7 @@ mod tests {
 
         // Simulate bumper trigger using HazardEvent
         let hazard = HazardEvent::new(HazardType::BumperLeft, &pose);
-        let action = strategy.next_action(&map, &pose, &PointCloud2D::new(), Some(&hazard), true);
+        let action = strategy.next_action(&map, &pose, &PointCloud2D::new(), Some(&hazard), None);
 
         // Should get a backing up action
         assert!(matches!(action, ExplorationAction::MoveTo { .. }));
@@ -1213,7 +1213,7 @@ mod tests {
 
         // Simulate cliff sensor trigger
         let hazard = HazardEvent::new(HazardType::CliffLeftFront, &pose);
-        let action = strategy.next_action(&map, &pose, &PointCloud2D::new(), Some(&hazard), true);
+        let action = strategy.next_action(&map, &pose, &PointCloud2D::new(), Some(&hazard), None);
 
         // Should get a backing up action
         assert!(matches!(action, ExplorationAction::MoveTo { .. }));

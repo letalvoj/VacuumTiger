@@ -489,12 +489,7 @@ impl WallFollower {
             // reverse lifts the shell off (forward is refused while it is pressed), a small
             // turn away, and following goes on, wanting the hover gap again.
             self.calibrate(d - self.config.robot_radius);
-            self.phase = Phase::BackOff {
-                from: *pose,
-                distance: TOUCH_BACKOFF,
-                turn: TOUCH_TURN,
-                ticks: 0,
-            };
+            self.back_off(pose, TOUCH_BACKOFF, TOUCH_TURN);
             return;
         }
         let turn = if seen {
@@ -519,9 +514,37 @@ impl WallFollower {
             let c = self.to_robot(pose, &at);
             c.y.atan2(c.x) + FRAC_PI_2
         };
+        self.back_off(pose, self.config.tuning.backoff_distance, turn);
+    }
+
+    /// Still pressed while following, after backing off (an edge the lidar puts farther
+    /// than it is). Forward is refused while a bumper is pressed: a little more back, and
+    /// away from the side pressed. That is no touch: the lidar is not measured, the next
+    /// touch not put off. A cliff still seen is a cliff again: its fence and the full back
+    /// off. Both repeat as long as the contact is held; the stuck watch ends that.
+    fn on_held(&mut self, kind: HazardType, pose: &Pose2D, scan: &PointCloud2D) {
+        if kind.is_cliff() {
+            self.on_hazard(&HazardEvent::new(kind, pose), pose, scan);
+            return;
+        }
+        let away_side = match self.config.side {
+            WallSide::Right => HazardType::BumperLeft,
+            WallSide::Left => HazardType::BumperRight,
+        };
+        let turn = if kind == away_side {
+            -TOUCH_TURN
+        } else {
+            TOUCH_TURN
+        };
+        self.back_off(pose, TOUCH_BACKOFF, turn);
+    }
+
+    /// Back `distance` (m) from `pose`, then turn by `turn` (rad, mirrored: + is away from
+    /// the wall).
+    fn back_off(&mut self, pose: &Pose2D, distance: f32, turn: f32) {
         self.phase = Phase::BackOff {
             from: *pose,
-            distance: self.config.tuning.backoff_distance,
+            distance,
             turn,
             ticks: 0,
         };
@@ -619,12 +642,16 @@ impl ExplorationStrategy for WallFollower {
         current_pose: &Pose2D,
         scan: &PointCloud2D,
         hazard: Option<&HazardEvent>,
-        _contact: bool,
+        held: Option<HazardType>,
     ) -> ExplorationAction {
         self.track(current_pose);
         let before = self.phase;
         if let Some(h) = hazard {
             self.on_hazard(h, current_pose, scan);
+        } else if let Some(kind) = held
+            && self.phase == Phase::Edge
+        {
+            self.on_held(kind, current_pose, scan);
         }
         if self.travelled > self.config.max_distance {
             self.phase = Phase::Done;
@@ -709,7 +736,7 @@ mod tests {
     }
 
     fn tick(f: &mut WallFollower, scan: &PointCloud2D) -> (f32, f32) {
-        drive(f.next_action(&no_map(), &Pose2D::identity(), scan, None, false))
+        drive(f.next_action(&no_map(), &Pose2D::identity(), scan, None, None))
     }
 
     fn wall_at(y: f32) -> PointCloud2D {
@@ -786,11 +813,12 @@ mod tests {
         let r = f.config.robot_radius;
         let mut wall = PointCloud2D::new();
         segment_scan(&mut wall, (r, -0.3), (r, 0.3));
-        let (v, w) = drive(f.next_action(&no_map(), &pose, &wall, Some(&bump), true));
+        let (v, w) =
+            drive(f.next_action(&no_map(), &pose, &wall, Some(&bump), Some(bump.hazard_type)));
         assert!(v < 0.0 && w == 0.0, "backs off: {v} {w}");
         // The pose does not move here, so the back-off ends by its tick limit.
         for _ in 0..MAX_BACKOFF_TICKS {
-            f.next_action(&no_map(), &pose, &wall, None, false);
+            f.next_action(&no_map(), &pose, &wall, None, None);
         }
         let Phase::Turn { heading, .. } = f.phase else {
             panic!("turns after backing off: {:?}", f.phase);
@@ -800,7 +828,7 @@ mod tests {
         // On the side away from the wall, the nudge is towards it.
         let mut f = following(WallSide::Right);
         let bump = HazardEvent::new(HazardType::BumperLeft, &pose);
-        f.next_action(&no_map(), &pose, &wall, Some(&bump), true);
+        f.next_action(&no_map(), &pose, &wall, Some(&bump), Some(bump.hazard_type));
         assert!(matches!(f.phase, Phase::BackOff { turn, .. } if turn == -nudge));
     }
 
@@ -821,7 +849,7 @@ mod tests {
         let wall = wall_at(-(f.config.robot_radius + 0.008));
         let touch = |f: &mut WallFollower| {
             f.phase = Phase::Edge;
-            f.next_action(&no_map(), &pose, &wall, Some(&bump), true)
+            f.next_action(&no_map(), &pose, &wall, Some(&bump), Some(bump.hazard_type))
         };
         let (v, w) = drive(touch(&mut f));
         assert!(v < 0.0 && w == 0.0, "lifts the shell off: {v} {w}");
@@ -849,7 +877,7 @@ mod tests {
         // A touch 6 mm off what was learnt starts over.
         let wall = wall_at(-(f.config.robot_radius + 0.014));
         f.phase = Phase::Edge;
-        f.next_action(&no_map(), &pose, &wall, Some(&bump), true);
+        f.next_action(&no_map(), &pose, &wall, Some(&bump), Some(bump.hazard_type));
         assert_eq!(f.calibration.interval, first, "it disagreed");
 
         // What was learnt outlives the sweep; the plan does not.
@@ -860,13 +888,85 @@ mod tests {
     }
 
     #[test]
+    fn held_pressed_while_following_it_backs_off_and_turns_from_the_side_pressed() {
+        use HazardType::*;
+        for (side, wall_side, away_side) in [
+            (WallSide::Right, BumperRight, BumperLeft),
+            (WallSide::Left, BumperLeft, BumperRight),
+        ] {
+            for (held, want) in [
+                (wall_side, TOUCH_TURN),
+                (BumperBoth, TOUCH_TURN),
+                (away_side, -TOUCH_TURN),
+            ] {
+                let mut f = following(side);
+                let scan = PointCloud2D::new();
+                let action = f.next_action(&no_map(), &Pose2D::identity(), &scan, None, Some(held));
+                let (v, _) = drive(action);
+                assert!(
+                    v < 0.0,
+                    "{side:?} {held:?}: not forward into the interlock: {v}"
+                );
+                assert!(
+                    matches!(f.phase, Phase::BackOff { distance, turn, .. }
+                        if distance == TOUCH_BACKOFF && turn == want),
+                    "{side:?} {held:?}: {:?}",
+                    f.phase
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_cliff_held_while_following_is_backed_off_as_a_cliff() {
+        let mut f = following(WallSide::Right);
+        let held = Some(HazardType::CliffLeftFront);
+        f.next_action(
+            &no_map(),
+            &Pose2D::identity(),
+            &PointCloud2D::new(),
+            None,
+            held,
+        );
+        assert!(matches!(f.phase, Phase::BackOff { distance, .. }
+            if distance == f.config.tuning.backoff_distance));
+    }
+
+    #[test]
+    fn nothing_held_while_following_follows() {
+        let mut f = following(WallSide::Right);
+        let wall = wall_at(-f.config.robot_radius - f.config.tuning.hover_gap);
+        let (v, _) = drive(f.next_action(&no_map(), &Pose2D::identity(), &wall, None, None));
+        assert!(v > 0.0 && f.phase == Phase::Edge, "{v} {:?}", f.phase);
+    }
+
+    #[test]
+    fn held_while_turning_it_turns_on() {
+        let mut f = following(WallSide::Right);
+        f.phase = Phase::Turn {
+            heading: 1.0,
+            ticks: 0,
+        };
+        let held = Some(HazardType::BumperRight);
+        let scan = PointCloud2D::new();
+        let (v, w) = drive(f.next_action(&no_map(), &Pose2D::identity(), &scan, None, held));
+        assert!(v == 0.0 && w > 0.0, "turning is not refused: {v} {w}");
+    }
+
+    #[test]
     fn a_bump_that_is_no_touch_puts_the_next_touch_off() {
         let mut f = following(WallSide::Right);
         f.travelled = 10.0;
         assert!(f.wanted_gap() < 0.0, "a touch is due");
         let pose = Pose2D::identity();
         let bump = HazardEvent::new(HazardType::BumperBoth, &pose);
-        f.next_action(&no_map(), &pose, &PointCloud2D::new(), Some(&bump), true);
+        f.next_action(
+            &no_map(),
+            &pose,
+            &PointCloud2D::new(),
+            Some(&bump),
+            Some(bump.hazard_type),
+        );
         assert!(!f.calibration.measured, "glass measures nothing");
         assert_eq!(f.wanted_gap(), f.config.tuning.hover_gap, "but it was near");
     }
@@ -899,7 +999,13 @@ mod tests {
         let mut f = following(WallSide::Right);
         let pose = Pose2D::identity();
         let bump = HazardEvent::new(HazardType::BumperBoth, &pose);
-        f.next_action(&no_map(), &pose, &PointCloud2D::new(), Some(&bump), true);
+        f.next_action(
+            &no_map(),
+            &pose,
+            &PointCloud2D::new(),
+            Some(&bump),
+            Some(bump.hazard_type),
+        );
         let Phase::BackOff { turn, .. } = f.phase else {
             panic!("backs off: {:?}", f.phase);
         };
@@ -924,7 +1030,7 @@ mod tests {
             ys: vec![0.0, -0.3, -0.6, 0.5],
             ..Default::default()
         };
-        let (v, w) = drive(f.next_action(&no_map(), &Pose2D::identity(), &scan, None, false));
+        let (v, w) = drive(f.next_action(&no_map(), &Pose2D::identity(), &scan, None, None));
         assert!(v == 0.0 && w < 0.0, "turns right on the spot: {v} {w}");
         // Facing it, it drives straight at it.
         let mut f = WallFollower::new(WallFollowConfig::default());
@@ -946,7 +1052,7 @@ mod tests {
         let at = |f: &mut WallFollower, x: f32, travelled: f32| {
             f.travelled = travelled;
             f.last_pose = None;
-            f.next_action(&map, &Pose2D::new(x, 0.0, 0.0), &scan, None, false)
+            f.next_action(&map, &Pose2D::new(x, 0.0, 0.0), &scan, None, None)
         };
         assert!(matches!(
             at(&mut f, 0.0, 0.0),
@@ -981,7 +1087,13 @@ mod tests {
         let mut f = WallFollower::new(WallFollowConfig::default());
         let at = Pose2D::new(1.0, 2.0, 0.0);
         let bump = HazardEvent::new(HazardType::BumperBoth, &at);
-        f.next_action(&no_map(), &at, &PointCloud2D::new(), Some(&bump), true);
+        f.next_action(
+            &no_map(),
+            &at,
+            &PointCloud2D::new(),
+            Some(&bump),
+            Some(bump.hazard_type),
+        );
         assert_eq!(f.lap_start.map(|(p, _)| (p.x, p.y)), Some((1.0, 2.0)));
     }
 }
