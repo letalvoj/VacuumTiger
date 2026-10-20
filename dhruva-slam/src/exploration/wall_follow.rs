@@ -1,11 +1,12 @@
 //! Wall following: the corner sweep (scout).
 //!
 //! Follows the edge of the room on one side (the side brush's) into every corner until the
-//! robot is back where the lap started. The edge is the nearest obstacle point on that side
-//! (or what blocks the way): the robot keeps it beside the body, `hover_gap` off, so one rule
-//! runs along walls, turns in inner corners, and hugs outer corners and legs round (the point
-//! followed is kept as it passes behind). From far away the same rule drives straight at the
-//! nearest point on the wall side, which is how a sweep starts.
+//! robot is back where the lap started, and over that seam. The edge is the nearest obstacle
+//! point on that side (or what blocks the way): the robot keeps it beside the body,
+//! `hover_gap` off, so one rule runs along walls, turns in inner corners, and hugs outer
+//! corners and legs round (the point followed is kept as it passes behind). From far away the
+//! same rule drives straight at the nearest point on the wall side, which is how a sweep
+//! starts.
 //!
 //! The lidar steers; the bumper corrects. A bump on something the lidar sees backs off a
 //! little and nudges away. What the bumper touches where the lidar sees nothing (glass) is a
@@ -90,8 +91,11 @@ pub struct WallFollowConfig {
     pub turn_rate: f32,
     /// A lap is closed back within this distance of where following started (m)…
     pub lap_radius: f32,
-    /// …after at least this much travel (m).
+    /// …after at least this much travel (m)…
     pub lap_min_distance: f32,
+    /// …and followed on this far after coming back within it (m), over the seam where
+    /// following started: the robot came at the wall there on a curve.
+    pub lap_overlap: f32,
     /// Stop after this much travel in total (m).
     pub max_distance: f32,
     /// The controller's gains, as tuned on the lab's sweep bench (`dhruva-lab/src/bin/sweep`).
@@ -107,6 +111,7 @@ impl Default for WallFollowConfig {
             turn_rate: 0.67,
             lap_radius: 0.3,
             lap_min_distance: 3.0,
+            lap_overlap: 0.25,
             max_distance: 300.0,
             tuning: Tuning::default(),
         }
@@ -179,6 +184,8 @@ pub struct WallFollower {
     /// Where following started (world frame, not moved by loop closures) and the distance
     /// travelled by then.
     lap_start: Option<(Point2D, f32)>,
+    /// The distance travelled when the lap came back to its start.
+    lap_back: Option<f32>,
     /// The edge point followed last tick (world frame).
     last_edge: Option<Point2D>,
     /// Virtual wall points (world frame), followed like real ones.
@@ -200,6 +207,7 @@ impl WallFollower {
             last_pose: None,
             travelled: 0.0,
             lap_start: None,
+            lap_back: None,
             last_edge: None,
             fence,
         }
@@ -325,11 +333,18 @@ impl WallFollower {
             .then(|| (0.0, self.spin(remaining), "turning on the spot"))
     }
 
-    fn lap_closed(&self, pose: &Pose2D) -> bool {
-        self.lap_start.is_some_and(|(start, at)| {
+    /// Back within `lap_radius` of the lap's start, and `lap_overlap` on since; notes when it
+    /// came back. Checked only while following, so a bump or spin there lengthens the overlap.
+    fn lap_done(&mut self, pose: &Pose2D) -> bool {
+        let back = self.lap_start.is_some_and(|(start, at)| {
             self.travelled - at > self.config.lap_min_distance
                 && (pose.x - start.x).hypot(pose.y - start.y) < self.config.lap_radius
-        })
+        });
+        if back {
+            self.lap_back.get_or_insert(self.travelled);
+        }
+        self.lap_back
+            .is_some_and(|at| self.travelled - at >= self.config.lap_overlap)
     }
 
     /// Whether the scan has a point within `EXPLAINED` of the contact `at` (world frame).
@@ -385,7 +400,7 @@ impl WallFollower {
         loop {
             match self.phase {
                 Phase::Edge => {
-                    if self.lap_closed(pose) {
+                    if self.lap_done(pose) {
                         self.phase = Phase::Done;
                         continue;
                     }
@@ -695,20 +710,22 @@ mod tests {
     }
 
     #[test]
-    fn closes_the_lap_back_at_the_start() {
+    fn closes_the_lap_over_the_seam() {
         let mut f = WallFollower::new(WallFollowConfig::default());
         let scan = wall_at(-0.175);
         let map = no_map();
         let start = Pose2D::identity();
-        assert!(matches!(
-            f.next_action(&map, &start, &scan, None),
-            ExplorationAction::Drive { .. }
-        ));
-        f.travelled = 10.0;
-        assert!(matches!(
-            f.next_action(&map, &start, &scan, None),
-            ExplorationAction::Complete
-        ));
+        let at = |f: &mut WallFollower, travelled: f32| {
+            f.travelled = travelled;
+            f.next_action(&map, &start, &scan, None)
+        };
+        assert!(matches!(at(&mut f, 0.0), ExplorationAction::Drive { .. }));
+        assert!(
+            matches!(at(&mut f, 10.0), ExplorationAction::Drive { .. }),
+            "back at the start, it goes on over the seam"
+        );
+        let past = 10.0 + f.config.lap_overlap;
+        assert!(matches!(at(&mut f, past), ExplorationAction::Complete));
     }
 
     #[test]
