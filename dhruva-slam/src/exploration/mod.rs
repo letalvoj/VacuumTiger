@@ -33,6 +33,7 @@
 
 mod frontier;
 pub mod session;
+mod steady;
 mod strategy;
 mod wall_follow;
 

@@ -4,6 +4,7 @@
 
 use std::time::{Duration, Instant};
 
+use super::steady::Steady;
 use super::{ExplorationAction, ExplorationStrategy, HazardEvent, HazardType};
 use crate::core::types::{Point2D, PointCloud2D, Pose2D, Timestamped};
 use crate::io::motion_controller::{MotionConfig, compute_velocity_to_target};
@@ -165,6 +166,8 @@ pub struct Session {
     pending_hazard: Option<HazardEvent>,
     /// The scan stamp last seen, and since when; `None` until one arrives after the start.
     scan_seen: (u64, Option<Instant>),
+    /// What stands still in the scans: what strategies steer by.
+    steady: Steady,
 }
 
 impl Session {
@@ -184,6 +187,7 @@ impl Session {
             last_cliff: CliffState::default(),
             pending_hazard: None,
             scan_seen: (0, None),
+            steady: Steady::default(),
         }
     }
 
@@ -213,6 +217,7 @@ impl Session {
         self.last_cliff = CliffState::default();
         self.pending_hazard = None;
         self.scan_seen = (scan_stamp, None);
+        self.steady = Steady::default();
     }
 
     /// Whether SLAM has published a scan in the last `SCAN_TIMEOUT`, as of the last tick.
@@ -239,6 +244,7 @@ impl Session {
         if inputs.scan.timestamp_us != self.scan_seen.0 {
             self.scan_seen = (inputs.scan.timestamp_us, Some(now));
         }
+        self.steady.update(&inputs.scan);
         if !self.scans_flowing(now) {
             return Tick::hold(halt, "Waiting for SLAM");
         }
@@ -267,7 +273,7 @@ impl Session {
             };
         }
 
-        let scan = inputs.scan.data.seen_from(&inputs.pose);
+        let scan = self.steady.seen_from(&inputs.pose);
         self.act(map, &inputs.pose, &scan, halt, inputs.held())
     }
 
@@ -599,7 +605,9 @@ mod tests {
         let (mut session, seen) = session_seeing();
         // Taken at the origin; the robot has since moved 10 cm on and turned 90° left.
         let now = Pose2D::new(0.1, 0.0, std::f32::consts::FRAC_PI_2);
+        // The same point in two scans: it stands still.
         session.tick(&inputs(1, now, Pose2D::identity()), Instant::now());
+        session.tick(&inputs(2, now, Pose2D::identity()), Instant::now());
         let scan = seen.lock().unwrap().scan.clone().expect("a scan");
         // The point 1 m ahead of the origin is now 0.9 m to the right.
         assert!((scan.xs[0] - 0.0).abs() < 1e-5 && (scan.ys[0] + 0.9).abs() < 1e-5);
