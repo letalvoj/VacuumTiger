@@ -128,18 +128,18 @@ impl Loop {
 }
 
 /// Sweeps `scene` with dhruva-slam configured by `dhruva` and the robot simulated by
-/// `sim` (`seed` for its noise). Only `wall_follow` runs on the simulated clock (the
-/// frontier strategy reads the wall clock), so only it is accepted.
+/// `sim` (`seed` for its noise). Only strategies that run on the simulated clock are
+/// accepted (not frontier).
 pub fn run(
     scene: &Scene,
     dhruva: &Config,
     mut sim: SimulationConfig,
     seed: u64,
 ) -> Result<Run, String> {
-    if dhruva.exploration.strategy != "wall_follow" {
+    let kind = dhruva.exploration.strategy;
+    if !kind.runs_on_simulated_clock() {
         return Err(format!(
-            "exploration strategy {:?}: the bench runs wall_follow only",
-            dhruva.exploration.strategy
+            "exploration strategy {kind:?}: reads the wall clock, the bench can't run it"
         ));
     }
     let start = scene.start;
@@ -149,7 +149,7 @@ pub fn run(
     if let Some(walkers) = scene.walkers {
         sim.lidar.noise.legs = walkers;
     }
-    let (exploration, strategy) = build_exploration(dhruva)?;
+    let (exploration, strategy) = build_exploration(dhruva);
     let mut session = Session::new(
         strategy,
         exploration.motion.clone(),

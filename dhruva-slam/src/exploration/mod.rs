@@ -2,9 +2,9 @@
 //!
 //! This module provides algorithms for autonomous exploration during map building:
 //!
-//! - [`strategy`]: Exploration strategy trait for extensibility
-//! - [`frontier`]: Frontier-based exploration implementation
-//! - [`wall_follow`]: Corner sweep: follow the walls around the room
+//! - [`strategy`]: the strategy trait every algorithm plugs in through
+//! - [`frontier`]: frontier exploration, driving to targets by A* (the navigation thread)
+//! - [`edge`]: edge passes, once round the room with the wall on one side
 //! - [`session`]: one session tick by tick: contacts, the SLAM gate, undocking, the
 //!   stuck watch, the strategy's actions as commands
 //!
@@ -31,12 +31,13 @@
 //! }
 //! ```
 
+mod edge;
 mod frontier;
 pub mod session;
 mod steady;
 mod strategy;
-mod wall_follow;
 
+pub use edge::WallSide;
+pub use edge::wall_follow::{WallFollowConfig, WallFollower};
 pub use frontier::{FrontierConfig, FrontierExploration};
 pub use strategy::{ExplorationAction, ExplorationStrategy, HazardEvent, HazardType};
-pub use wall_follow::{WallFollowConfig, WallFollower, WallSide};

@@ -434,13 +434,35 @@ impl Default for OptimizationConfig {
     }
 }
 
+/// The exploration algorithm (`[exploration] strategy`): each is an
+/// [`ExplorationStrategy`] of its own, picked here and nowhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyKind {
+    /// Frontiers, driven to by A* (the navigation thread).
+    #[default]
+    Frontier,
+    /// The corner sweep (`[exploration.wall_follow]`).
+    WallFollow,
+}
+
+impl StrategyKind {
+    /// Whether it runs on the time it is ticked with: frontier reads the wall clock, so
+    /// benches on a simulated clock can't run it.
+    pub fn runs_on_simulated_clock(self) -> bool {
+        match self {
+            StrategyKind::Frontier => false,
+            StrategyKind::WallFollow => true,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct ExplorationCfg {
     /// Enable exploration thread.
     pub enabled: bool,
-    /// Exploration strategy: "frontier" or "wall_follow" (the corner sweep).
-    pub strategy: String,
+    pub strategy: StrategyKind,
     /// Loop rate for exploration thread (Hz).
     pub loop_rate_hz: f32,
     /// Exploration stops with an error when the robot has not left a 1 m circle for this
@@ -458,7 +480,7 @@ impl Default for ExplorationCfg {
     fn default() -> Self {
         Self {
             enabled: true,
-            strategy: "frontier".to_string(),
+            strategy: StrategyKind::default(),
             loop_rate_hz: 10.0,
             stuck_after_s: 180.0,
             motion: ExplorationMotionConfig::default(),
@@ -752,10 +774,8 @@ pub fn build_slam_thread_config(config: &Config) -> SlamThreadConfig {
 }
 
 /// Exploration thread config and strategy from the TOML config (shared by the daemon and the
-/// lab's sweep bench). Errors on an unknown strategy name.
-pub fn build_exploration(
-    config: &Config,
-) -> Result<(ExplorationConfig, Box<dyn ExplorationStrategy>), String> {
+/// lab's sweep bench).
+pub fn build_exploration(config: &Config) -> (ExplorationConfig, Box<dyn ExplorationStrategy>) {
     let exploration = &config.exploration;
     let thread = ExplorationConfig {
         motion: MotionConfig {
@@ -768,8 +788,8 @@ pub fn build_exploration(
         stuck_after: Duration::from_secs_f32(exploration.stuck_after_s.max(1.0)),
     };
     // Strategies plan with the same robot footprint as navigation.
-    let strategy: Box<dyn ExplorationStrategy> = match exploration.strategy.as_str() {
-        "frontier" => Box::new(FrontierExploration::new(FrontierConfig {
+    let strategy: Box<dyn ExplorationStrategy> = match exploration.strategy {
+        StrategyKind::Frontier => Box::new(FrontierExploration::new(FrontierConfig {
             min_frontier_size: exploration.frontier.min_frontier_size,
             frontier_detection_range: exploration.frontier.detection_range,
             blocked_radius: exploration.frontier.blocked_radius,
@@ -778,17 +798,12 @@ pub fn build_exploration(
             safety_margin: config.navigation.safety_margin,
             ..FrontierConfig::default()
         })),
-        "wall_follow" => Box::new(WallFollower::new(WallFollowConfig {
+        StrategyKind::WallFollow => Box::new(WallFollower::new(WallFollowConfig {
             robot_radius: config.navigation.robot_radius,
             ..exploration.wall_follow
         })),
-        other => {
-            return Err(format!(
-                "unknown exploration strategy {other:?} (frontier, wall_follow)"
-            ));
-        }
     };
-    Ok((thread, strategy))
+    (thread, strategy)
 }
 
 #[cfg(test)]

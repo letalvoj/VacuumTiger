@@ -427,10 +427,8 @@ fn run_threaded_mode_rest(
 
     // Exploration Thread - autonomous mapping (optional)
     let exploration_thread = if config.exploration.enabled {
-        let (exploration_config, strategy) = build_exploration(&config).unwrap_or_else(|e| {
-            log::error!("{e}");
-            std::process::exit(1);
-        });
+        let (exploration_config, strategy) = build_exploration(&config);
+        let name = strategy.name();
 
         let thread = ExplorationThread::spawn(
             exploration_config,
@@ -439,10 +437,7 @@ fn run_threaded_mode_rest(
             shared_motion.clone(),
             running.clone(),
         );
-        log::info!(
-            "  Exploration thread started (strategy: {})",
-            config.exploration.strategy
-        );
+        log::info!("  Exploration thread started (strategy: {name})");
         Some(thread)
     } else {
         log::info!("  Exploration thread disabled");
@@ -461,7 +456,7 @@ fn run_threaded_mode_rest(
         );
     }
     if config.exploration.enabled {
-        log::info!("  Exploration: enabled ({})", config.exploration.strategy);
+        log::info!("  Exploration: enabled ({:?})", config.exploration.strategy);
     }
 
     // 9. Wait for shutdown signal (main thread just monitors)

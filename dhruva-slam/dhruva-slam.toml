@@ -299,7 +299,7 @@ tolerance = 1e-6
 # Enable autonomous exploration thread
 enabled = true
 
-# Exploration strategy: "frontier"
+# Exploration strategy: "frontier" or "wall_follow" (the corner sweep)
 strategy = "frontier"
 
 # Loop rate for exploration thread (Hz)
