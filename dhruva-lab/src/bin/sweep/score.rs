@@ -310,7 +310,7 @@ pub fn score(scene: &Scene, run: &Run) -> Score {
     }
 }
 
-/// The run, its scene and score as JSON, for `tools/py/wf_sim_plot.py`.
+/// The run, its scene and score as JSON, for `tools/wf_sim_plot.py`.
 pub fn to_json(scene: &Scene, run: &Run, score: &Score) -> Value {
     let curtains: Vec<_> = scene.curtains.iter().map(|c| c.front).collect();
     let path: Vec<_> = run.path.iter().step_by(10).collect();

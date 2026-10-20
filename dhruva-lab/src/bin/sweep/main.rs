@@ -12,7 +12,7 @@
 //!   models its own side: dhruva-slam's gyro scale is what it assumes, the mock's what
 //!   was measured, and the 2.5% between them is real.
 //! - `--set` changes `[exploration.wall_follow]` settings before the runs (see `climb`).
-//! - `--dump` writes `<DIR>/<scene>_<seed>.json` for `tools/py/wf_sim_plot.py`.
+//! - `--dump` writes `<DIR>/<scene>_<seed>.json` for `tools/wf_sim_plot.py`.
 
 mod climb;
 mod run;

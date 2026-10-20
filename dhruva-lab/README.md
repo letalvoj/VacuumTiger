@@ -41,23 +41,31 @@ Open `trace.mcap` in [Foxglove](https://foxglove.dev) or
 
 ## The corner-sweep bench
 
-`sweep` runs the corner sweep closed loop, faster than real time, in nine small
-scenes after what the real runs met (a box, an L, the dock, a curtain, legs by a
-wall, the dog's bench, a chair, a round bed, a glass fin):
+`sweep` runs the corner sweep closed loop, faster than real time, in small
+scenes after what the real runs met: a rooms kit (a box, an L, the dock, a
+curtain, legs by a wall, the dog's bench, a chair, a round bed, a glass fin) and
+a primitives kit, one obstacle each. From this folder:
 
 ```bash
-cargo run --release --bin sweep -- --seeds 2 --dump /tmp/wf
-uv run --with numpy --with matplotlib ../../tools/py/wf_sim_plot.py /tmp/wf --out wf.png
+cargo build --release --bin sweep
+./target/release/sweep --kit rooms --seeds 3 --dump /tmp/wf      # table per scene and seed + total cost
+uv run -q --with numpy --with matplotlib tools/wf_sim_plot.py /tmp/wf --out /tmp/wf.png --cols 3
 ```
 
-(`tools/py` is in the project folder around this repo, not in it.)
+The scenes, the metrics, the flags (one scene, `--set`, `--climb`), the
+sim-to-real gaps, the lab notes and the reference render of the current code
+are in [SWEEP_BENCH.md](SWEEP_BENCH.md).
 
-The robot model, the wire, the decode and the SLAM are the real ones: SangamIO's
-mock of the v8 (`sangamio/mock_bench.toml`, as measured) is stepped at its
-110 Hz, its groups go through SangamIO's wire format and dhruva-slam's decode
-into the SLAM the daemon runs, and the exploration session decides on the
-simulated clock, as the exploration thread would. What the bench leaves out
-(SLAM latency, TCP, the lidar's boot) is listed in `src/bin/sweep/run.rs`. Each
-run is scored on the true path: the floor the brushes left unswept along the
-walls, the corners, time, bumps, whether the lap closed. `--climb N`
-hill-climbs `[exploration.wall_follow]` on that score.
+## The simulated robot in the web UI
+
+To watch the simulated v8 live instead, run the daemons on SangamIO's mock, each
+in its own terminal from the repo root (ports 5555, 5557, 8080):
+
+```bash
+cd sangamio && cargo build --release --features mock --target-dir target/mock && ./target/mock/release/sangamio mock.toml
+cd dhruva-slam && cargo build --release && ./target/release/dhruva-slam -c dhruva-mock.toml
+cd dwar/web && npm ci && npm run build && cd .. && cargo build --release && ./target/release/dwar dwar.toml
+```
+
+Then open http://localhost:8080/. `mock.toml` loads its map from `sangamio/maps/`;
+driving from the UI needs `allow_drive = true` in `dwar.toml`.
