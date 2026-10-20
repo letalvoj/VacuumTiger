@@ -3,6 +3,9 @@
     cd dhruva-lab && cargo run --release --bin sweep -- --dump /tmp/wf
     uv run --with numpy --with matplotlib tools/wf_sim_plot.py /tmp/wf --out /tmp/wf.png
 
+It writes the overview (legend, what each seed changes, a table of every run) to --out, and
+pages of panels next to it (wf_1.png, …): a row per scene, a column per seed.
+
 Each panel shows:
 - light green: the floor the brushes swept, the bench's own cells (the side brush's disc and
   the main roller's 16 cm strip along the true path; not the whole body);
@@ -20,7 +23,7 @@ Each panel shows:
   missing from it, curtains are a smear);
 - each inner corner marked with its distance (cm) to the nearest swept floor.
 
-The last panel totals every scene: the uncleaned area, the corners, time and bumps.
+The overview's table totals every run: the uncleaned area, the corners, time and bumps.
 """
 
 import argparse
@@ -158,8 +161,8 @@ def panel(ax, run):
                     xytext=(cx + (0.08 if cx < (x0 + x1) / 2 else -0.15),
                             cy + (0.06 if cy < (y0 + y1) / 2 else -0.12)), zorder=6)
     done = "" if run["completed"] else ", NO LAP"
-    ax.set_title(f"{run['name']}: {run['seconds']:.0f} s, {run['bump_count']} bumps{done}\n"
-                 f"uncleaned {run['missed_m2'] * 1e4:.0f} cm² ({run['missed_depth'] * 100:.1f} cm deep), "
+    ax.set_title(f"{run['seconds']:.0f} s, {run['bump_count']} bumps{done}\n"
+                 f"miss {run['missed_depth'] * 100:.1f} cm deep, "
                  f"pockets {run.get('pockets_m2', 0) * 1e4:.0f} cm², "
                  f"worst corner {max(run['corners'] or [0]) * 100:.0f} cm", fontsize=8)
     ax.set_xlim(x0, x1)
@@ -184,28 +187,74 @@ def summary(ax, runs):
     ax.text(0, 1, "\n".join(lines), family="monospace", fontsize=8, va="top")
 
 
+def seed_note(seed, runs):
+    """What a column's seed changes, from the dumps."""
+    bias = next((r["range_bias"] for r in runs if r["seed"] == seed and "range_bias" in r), None)
+    if bias is None:
+        return f"seed {seed}"
+    lidar = ("lidar as calibrated" if abs(bias) < 1e-4 else
+             f"lidar reads {abs(bias) * 100:.0f} cm {'long' if bias > 0 else 'short'}")
+    return f"seed {seed}: {lidar}"
+
+
+def overview(runs, seeds, out):
+    """The legend, what the columns are, and the table of every run."""
+    fig = plt.figure(figsize=(14, 2.6 + 0.16 * len(runs)))
+    legend(fig)
+    notes = ["Pages: one row per scene, one column per seed. Each seed draws its own noise "
+             "(lidar, wheels, gyro) and shifts the lidar's range:"]
+    notes += [f"  {seed_note(s, runs)}" for s in seeds]
+    fig.text(0.03, 1 - 1.3 / fig.get_figheight(), "\n".join(notes), fontsize=9, va="top")
+    ax = fig.add_axes((0.03, 0, 0.94, 1 - 2.3 / fig.get_figheight()))
+    summary(ax, runs)
+    fig.savefig(out, dpi=90)
+
+
+def page(runs, scenes, seeds, out):
+    """Panels for `scenes`, a row each, a column per seed."""
+    cols = len(seeds)
+    fig, axes = plt.subplots(len(scenes), cols, figsize=(4.6 * cols, 3.8 * len(scenes) + 0.4),
+                             squeeze=False)
+    by = {(r["scene"], r["seed"]): r for r in runs}
+    for i, scene in enumerate(scenes):
+        for j, seed in enumerate(seeds):
+            ax = axes[i, j]
+            if (scene, seed) in by:
+                panel(ax, by[(scene, seed)])
+            else:
+                ax.axis("off")
+        axes[i, 0].set_ylabel(scene, fontsize=12, weight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 1 - 0.4 / fig.get_figheight()))
+    for j, seed in enumerate(seeds):
+        box = axes[0, j].get_position()
+        fig.text((box.x0 + box.x1) / 2, 1 - 0.15 / fig.get_figheight(), seed_note(seed, runs),
+                 ha="center", va="top", fontsize=10, weight="bold")
+    fig.savefig(out, dpi=90)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dir", help="directory of <scene>_<seed>.json dumps")
-    ap.add_argument("--out", required=True, help="PNG")
-    ap.add_argument("--cols", type=int, default=4)
+    ap.add_argument("--out", required=True,
+                    help="PNG: the overview; the pages go next to it as <out>_1.png, …")
+    ap.add_argument("--rows", type=int, default=4, help="scenes per page")
     args = ap.parse_args()
-    runs = [json.load(open(p)) for p in sorted(glob.glob(os.path.join(args.dir, "*.json")))]
-    for r, p in zip(runs, sorted(glob.glob(os.path.join(args.dir, "*.json")))):
-        r["name"] = os.path.basename(p)[:-5]
-    n = len(runs) + 1
-    cols = min(args.cols, n)
-    rows = math.ceil(n / cols)
-    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), squeeze=False)
-    for ax in axes.flat[n:]:
-        ax.axis("off")
-    for ax, run in zip(axes.flat, runs):
-        panel(ax, run)
-    summary(axes.flat[len(runs)], runs)
-    legend(fig)
-    fig.tight_layout(rect=(0, 0, 1, 1 - 1.5 / fig.get_figheight()))
-    fig.savefig(args.out, dpi=90)
+    runs = []
+    for p in sorted(glob.glob(os.path.join(args.dir, "*.json"))):
+        run = json.load(open(p))
+        scene, seed = os.path.basename(p)[:-5].rsplit("_", 1)
+        run["scene"], run["seed"] = scene, run.get("seed", int(seed))
+        run["name"] = f"{scene}_{run['seed']}"
+        runs.append(run)
+    scenes = list(dict.fromkeys(r["scene"] for r in runs))
+    seeds = sorted({r["seed"] for r in runs})
+    overview(runs, seeds, args.out)
     print("wrote", args.out)
+    stem, ext = os.path.splitext(args.out)
+    for k in range(math.ceil(len(scenes) / args.rows)):
+        out = f"{stem}_{k + 1}{ext}"
+        page(runs, scenes[k * args.rows:(k + 1) * args.rows], seeds, out)
+        print("wrote", out)
 
 
 if __name__ == "__main__":

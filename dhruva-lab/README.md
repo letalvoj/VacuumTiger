@@ -43,13 +43,13 @@ Open `trace.mcap` in [Foxglove](https://foxglove.dev) or
 
 `sweep` runs the corner sweep closed loop, faster than real time, in small
 scenes after what the real runs met: a rooms kit (a box, an L, the dock, a
-curtain, legs by a wall, the dog's bench, a chair, a round bed, a glass fin) and
+curtain, legs by a wall, the dog's bench, three chairs, a round bed, a glass fin) and
 a primitives kit, one obstacle each. From this folder:
 
 ```bash
 cargo build --release --bin sweep
 ./target/release/sweep --kit rooms --seeds 3 --dump /tmp/wf      # table per scene and seed + total cost
-uv run -q --with numpy --with matplotlib tools/wf_sim_plot.py /tmp/wf --out /tmp/wf.png --cols 3
+uv run -q --with numpy --with matplotlib tools/wf_sim_plot.py /tmp/wf --out /tmp/wf.png   # + /tmp/wf_1.png, …
 ```
 
 The scenes, the metrics, the flags (one scene, `--set`, `--climb`), the

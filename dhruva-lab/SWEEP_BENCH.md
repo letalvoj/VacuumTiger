@@ -65,7 +65,9 @@ left of every edge), obstacles, and a start pose by a wall with the wall on the 
 | `curtain` | sweep7: folds 3–18 cm out from a wall, mostly seen; the body drives through to the wall |
 | `legs_by_wall` | sweep6/7: legs 15 cm off the wall every 0.5 m, too close to pass behind |
 | `dog_bench` | 1.2 × 0.4 m on six 3 cm legs against a wall, high enough to drive under |
-| `chair` | sweep8: a chair 20 cm off the wall; the body fits under its 39 cm side |
+| `chair` | sweep8: a chair 20 cm off the wall; its legs are 34 and 32 cm apart inside, too narrow for the body |
+| `chair_through` | a wider chair (42 cm inside) 20 cm off the wall: in under it from one side, out the other |
+| `chair_dead_end` | the same chair with a second one beside it, offset so its leg blocks the way out: in, sweep, back out |
 | `round_bed` | sweep6: a half disc of 35 cm radius against the wall, an outer curve |
 | `glass` | a 0.6 m glass fin out of a wall: felt, not seen |
 
@@ -174,10 +176,12 @@ and compare the total cost with the reference below on the same seeds.
 Render dumped runs ([uv](https://docs.astral.sh/uv/) fetches numpy and matplotlib):
 
 ```bash
-uv run -q --with numpy --with matplotlib tools/wf_sim_plot.py /tmp/wf --out /tmp/wf.png --cols 3
+uv run -q --with numpy --with matplotlib tools/wf_sim_plot.py /tmp/wf --out /tmp/wf.png
 ```
 
-The render has a legend:
+It writes an overview (`/tmp/wf.png`: the legend, what each seed changes, a table of every
+run) and pages of panels (`/tmp/wf_1.png`, …): a row per scene, a column per seed, `--rows`
+scenes a page (4). The marks:
 - Green floor is swept; red is missed along an edge; orange is a pocket.
 - The line is the true path (coloured by time); the dashed line is SLAM's belief.
 - Circles are the body and brush every ~10 s.
@@ -189,15 +193,30 @@ is never needed for this.
 
 ## 7. Reference render
 
-Both kits at cf89f9e, 3 seeds, default settings: total cost **rooms 285.4, primitives 332.8**.
-A change should beat these on the same seeds.
+Both kits with the `wall_follow` of cf89f9e, 3 seeds, default settings: total cost
+**rooms 573.1** (11 scenes, with the two new chairs; the 9 older ones total 285.4) and
+**primitives 332.8**. A change should beat these on the same seeds.
 
-![rooms kit at cf89f9e](img/sweep_rooms.png)
+Rooms kit: the overview (legend, what each seed changes, every run), then the pages.
 
-![primitives kit at cf89f9e](img/sweep_primitives.png)
+![rooms overview](img/rooms.png)
+![rooms 1](img/rooms_1.png)
+![rooms 2](img/rooms_2.png)
+![rooms 3](img/rooms_3.png)
 
-Open at cf89f9e:
-- `chair` closes its lap early on one seed (48 s) and misses most of the room.
+Primitives kit:
+
+![primitives overview](img/primitives.png)
+![primitives 1](img/primitives_1.png)
+![primitives 2](img/primitives_2.png)
+![primitives 3](img/primitives_3.png)
+
+Open:
+- **Chairs.** The sweep never goes under a chair, not even the 42 cm one: it rounds the legs
+  as one outline. On 2 of 3 seeds of `chair_through`, all of `chair_dead_end`, and `chair`
+  seed 2, it closes its lap early (47–71 s) after circling the legs and leaves most of the
+  room. The scenario test skips the two new chairs until that is fixed.
+- `curtain` runs out of time on the test's seed 7.
 - `dog_bench` leaves 380–570 cm² of pockets between its legs.
 - `cabinet` skips the bay beside it on 1 of 3 seeds.
 - The corner at the curtain's end stays 13–17 cm.

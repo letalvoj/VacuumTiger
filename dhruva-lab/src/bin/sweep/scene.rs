@@ -387,12 +387,29 @@ pub fn scenes() -> Vec<Scene> {
     }
     out.push(scene);
 
-    // sweep8: a chair (39 x 37 cm outside, 2.5 cm legs) 20 cm off the wall: the body
-    // cannot pass behind it but fits under it along its 39 cm side.
+    // sweep8: a chair (39 x 37 cm outside, 2.5 cm legs) 20 cm off the wall. Its legs are
+    // 34 and 32 cm apart inside, too narrow for the 35 cm body: round it as one thing.
     let mut scene = Scene::new("chair", &BOX, (0.5, 1.2, 0.0), 200.0);
     for x in [1.3, 1.665] {
         scene.legs.extend([((x, 0.2), 0.025), ((x, 0.545), 0.025)]);
     }
+    out.push(scene);
+
+    // A wider chair, 42 cm inside between its legs, 20 cm off the wall: the body cannot
+    // pass behind it but fits under it. Coming along the wall it enters from the left and
+    // leaves on the right. With a second such chair 6 cm to the right and 20 cm farther
+    // from the wall, its leg splits the way out into 18 cm gaps: a dead end to sweep and
+    // back out of.
+    let wide = |x: f32, y: f32| {
+        [(0.0, 0.0), (0.445, 0.0), (0.0, 0.445), (0.445, 0.445)]
+            .map(|(dx, dy)| ((x + dx, y + dy), 0.025))
+    };
+    let mut scene = Scene::new("chair_through", &BOX, (0.5, 1.2, 0.0), 200.0);
+    scene.legs.extend(wide(1.3, 0.2125));
+    out.push(scene);
+    let mut scene = Scene::new("chair_dead_end", &BOX, (0.5, 1.2, 0.0), 200.0);
+    scene.legs.extend(wide(1.3, 0.2125));
+    scene.legs.extend(wide(1.3 + 0.445 + 0.06, 0.4125));
     out.push(scene);
 
     // sweep6: a round bed against the wall, a half disc of 35 cm radius: an outer curve
