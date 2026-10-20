@@ -11,7 +11,7 @@
 //!   for glass. Keeping what moves next to the body would explain it, but the robot then
 //!   steers round passing legs: on the bench, with people in every room, the cost tripled.
 
-use crate::core::types::{PointCloud2D, Pose2D, Timestamped};
+use crate::core::types::{Point2D, PointCloud2D, Pose2D, Timestamped};
 use crate::state::PlacedScan;
 
 /// A point stands still with a point of the scan before this near (m)…
@@ -49,7 +49,10 @@ impl Steady {
             let stood = (self.before.xs.iter().zip(&self.before.ys))
                 .any(|(bx, by)| (bx - wx).powi(2) + (by - wy).powi(2) < near * near);
             if stood {
-                cloud.push_xy(x, y);
+                match &local.intensities {
+                    Some(quality) => cloud.push_with_intensity(Point2D::new(x, y), quality[i]),
+                    None => cloud.push_xy(x, y),
+                }
             }
         }
         self.stamp = Some(scan.timestamp_us);
