@@ -32,6 +32,9 @@ use crate::scene::{Point, Scene};
 
 /// The groups' clock starts here (µs): any fixed time, so runs replay exactly.
 const EPOCH_US: u64 = 1_700_000_000_000_000;
+/// The lidar's range bias (m, + reads walls farther) for seeds 1, 2, 3, 4…, on top of the
+/// mock's: the software's idea of the lidar's offsets is off by up to a centimetre.
+const RANGE_BIAS: [f32; 3] = [0.0, -0.01, 0.01];
 /// An occupied cell in the shared state's map (`CurrentMapData::cells`).
 const OCCUPIED: u8 = 100;
 
@@ -132,6 +135,7 @@ pub fn run(
     let start = scene.start;
     (sim.start_x, sim.start_y, sim.start_theta) = start;
     sim.random_seed = seed;
+    sim.lidar.noise.range_bias += RANGE_BIAS[(seed as usize).saturating_sub(1) % RANGE_BIAS.len()];
     if let Some(walkers) = scene.walkers {
         sim.lidar.noise.legs = walkers;
     }

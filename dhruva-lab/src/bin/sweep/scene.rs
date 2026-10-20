@@ -222,12 +222,13 @@ pub fn primitives() -> Vec<Scene> {
     };
     let start = (0.35, 0.25, 0.0);
     let room = [(0.0, 0.0), (1.4, 0.0), (1.4, 1.0), (0.0, 1.0)];
-    // Along 4 m of wall, a U-turn at each end (its corners are scored too).
+    // Along 8 m of wall, a U-turn at each end (its corners are scored too). It starts in the
+    // bottom left corner, so the lap's seam is there and not along the wall.
     let corridor = quiet(
         "wall",
-        &[(0.0, 0.0), (4.0, 0.0), (4.0, 0.7), (0.0, 0.7)],
-        (0.5, 0.3, 0.0),
-        90.0,
+        &[(0.0, 0.0), (8.0, 0.0), (8.0, 0.7), (0.0, 0.7)],
+        (0.25, 0.22, 0.0),
+        150.0,
     );
     let mut out = vec![corridor.clone()];
 
