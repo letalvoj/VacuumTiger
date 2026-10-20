@@ -253,6 +253,63 @@ pub fn primitives() -> Vec<Scene> {
     scene.legs.push(((0.7, 0.2), 0.03));
     out.push(scene);
 
+    // A cabinet whose top overhangs its plinth by 4 cm: the lidar sees the plinth, the
+    // shell meets the top. Bumps all along unless it is kept off.
+    let cabinet = [
+        (0.0, 0.0),
+        (0.5, 0.0),
+        (0.5, 0.4),
+        (1.1, 0.4),
+        (1.1, 0.0),
+        (1.6, 0.0),
+        (1.6, 1.0),
+        (0.0, 1.0),
+    ];
+    let mut scene = quiet("cabinet", &cabinet, (0.3, 0.8, 0.0), 120.0);
+    let lid = [(0.46, 0.0), (0.46, 0.44), (1.14, 0.44), (1.14, 0.0)];
+    scene.glass.extend(lid.windows(2).map(|w| (w[0], w[1])));
+    out.push(scene);
+
+    // Chairs (39 x 37 cm outside, 2.5 cm legs) 14 cm off the bottom wall, as in sweep8:
+    // the body cannot pass behind or between the legs, so round them as one thing. Bays
+    // beside and above as by a fin.
+    let chair = |x: f32| {
+        [(0.0, 0.0), (0.365, 0.0), (0.0, 0.345), (0.365, 0.345)]
+            .map(|(dx, dy)| ((x + dx, 0.15 + dy), 0.025))
+    };
+    let (left, top) = (BAY + 0.025, 0.52 + BAY);
+    let room_to = |right: f32| [(0.0, 0.0), (right, 0.0), (right, top), (0.0, top)];
+    let one = room_to(left + 0.39 + BAY - BAY_SKEW);
+    let by_door = (0.3, top - 0.25, 0.0);
+    let mut scene = quiet("lone_chair", &one, by_door, 120.0);
+    scene.legs.extend(chair(left));
+    out.push(scene);
+
+    // The chair with a stretcher across its far side, below the lidar: seen open, bumped.
+    let mut scene = quiet("chair_bar", &one, by_door, 120.0);
+    scene.legs.extend(chair(left));
+    scene.glass.push(((left + 0.365, 0.52), (left, 0.52)));
+    out.push(scene);
+
+    // Two chairs 22 cm apart: the gap is narrower than the body, round both as one.
+    let next = left + 0.39 + 0.22;
+    let two = room_to(next + 0.39 + BAY - BAY_SKEW);
+    let mut scene = quiet("two_chairs", &two, by_door, 150.0);
+    scene.legs.extend(chair(left));
+    scene.legs.extend(chair(next));
+    out.push(scene);
+
+    let open = [(0.0, 0.0), (1.6, 0.0), (1.6, 1.3), (0.0, 1.3)];
+
+    // A curtain 15 cm deep before a wall, its fabric mostly seen: into it to the wall.
+    let mut scene = quiet("curtain_strip", &open, (1.3, 0.8, PI), 150.0);
+    scene.curtains.push(Curtain {
+        front: ((1.3, 0.18), (0.3, 0.18)),
+        depth: 0.15,
+        seen: 0.85,
+    });
+    out.push(scene);
+
     // The corridor with people walking past: not taking their legs for the wall.
     out.push(Scene {
         name: "people",
