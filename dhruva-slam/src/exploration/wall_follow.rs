@@ -232,6 +232,10 @@ pub struct WallFollower {
     /// Where following started (world frame, not moved by loop closures) and the distance
     /// travelled by then.
     lap_start: Option<(Point2D, f32)>,
+    /// The heading the first tick on the edge (rad): the lap closes going that way, not
+    /// passing its start the other way (down the far side of a narrow bay). Not the heading
+    /// at a bump that started the lap: into the wall, not along it. Unset, any way closes.
+    lap_heading: Option<f32>,
     /// Once the lap is back at its start, the nearest it has come to it (m) and the distance
     /// travelled then.
     lap_back: Option<(f32, f32)>,
@@ -257,6 +261,7 @@ impl WallFollower {
             last_pose: None,
             travelled: 0.0,
             lap_start: None,
+            lap_heading: None,
             lap_back: None,
             last_edge: None,
             fence,
@@ -431,15 +436,20 @@ impl WallFollower {
             .then(|| (0.0, self.spin(remaining), "turning on the spot"))
     }
 
-    /// Back within `lap_radius` of the lap's start, and `lap_overlap` on from the nearest it
-    /// came to it while following: over the seam, not short of it (the start may lie in a
-    /// corner still ahead).
+    /// Back within `lap_radius` of the lap's start, going the way it started, and
+    /// `lap_overlap` on from the nearest it came to it while following: over the seam, not
+    /// short of it (the start may lie in a corner still ahead).
     fn lap_done(&mut self, pose: &Pose2D) -> bool {
         let Some((start, at)) = self.lap_start else {
             return false;
         };
         let d = (pose.x - start.x).hypot(pose.y - start.y);
-        let back = self.travelled - at > self.config.lap_min_distance && d < self.config.lap_radius;
+        let same_way = self
+            .lap_heading
+            .is_none_or(|h| angle_diff(pose.theta, h).abs() < FRAC_PI_2);
+        let back = self.travelled - at > self.config.lap_min_distance
+            && d < self.config.lap_radius
+            && same_way;
         match &mut self.lap_back {
             Some(nearest) if d < nearest.0 => *nearest = (d, self.travelled),
             None if back => self.lap_back = Some((d, self.travelled)),
@@ -573,6 +583,7 @@ impl WallFollower {
                     let gap = d - r;
                     if gap < ON_EDGE {
                         self.start_lap(pose);
+                        self.lap_heading.get_or_insert(pose.theta);
                     }
                     // Run along the edge point (it on the right), bent towards it when the
                     // gap is wider than wanted (from far away, straight at it), away when
@@ -1082,6 +1093,25 @@ mod tests {
     }
 
     #[test]
+    fn passing_the_start_the_other_way_is_no_lap() {
+        // Down the far side of a narrow bay, 12 cm from where following started going up.
+        let mut f = WallFollower::new(WallFollowConfig::default());
+        let up = FRAC_PI_2;
+        f.lap_start = Some((Point2D::new(0.0, 0.0), 0.0));
+        f.lap_heading = Some(up);
+        f.travelled = 5.0;
+        assert!(!f.lap_done(&Pose2D::new(0.12, 0.0, -up)));
+        f.travelled = 5.0 + f.config.lap_overlap;
+        assert!(!f.lap_done(&Pose2D::new(0.12, -f.config.lap_overlap, -up)));
+        assert!(f.lap_back.is_none(), "it never came back");
+        // Round the bay and up the wall again: the lap.
+        f.travelled = 7.0;
+        assert!(!f.lap_done(&Pose2D::new(0.0, 0.0, up)));
+        f.travelled = 7.0 + f.config.lap_overlap;
+        assert!(f.lap_done(&Pose2D::new(0.0, f.config.lap_overlap, up)));
+    }
+
+    #[test]
     fn the_lap_starts_at_the_first_bump_too() {
         // E.g. glass the lidar never saw.
         let mut f = WallFollower::new(WallFollowConfig::default());
@@ -1095,5 +1125,6 @@ mod tests {
             Some(bump.hazard_type),
         );
         assert_eq!(f.lap_start.map(|(p, _)| (p.x, p.y)), Some((1.0, 2.0)));
+        assert_eq!(f.lap_heading, None, "into the wall is not the way along it");
     }
 }
