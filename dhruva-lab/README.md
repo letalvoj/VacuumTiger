@@ -53,8 +53,8 @@ uv run -q --with numpy --with matplotlib tools/wf_sim_plot.py /tmp/wf --out /tmp
 ```
 
 The scenes, the metrics, the flags (one scene, `--set`, `--climb`), the
-sim-to-real gaps, the lab notes and the reference render of the current code
-are in [SWEEP_BENCH.md](SWEEP_BENCH.md).
+sim-to-real gaps and the lab notes are in [SWEEP_BENCH.md](SWEEP_BENCH.md); each
+strategy's current numbers and renders are in [reports/sweep](../reports/sweep/README.md).
 
 ## The simulated robot in the web UI
 

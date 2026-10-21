@@ -173,6 +173,7 @@ VacuumTiger/
 │   ├── drishti_ui.py       # PyQt GUI with sensor overlays
 │   ├── drishti.py          # Console client
 │   └── ui/                 # PyQt widgets and processors
+├── reports/                # Analyses with their numbers, plots and scripts (paper trail)
 ├── slam-test/              # SLAM integration test framework
 └── protocol-mitm/          # Reverse engineering tools
 ```

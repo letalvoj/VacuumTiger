@@ -193,33 +193,10 @@ is never needed for this.
 
 ## 7. Reference render
 
-Both kits with the `wall_follow` of cf89f9e, 3 seeds, default settings: total cost
-**rooms 573.1** (11 scenes, with the two new chairs; the 9 older ones total 285.4) and
-**primitives 332.8**. A change should beat these on the same seeds.
-
-Rooms kit: the overview (legend, what each seed changes, every run), then the pages.
-
-![rooms overview](img/rooms.png)
-![rooms 1](img/rooms_1.png)
-![rooms 2](img/rooms_2.png)
-![rooms 3](img/rooms_3.png)
-
-Primitives kit:
-
-![primitives overview](img/primitives.png)
-![primitives 1](img/primitives_1.png)
-![primitives 2](img/primitives_2.png)
-![primitives 3](img/primitives_3.png)
-
-Open:
-- **Chairs.** The sweep never goes under a chair, not even the 42 cm one: it rounds the legs
-  as one outline. On 2 of 3 seeds of `chair_through`, all of `chair_dead_end`, and `chair`
-  seed 2, it closes its lap early (47–71 s) after circling the legs and leaves most of the
-  room. The scenario test skips the two new chairs until that is fixed.
-- `curtain` runs out of time on the test's seed 7.
-- `dog_bench` leaves 380–570 cm² of pockets between its legs.
-- `cabinet` skips the bay beside it on 1 of 3 seeds.
-- The corner at the curtain's end stays 13–17 cm.
+The current numbers and renders of each strategy (wall_follow, stock_follow,
+stock_follow_fix), 8 seeds for the tables and 3 for the renders, with what each still gets
+wrong, are in [reports/sweep](../reports/sweep/README.md). A change should beat its
+strategy's numbers there on the same seeds, and update them.
 
 ## 8. What was tried (lab notes)
 

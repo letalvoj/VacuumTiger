@@ -140,6 +140,12 @@ def panel(ax, run):
         ax.plot([a[0], b[0]], [a[1], b[1]], "c-", lw=3, zorder=3)
     for (a, b) in run.get("curtains", []):
         ax.plot([a[0], b[0]], [a[1], b[1]], "m--", lw=2, zorder=3)
+    # An overhang: its lip (the room's side) in cyan, what holds it up `depth` behind in black.
+    for (a, b), depth in run.get("overhangs", []):
+        n = np.array([b[1] - a[1], a[0] - b[0]])
+        n *= depth / np.hypot(*n)
+        ax.plot([a[0], b[0]], [a[1], b[1]], "c-", lw=3, zorder=3)
+        ax.plot([a[0] + n[0], b[0] + n[0]], [a[1] + n[1], b[1] + n[1]], "k-", lw=1, zorder=3)
     if run["path"]:
         xs, ys = [p[0] for p in run["path"]], [p[1] for p in run["path"]]
         ax.scatter(xs, ys, c=range(len(xs)), cmap="viridis", s=0.3, zorder=4)
