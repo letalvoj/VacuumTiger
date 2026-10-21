@@ -162,13 +162,14 @@ fn main() -> Result<(), String> {
 
     let outcomes = evaluate(&scenes, &config, &sim, args.seeds)?;
     println!(
-        "{:<16} {:>4} {:>6} {:>5} {:>8} {:>8} {:>8} {:>7} {:>6}",
-        "scene", "lap", "s", "bumps", "miss cm", "corner", "pkt cm²", "loiter", "cost"
+        "{:<16} {:>4} {:>6} {:>5} {:>8} {:>8} {:>8} {:>7} {:>6} {:>5} {:>6} {:>6}",
+        "scene", "lap", "s", "bumps", "miss cm", "corner", "pkt cm²", "loiter", "cost", "lap%",
+        "m/min", "stray%"
     );
     for o in &outcomes {
         let s = &o.score;
         println!(
-            "{:<16} {:>4} {:>6.0} {:>5} {:>8.1} {:>8.1} {:>8.0} {:>7.0} {:>6.1}  {}",
+            "{:<16} {:>4} {:>6.0} {:>5} {:>8.1} {:>8.1} {:>8.0} {:>7.0} {:>6.1} {:>5.0} {:>6.2} {:>6.1}  {}",
             format!("{}#{}", o.scene, o.seed),
             if s.completed { "yes" } else { "NO" },
             s.seconds,
@@ -178,6 +179,9 @@ fn main() -> Result<(), String> {
             s.pockets_m2 * 1e4,
             s.loiter,
             cost(s),
+            s.lap_share() * 100.0,
+            s.rate(),
+            s.stray_share() * 100.0,
             o.run.ended.as_deref().unwrap_or_default()
         );
         if let Some(dir) = &args.dump {

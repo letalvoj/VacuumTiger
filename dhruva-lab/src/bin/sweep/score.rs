@@ -11,11 +11,16 @@
 //! Pockets are reachable unswept floor the path closed round, away from the room's sides,
 //! too small for the body: inside a loop round a leg, say. Sweeping them later means coming
 //! back for each, so they cost more than the open middle the lanes will sweep.
+//!
+//! Besides, not in the cost: how much of the edge the pass reached (the share of the lap it
+//! made), how fast (edge reached per minute: a run that ran out of time is not charged for
+//! the time it would have needed), and how much of the middle it swept straying from the
+//! edges, past the straight drive from the start to the nearest wall.
 
 use serde_json::{Value, json};
 
 use crate::run::Run;
-use crate::scene::{Point, Scene, inside};
+use crate::scene::{Point, Scene, distance_to_segment, inside};
 
 /// Side brush centre (robot frame, m; right is -y) and the radius it sweeps (m).
 pub const SIDE_BRUSH: Point = (0.105, -0.11);
@@ -38,8 +43,13 @@ const GAP: usize = 3;
 const BODY_RADIUS: f32 = 0.175;
 /// A path that does not leave a circle this big (m) for long loiters.
 const LOITER_RADIUS: f32 = 1.0;
+/// An edge sample is reached when the swept floor starts this near it (m), past what no
+/// brush reaches: the corners' allowance.
+const REACHED: f32 = 0.05;
+/// Floor farther than a body's width from anything solid (m) is the middle, not the edge.
+const MIDDLE: f32 = 2.0 * BODY_RADIUS;
 
-/// A run's score. Lower is better throughout.
+/// A run's score. Lower is better throughout, but for `lap_share` and `rate`.
 #[derive(Debug, Clone, Default)]
 pub struct Score {
     pub completed: bool,
@@ -61,11 +71,46 @@ pub struct Score {
     pub loiter: f32,
     /// Every edge sample scored: where it is, the inward normal, and how deep the miss is (m).
     pub misses: Vec<(Point, Point, f32)>,
+    /// The edge scored (m)…
+    pub edge_m: f32,
+    /// …and what of it was reached at some point in the run (m), not necessarily in one go.
+    pub reached_m: f32,
+    /// The middle (m²)…
+    pub middle_m2: f32,
+    /// …and what of it was swept, but for the drive from the start to the nearest wall (m²).
+    pub stray_m2: f32,
 }
 
 impl Score {
     pub fn worst_corner(&self) -> f32 {
         self.corners.iter().copied().fold(0.0, f32::max)
+    }
+
+    /// The share of the edge reached: of the lap, how much it made.
+    pub fn lap_share(&self) -> f32 {
+        if self.edge_m > 0.0 {
+            self.reached_m / self.edge_m
+        } else {
+            0.0
+        }
+    }
+
+    /// The edge reached per minute (m/min).
+    pub fn rate(&self) -> f32 {
+        if self.seconds > 0.0 {
+            self.reached_m / self.seconds * 60.0
+        } else {
+            0.0
+        }
+    }
+
+    /// The share of the middle swept straying from the edges.
+    pub fn stray_share(&self) -> f32 {
+        if self.middle_m2 > 0.0 {
+            self.stray_m2 / self.middle_m2
+        } else {
+            0.0
+        }
     }
 }
 
@@ -243,10 +288,9 @@ impl Swept {
                 }
             }
         }
-        // At some yaw the side brush's far rim is this far from the centre, past the main
-        // brush. A point that far from a centre inside the joined region is as near to one
-        // on its rim, so only the rim is grown.
-        let far = SIDE_BRUSH.0.hypot(SIDE_BRUSH.1) + SIDE_BRUSH_RADIUS;
+        // A point `brush_reach` from a centre inside the joined region is as near to one on
+        // its rim, so only the rim is grown.
+        let far = brush_reach();
         let mut reach: Vec<bool> = (0..n).map(|k| joined[k] || self.cells[k]).collect();
         for k in (0..n).filter(|&k| joined[k]) {
             if self.around(k, 1).any(|m| !joined[m]) {
@@ -256,6 +300,71 @@ impl Swept {
             }
         }
         reach
+    }
+
+    /// Each cell's distance to the nearest solid cell (m): a two-pass chamfer transform,
+    /// diagonals at √2 cells, so exact along the axes and up to 8% long in between.
+    fn clearance(&self) -> Vec<f32> {
+        let (w, n) = (self.width, self.cells.len());
+        let diag = CELL * std::f32::consts::SQRT_2;
+        let mut d: Vec<f32> = (self.floor.iter())
+            .map(|&f| if f { f32::INFINITY } else { 0.0 })
+            .collect();
+        // The neighbours before cell `k` in raster order.
+        let before = |k: usize| {
+            let i = k % w;
+            [
+                (i > 0).then(|| (k - 1, CELL)),
+                (k >= w).then(|| (k - w, CELL)),
+                (k >= w && i > 0).then(|| (k - w - 1, diag)),
+                (k >= w && i + 1 < w).then(|| (k - w + 1, diag)),
+            ]
+        };
+        // Forwards, then backwards: the same pass over the grid reversed (`n - 1 - k`).
+        for reversed in [false, true] {
+            let at = |k: usize| if reversed { n - 1 - k } else { k };
+            for k in 0..n {
+                for (m, step) in before(k).into_iter().flatten() {
+                    d[at(k)] = d[at(k)].min(d[at(m)] + step);
+                }
+            }
+        }
+        d
+    }
+
+    /// The middle (floor more than `MIDDLE` from anything solid), and what of it was swept but
+    /// for what the brushes reach driving straight from `start` to the nearest wall, up to
+    /// where the body touches it (m²).
+    fn stray(&self, start: Point) -> (f32, f32) {
+        let clearance = self.clearance();
+        let middle = |k: usize| clearance[k] > MIDDLE;
+        let solid = (0..self.cells.len()).filter(|&k| !self.floor[k]);
+        let dist = |k: usize| {
+            let p = self.centre(k);
+            (p.0 - start.0).hypot(p.1 - start.1)
+        };
+        let seek = solid.min_by(|&a, &b| dist(a).total_cmp(&dist(b))).map(|k| {
+            let (wall, d) = (self.centre(k), dist(k));
+            // Already against it: no drive, only what the brushes reach from the start.
+            let t = if d > BODY_RADIUS {
+                (d - BODY_RADIUS) / d
+            } else {
+                0.0
+            };
+            let stop = (
+                start.0 + t * (wall.0 - start.0),
+                start.1 + t * (wall.1 - start.1),
+            );
+            (start, stop)
+        });
+        let seeking = |p: Point| seek.is_some_and(|s| distance_to_segment(p, s) <= brush_reach());
+        let n = self.cells.len();
+        let area = |cells: usize| cells as f32 * CELL * CELL;
+        let stray = (0..n).filter(|&k| self.cells[k] && middle(k) && !seeking(self.centre(k)));
+        (
+            area(stray.count()),
+            area((0..n).filter(|&k| middle(k)).count()),
+        )
     }
 
     fn mark(&mut self, p: Point) {
@@ -318,6 +427,11 @@ impl Swept {
     }
 }
 
+/// How far from the centre the brushes reach at some yaw (m): the side brush's far rim.
+fn brush_reach() -> f32 {
+    SIDE_BRUSH.0.hypot(SIDE_BRUSH.1) + SIDE_BRUSH_RADIUS
+}
+
 /// The longest time (s) the path stayed within `LOITER_RADIUS` of where it was: a stay
 /// starts when the path last got that far from the previous start.
 fn loiter(run: &Run) -> f32 {
@@ -337,7 +451,7 @@ fn loiter(run: &Run) -> f32 {
 pub fn score(scene: &Scene, run: &Run) -> Score {
     let swept = Swept::new(scene, run);
     let edges = scene.edges();
-    let (mut missed, mut length) = (0.0, 0.0);
+    let (mut missed, mut length, mut reached) = (0.0, 0.0, 0.0);
     let mut misses = Vec::new();
     for &((ax, ay), (bx, by)) in &edges {
         let len = (bx - ax).hypot(by - ay);
@@ -351,6 +465,9 @@ pub fn score(scene: &Scene, run: &Run) -> Score {
             };
             missed += depth * EDGE_STEP;
             length += EDGE_STEP;
+            if depth <= REACHED {
+                reached += EDGE_STEP;
+            }
             misses.push((at, inward, depth));
         }
     }
@@ -372,6 +489,8 @@ pub fn score(scene: &Scene, run: &Run) -> Score {
         );
         corners.push(swept.nearest(inside));
     }
+    let (stray_m2, middle_m2) =
+        (run.path.first()).map_or((0.0, 0.0), |&(x, y, _)| swept.stray((x, y)));
     let pockets: Vec<Point> = (swept.pockets().into_iter())
         .map(|k| swept.centre(k))
         .collect();
@@ -390,6 +509,10 @@ pub fn score(scene: &Scene, run: &Run) -> Score {
         corners,
         loiter: loiter(run),
         misses,
+        edge_m: length,
+        reached_m: reached,
+        middle_m2,
+        stray_m2,
     }
 }
 
@@ -421,6 +544,10 @@ pub fn to_json(scene: &Scene, run: &Run, score: &Score) -> Value {
         "misses": misses,
         "pockets": score.pockets,
         "pockets_m2": score.pockets_m2,
+        "lap_share": score.lap_share(),
+        "rate": score.rate(),
+        "middle_m2": score.middle_m2,
+        "stray_m2": score.stray_m2,
         "swept": score.swept,
         "side_brush": SIDE_BRUSH,
         "side_brush_radius": SIDE_BRUSH_RADIUS,
@@ -577,6 +704,54 @@ mod tests {
             })
             .collect();
         (scene, run)
+    }
+
+    #[test]
+    fn a_pass_along_one_wall_makes_that_share_of_the_lap_and_strays_nothing() {
+        // 1.4 m along the bottom. The side brush (centre 10.5 cm ahead, 9 cm off the wall)
+        // sweeps to within `REACHED` of it 6.7 cm either side of its centre: from x = 0.34
+        // to 1.87, 1.53 m of the 8 m round the room.
+        let (scene, run) = square(along(0.2));
+        let s = score(&scene, &run);
+        assert!((s.reached_m - 1.53).abs() < 0.02, "{}", s.reached_m);
+        assert!((s.edge_m - 8.0).abs() < 0.01, "{}", s.edge_m);
+        assert!((s.rate() - s.reached_m / run.seconds() * 60.0).abs() < 1e-3);
+        assert_eq!(s.stray_m2, 0.0);
+    }
+
+    #[test]
+    fn a_pass_through_the_middle_strays_but_for_the_drive_to_the_nearest_wall() {
+        // From (0.3, 1) the nearest wall is x = 0: that drive (to x = 0.175) and its brushes'
+        // 23 cm reach is not counted, out to x = 0.44–0.53 across the swept strip. The main
+        // brush's 16 cm and the side brush's 10.8 cm below it are, on to x = 1.65 (35 cm off
+        // the far wall): about 0.27 × 1.17 m.
+        let (scene, run) = square(along(1.0));
+        let s = score(&scene, &run);
+        assert!((s.stray_m2 - 0.31).abs() < 0.015, "{}", s.stray_m2);
+        // The middle is the room less 35 cm all round: 1.3 m square.
+        assert!((s.middle_m2 - 1.69).abs() < 0.03, "{}", s.middle_m2);
+    }
+
+    #[test]
+    fn starting_against_a_wall_there_is_no_drive_to_it() {
+        // 10 cm off the bottom wall, then straight up the middle at x = 1: what the brushes
+        // reach from the start is not counted, the rest of the climb through the middle is.
+        let mut path = vec![(1.0, 0.1, FRAC_PI_2)];
+        path.extend((100..=1000).map(|mm| (1.0, mm as f32 / 1000.0, FRAC_PI_2)));
+        let (scene, run) = square(path);
+        let s = score(&scene, &run);
+        assert!(s.stray_m2.is_finite() && s.stray_m2 > 0.1, "{}", s.stray_m2);
+    }
+
+    #[test]
+    fn clearance_is_the_distance_to_the_nearest_solid() {
+        let (scene, run) = square(along(1.0));
+        let swept = Swept::new(&scene, &run);
+        let clearance = swept.clearance();
+        for (p, want) in [((1.0, 1.0), 1.0), ((0.3, 1.0), 0.3), ((0.3, 0.2), 0.2)] {
+            let got = clearance[swept.index(p).unwrap()];
+            assert!((got - want).abs() < 0.015, "{p:?}: {got}");
+        }
     }
 
     #[test]

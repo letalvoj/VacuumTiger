@@ -166,9 +166,15 @@ pub fn polygon(corners: &[Point]) -> Vec<Segment> {
         .collect()
 }
 
+/// The distance from `p` to the segment; to its one point if it has no length.
 pub fn distance_to_segment(p: Point, ((ax, ay), (bx, by)): Segment) -> f32 {
     let (dx, dy) = (bx - ax, by - ay);
-    let t = (((p.0 - ax) * dx + (p.1 - ay) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+    let length2 = dx * dx + dy * dy;
+    let t = if length2 > 0.0 {
+        (((p.0 - ax) * dx + (p.1 - ay) * dy) / length2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     (p.0 - ax - t * dx).hypot(p.1 - ay - t * dy)
 }
 
