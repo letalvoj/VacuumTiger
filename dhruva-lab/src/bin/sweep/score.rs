@@ -3,12 +3,14 @@
 //! - the main brush is a 16 cm strip across the centre.
 //!
 //! The main term is the floor left along the edges. Each edge is sampled every centimetre,
-//! and each sample measures how far in from the wall the swept floor starts; their sum is
-//! the area missed. Corners report the distance from the corner to the nearest swept floor.
+//! and each sample measures how far in from the wall the swept floor starts, past the floor
+//! no brush can reach (from a pose the body fits at, at any yaw); their sum is the area
+//! missed. A sample with no reachable floor within `MAX_MISS` is not scored. Corners report
+//! the distance from the corner to the nearest swept floor.
 //!
-//! Pockets are unswept floor the path closed round, away from the room's sides, too small
-//! for the body: inside a loop round a leg, say. Sweeping them later means coming back for
-//! each, so they cost more than the open middle the lanes will sweep.
+//! Pockets are reachable unswept floor the path closed round, away from the room's sides,
+//! too small for the body: inside a loop round a leg, say. Sweeping them later means coming
+//! back for each, so they cost more than the open middle the lanes will sweep.
 
 use serde_json::{Value, json};
 
@@ -45,7 +47,7 @@ pub struct Score {
     pub bumps: usize,
     /// Floor left unswept along the edges (m²), each sample capped at `MAX_MISS` deep…
     pub missed_m2: f32,
-    /// …and per metre of edge (m): the mean depth of the miss.
+    /// …and per metre of edge scored (m): the mean depth of the miss.
     pub missed_depth: f32,
     /// Distance from each inner corner to the nearest swept floor (m), in edge order.
     pub corners: Vec<f32>,
@@ -57,7 +59,7 @@ pub struct Score {
     pub swept: Vec<Point>,
     /// The longest time the path stayed within `LOITER_RADIUS` of a point (s).
     pub loiter: f32,
-    /// Every edge sample: where it is, the inward normal, and how deep the miss is (m).
+    /// Every edge sample scored: where it is, the inward normal, and how deep the miss is (m).
     pub misses: Vec<(Point, Point, f32)>,
 }
 
@@ -75,8 +77,11 @@ struct Swept {
     height: usize,
     /// Cells in the room…
     room: Vec<bool>,
-    /// …and its floor.
+    /// …its floor…
     floor: Vec<bool>,
+    /// …and the floor a brush can reach: from a pose the body fits at, joined to where the
+    /// path went, at any yaw.
+    reach: Vec<bool>,
     cells: Vec<bool>,
 }
 
@@ -95,6 +100,7 @@ impl Swept {
             height,
             room: Vec::new(),
             floor: Vec::new(),
+            reach: Vec::new(),
             cells: vec![false; width * height],
         };
         let centres: Vec<Point> = (0..width * height).map(|k| swept.centre(k)).collect();
@@ -113,6 +119,11 @@ impl Swept {
                 across += CELL;
             }
         }
+        swept.reach = if run.path.is_empty() {
+            swept.floor.clone()
+        } else {
+            swept.reachable(&run.path)
+        };
         swept
     }
 
@@ -139,13 +150,36 @@ impl Swept {
         js.flat_map(move |j| is.clone().map(move |i| j * self.width + i))
     }
 
-    /// The pockets' cells. Unswept floor is split into patches (4-connected) with the swept
-    /// floor grown by `GAP` first, which closes narrow gaps in a loop and drops specks; a
-    /// patch is a pocket if it does not touch the room's sides and has less area than the
-    /// body (shrunk by `GAP` too). Its cells are the patch grown back by `GAP` over unswept
-    /// floor.
+    /// The cells whose centres are within `r` (m) of `k`'s.
+    fn within(&self, k: usize, r: f32) -> impl Iterator<Item = usize> + '_ {
+        let c = self.centre(k);
+        self.around(k, (r / CELL).ceil() as usize)
+            .filter(move |&m| {
+                let p = self.centre(m);
+                (p.0 - c.0).hypot(p.1 - c.1) <= r
+            })
+    }
+
+    /// The 4-connected neighbours of `k`.
+    fn neighbours(&self, k: usize) -> impl Iterator<Item = usize> {
+        let (i, j, w) = (k % self.width, k / self.width, self.width);
+        [
+            (i > 0).then(|| k - 1),
+            (i + 1 < w).then(|| k + 1),
+            (j > 0).then(|| k - w),
+            (j + 1 < self.height).then(|| k + w),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    /// The pockets' cells. Reachable unswept floor is split into patches (4-connected) with
+    /// the swept floor grown by `GAP` first, which closes narrow gaps in a loop and drops
+    /// specks; a patch is a pocket if it touches neither the room's sides nor floor out of
+    /// reach (the edge, which is scored as missed) and has less area than the body (shrunk
+    /// by `GAP` too). Its cells are the patch grown back by `GAP` over unswept floor.
     fn pockets(&self) -> Vec<usize> {
-        let unswept = |k: usize| self.floor[k] && !self.cells[k];
+        let unswept = |k: usize| self.reach[k] && !self.cells[k];
         let body = std::f32::consts::PI * (BODY_RADIUS - GAP as f32 * CELL).powi(2);
         let open: Vec<bool> = (0..self.cells.len())
             .map(|k| unswept(k) && !self.around(k, GAP).any(|n| self.cells[n]))
@@ -160,15 +194,8 @@ impl Swept {
             let (mut patch, mut todo, mut walled) = (Vec::new(), vec![start], false);
             while let Some(k) = todo.pop() {
                 patch.push(k);
-                let (i, j) = (k % self.width, k / self.width);
-                let neighbours = [
-                    (i > 0).then(|| k - 1),
-                    (i + 1 < self.width).then(|| k + 1),
-                    (j > 0).then(|| k - self.width),
-                    (j + 1 < self.height).then(|| k + self.width),
-                ];
-                for n in neighbours.into_iter().flatten() {
-                    walled |= !self.room[n];
+                for n in self.neighbours(k) {
+                    walled |= !self.room[n] || (self.floor[n] && !self.reach[n]);
                     if !seen[n] && open[n] {
                         seen[n] = true;
                         todo.push(n);
@@ -184,6 +211,51 @@ impl Swept {
             }
         }
         (0..pocket.len()).filter(|&k| pocket[k]).collect()
+    }
+
+    /// The floor a brush can reach: from the centres the body fits at (no solid cell within
+    /// `BODY_RADIUS`) joined (4-connected) to where `path` went, at any yaw, and what was
+    /// swept. Like `mark`, it reaches through a wall thin enough.
+    fn reachable(&self, path: &[(f32, f32, f32)]) -> Vec<bool> {
+        let n = self.cells.len();
+        // Solid cells next to floor bar the centres within the body's radius.
+        let mut barred = vec![false; n];
+        for k in (0..n).filter(|&k| !self.floor[k]) {
+            if self.around(k, 1).any(|m| self.floor[m]) {
+                for m in self.within(k, BODY_RADIUS) {
+                    barred[m] = true;
+                }
+            }
+        }
+        let mut joined = vec![false; n];
+        let mut todo = Vec::new();
+        for k in path.iter().filter_map(|&(x, y, _)| self.index((x, y))) {
+            if self.floor[k] && !joined[k] {
+                joined[k] = true;
+                todo.push(k);
+            }
+        }
+        while let Some(k) = todo.pop() {
+            for m in self.neighbours(k) {
+                if !joined[m] && self.floor[m] && !barred[m] {
+                    joined[m] = true;
+                    todo.push(m);
+                }
+            }
+        }
+        // At some yaw the side brush's far rim is this far from the centre, past the main
+        // brush. A point that far from a centre inside the joined region is as near to one
+        // on its rim, so only the rim is grown.
+        let far = SIDE_BRUSH.0.hypot(SIDE_BRUSH.1) + SIDE_BRUSH_RADIUS;
+        let mut reach: Vec<bool> = (0..n).map(|k| joined[k] || self.cells[k]).collect();
+        for k in (0..n).filter(|&k| joined[k]) {
+            if self.around(k, 1).any(|m| !joined[m]) {
+                for m in self.within(k, far) {
+                    reach[m] |= self.floor[m];
+                }
+            }
+        }
+        reach
     }
 
     fn mark(&mut self, p: Point) {
@@ -208,16 +280,25 @@ impl Swept {
         self.index(p).is_some_and(|i| self.cells[i])
     }
 
-    /// How far from `p` along `dir` (unit) the swept floor starts, up to `MAX_MISS`.
-    fn miss(&self, p: Point, dir: Point) -> f32 {
+    /// How far from `p` along `dir` (unit) the first floor that `cells` holds lies, up to
+    /// `MAX_MISS`.
+    fn first(&self, cells: &[bool], p: Point, dir: Point) -> f32 {
         let mut d = 0.0;
         while d < MAX_MISS {
-            if self.swept((p.0 + d * dir.0, p.1 + d * dir.1)) {
+            let at = (p.0 + d * dir.0, p.1 + d * dir.1);
+            if self.index(at).is_some_and(|i| cells[i]) {
                 return d;
             }
             d += CELL / 2.0;
         }
         MAX_MISS
+    }
+
+    /// How deep the floor left unswept from `p` along `dir` (unit) is, past the floor no
+    /// brush can reach; `None` with no reachable floor within `MAX_MISS`.
+    fn miss(&self, p: Point, dir: Point) -> Option<f32> {
+        let from = self.first(&self.reach, p, dir);
+        (from < MAX_MISS).then(|| self.first(&self.cells, p, dir) - from)
     }
 
     /// Distance from `p` to the nearest swept cell, up to `MAX_MISS`.
@@ -265,11 +346,13 @@ pub fn score(scene: &Scene, run: &Run) -> Score {
         for i in 0..(len / EDGE_STEP) as usize {
             let s = (i as f32 + 0.5) * EDGE_STEP;
             let at = (ax + s * ux, ay + s * uy);
-            let depth = swept.miss(at, inward);
+            let Some(depth) = swept.miss(at, inward) else {
+                continue;
+            };
             missed += depth * EDGE_STEP;
+            length += EDGE_STEP;
             misses.push((at, inward, depth));
         }
-        length += len;
     }
     // A corner is where an edge ends and the next starts, turning left (inner).
     let mut corners = Vec::new();
@@ -371,6 +454,32 @@ mod tests {
         (300..=1700)
             .map(|mm| (mm as f32 / 1000.0, y, 0.0))
             .collect()
+    }
+
+    #[test]
+    fn floor_no_pose_can_reach_is_not_missed() {
+        // A 40 cm block 25 cm off the bottom wall: the body (35 cm) can't get under it, and
+        // the brushes reach 23 cm, so the floor under its middle is out of reach.
+        let (mut scene, run) = square(along(1.0));
+        scene.legs.push(((1.0, 0.45), 0.4));
+        let s = score(&scene, &run);
+        let under = |x: f32| {
+            (s.misses.iter())
+                .find(|((mx, my), _, _)| *my == 0.0 && (mx - x).abs() < 0.006)
+                .map(|m| m.2)
+        };
+        assert_eq!(under(1.0), None, "under the block: not scored");
+        // The open wall is reachable and the pass along y = 1 never came near it.
+        assert_eq!(under(0.2), Some(MAX_MISS));
+    }
+
+    #[test]
+    fn a_path_starting_against_a_wall_still_scores_the_edges() {
+        // Centre 10 cm off the bottom wall: closer than the body fits.
+        let (scene, run) = square(along(0.1));
+        let s = score(&scene, &run);
+        assert!(s.missed_depth > 0.0, "the far walls are missed");
+        assert!(s.misses.iter().any(|((_, y), _, _)| *y == 0.0));
     }
 
     #[test]
