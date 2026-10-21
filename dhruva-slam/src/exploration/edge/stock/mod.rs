@@ -35,7 +35,9 @@
 //! `stock_follow_fix` is the same but for a wall the lidar sees short of where it is (an
 //! overhang, a kick board): a bump on the wall side moves the wall-side gaps in by what they
 //! still read, for [`BUMPED_REACH`] past the last such bump, and it follows loose meanwhile,
-//! since rubbing that wall is a bump each time.
+//! since rubbing that wall is a bump each time. And once bumps loosened it, it stays loose
+//! for the run: what made it bump (the lidar's range bias, baseboards) does not stop at a
+//! corner, and tight again it bumps its way loose round every one.
 
 mod actions;
 mod gaps;
@@ -145,6 +147,9 @@ pub struct StockFollowConfig {
     /// `build_exploration` from the strategy).
     #[serde(skip)]
     pub overhangs: bool,
+    /// `stock_follow_fix`: once loose, loose for the run (set like `overhangs`).
+    #[serde(skip)]
+    pub stays_loose: bool,
 }
 
 impl Default for StockFollowConfig {
@@ -158,6 +163,7 @@ impl Default for StockFollowConfig {
             optical_offset: 0.0,
             tick: 0.1,
             overhangs: false,
+            stays_loose: false,
         }
     }
 }
@@ -204,20 +210,26 @@ struct Baseboard {
     left_only: u32,
     /// The heading when it went loose (rad).
     heading: f32,
+    /// `stock_follow_fix`: once loose, loose for the rest of the run.
+    stays_loose: bool,
 }
 
 impl Baseboard {
-    fn new() -> Self {
+    fn new(stays_loose: bool) -> Self {
         Self {
             tight: true,
             bumps: 0,
             left_only: 0,
             heading: 0.0,
+            stays_loose,
         }
     }
 
+    /// Tight again, the bumps forgotten; never if it stays loose.
     fn tighten(&mut self) {
-        *self = Self::new();
+        if !self.stays_loose {
+            *self = Self::new(false);
+        }
     }
 
     /// One update with the line flags (`updateState`); whether to restart following.
@@ -230,6 +242,7 @@ impl Baseboard {
                     bumps: 0,
                     left_only: 0,
                     heading,
+                    ..*self
                 };
             }
             return false;
@@ -237,8 +250,9 @@ impl Baseboard {
         if left && !right && following {
             self.left_only += 1;
             if self.left_only > LEFT_ONLY_UPDATES {
+                // Staying loose, it never left following: nothing to restart.
                 self.tighten();
-                return true;
+                return !self.stays_loose;
             }
         } else if angle_diff(self.heading, heading).abs() > CORNER {
             self.tighten();
@@ -332,7 +346,7 @@ impl StockFollower {
             arc_angle: ARC_ANGLE,
             quarter_arc: false,
             quarter_arcs: 0,
-            baseboard: Baseboard::new(),
+            baseboard: Baseboard::new(config.stays_loose),
             watchdogs: Watchdogs::default(),
             travel: Travel::default(),
             lap: Lap::new(config.lap_radius, config.lap_overlap),
@@ -951,10 +965,27 @@ mod tests {
     }
 
     #[test]
+    fn the_fix_stays_loose_round_corners_and_bumps() {
+        let mut b = Baseboard {
+            bumps: LOOSE_BUMPS + 1,
+            ..Baseboard::new(true)
+        };
+        b.update(true, false, 0.0, true);
+        assert!(!b.tight, "loose");
+        b.update(false, false, 1.0, true);
+        assert!(!b.tight, "past a corner");
+        for _ in 0..=LEFT_ONLY_UPDATES {
+            assert!(!b.update(false, true, 1.0, true), "no restart");
+        }
+        b.tighten();
+        assert!(!b.tight, "a bump while loose");
+    }
+
+    #[test]
     fn left_only_lines_tighten_it_only_while_following() {
         let loose = Baseboard {
             tight: false,
-            ..Baseboard::new()
+            ..Baseboard::new(false)
         };
         let mut b = loose;
         for _ in 0..=LEFT_ONLY_UPDATES {

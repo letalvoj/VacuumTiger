@@ -819,6 +819,7 @@ pub fn build_exploration(config: &Config) -> (ExplorationConfig, Box<dyn Explora
                 optical_offset: config.lidar.optical_offset,
                 tick: 1.0 / exploration.loop_rate_hz,
                 overhangs: exploration.strategy == StrategyKind::StockFollowFix,
+                stays_loose: exploration.strategy == StrategyKind::StockFollowFix,
                 ..exploration.stock_follow
             }))
         }
