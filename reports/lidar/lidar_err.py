@@ -10,7 +10,7 @@ SLAM's final trajectory), the robot's own SangamIO recordings of them (`data/`,
 
 A  static noise: per-beam std of range while the wheels stand still, against range.
 B  bumper presses: the gap the lidar reports between the shell and the nearest thing on the
-   pressed side, right after the press (0 = no bias).
+   pressed side, moved back to where the robot was at the press (0 = no bias).
 C  range-dependent bias: with SLAM's final poses, each point's offset (along its beam) from the
    local surface built from other scans, against how much farther it was seen than they were.
 """
@@ -25,6 +25,11 @@ import numpy as np
 LASER_X = -0.105  # dhruva-v8.toml / viomi_v8.toml: the lidar 10.5 cm behind the centre
 SHELL_R = 0.175
 OPTICAL = 0.025  # dhruva-v8.toml: added to every range
+# A press on something the lidar sees leaves a raw return this near the shell (glass and
+# overhangs leave none).
+SEEN_GAP = 0.03
+# The scan after a press is used if it came this soon (us).
+MAX_LATENCY_US = 0.3e6
 # Aborted before the lidar came up.
 SKIP = ("sweep4_1783a9",)
 
@@ -99,34 +104,42 @@ def static_noise(status, scans, kin):
     return np.array(rows)
 
 
-def bump_gaps(status, scans):
-    """Per press: the gap (m) between the shell and the nearest return on the pressed side,
-    and the side (L, R, B). Not corrected for the bumper's travel, nor for the robot moving
-    between the press and the scan."""
+def bump_gaps(status, scans, kin):
+    """Per press: the gap (m) between the resting shell and the nearest raw return on the
+    pressed side, its bearing (deg) and the side (L, R, B). From the first scan stamped after
+    the press, moved back to where the robot was at the press by the wheels' forward
+    distance in between (it turns on the spot and backs off; turning does not change a gap
+    to a round shell centred on the pivot; the scan is not deskewed). Not corrected for the
+    bumper's travel: the wall is that much nearer."""
+    wrap = 1 << int(kin["wheel_tick_bits"])
+    ticks = (np.diff(status[:, 1:3], axis=0) + wrap / 2) % wrap - wrap / 2
+    travelled = np.r_[0, np.cumsum(ticks.mean(axis=1)) * kin["wheel_m_per_tick"]]
     out = []
     press = (status[1:, 3] > status[:-1, 3]) | (status[1:, 4] > status[:-1, 4])
     scan_t = np.array([t for t, _ in scans])
     for k in np.nonzero(press)[0] + 1:
         t = status[k, 0]
         left, right = status[k, 3] > 0, status[k, 4] > 0
-        j = np.searchsorted(scan_t, t + 0.12e6)  # a scan started after the stop
-        if j >= len(scans) or scan_t[j] - t > 0.5e6:
+        j = np.searchsorted(scan_t, t)
+        if j >= len(scans) or scan_t[j] - t > MAX_LATENCY_US:
             continue
         sc = scans[j][1]
         sc = sc[(sc[:, 1] >= 0.15) & (sc[:, 1] < 0.6)]
-        r = sc[:, 1] + OPTICAL
-        x, y = LASER_X + r * np.cos(sc[:, 0]), r * np.sin(sc[:, 0])
-        bearing = np.degrees(np.arctan2(y, x))
+        x, y = LASER_X + sc[:, 1] * np.cos(sc[:, 0]), sc[:, 1] * np.sin(sc[:, 0])
+        bearing = np.arctan2(y, x)
+        deg = np.degrees(bearing)
         if left and right:
-            sel = np.abs(bearing) < 45
+            sel = np.abs(deg) < 45
         elif left:
-            sel = (bearing > 0) & (bearing < 90)
+            sel = (deg > 0) & (deg < 90)
         else:
-            sel = (bearing < 0) & (bearing > -90)
+            sel = (deg < 0) & (deg > -90)
         if sel.sum() < 3:
             continue
-        gap = np.hypot(x[sel], y[sel]) - SHELL_R
-        out.append((np.sort(gap)[1], "LR"[int(not left)] if left != right else "B"))  # 2nd nearest
+        forward = np.interp(scan_t[j], status[:, 0], travelled) - travelled[k]
+        gap = (np.hypot(x, y) - SHELL_R + forward * np.cos(bearing))[sel]
+        i = np.argsort(gap)[1]  # the 2nd nearest, against a stray point
+        out.append((gap[i], deg[sel][i], "LR"[int(not left)] if left != right else "B"))
     return out
 
 
@@ -200,27 +213,34 @@ def plot_static(ax, st):
 
 
 def plot_gaps(ax, gaps):
-    g = np.array([x for _, x, _ in gaps]) * 100
-    near = g[g < 5.5]
-    print(f"bump gaps: n={len(g)} median {np.median(g):.2f} cm, "
-          f"IQR {np.percentile(g, 25):.2f}..{np.percentile(g, 75):.2f}")
-    print(f"  on what the lidar sees (< 5.5 cm): n={len(near)} median {np.median(near):.2f} "
-          f"mean {near.mean():.2f} std {near.std():.2f} cm")
-    by = {}
-    for name, x, _ in gaps:
-        if x * 100 < 5.5:
-            by.setdefault(name, []).append(x * 100)
-    for name, v in by.items():
-        print(f"  {name}: n={len(v)} median {np.median(v):.2f} cm")
+    g = np.array([x for _, x, _, _ in gaps]) * 100
+    print(f"bump gaps (raw ranges): n={len(g)} median {np.median(g):+.2f} cm, "
+          f"IQR {np.percentile(g, 25):+.2f}..{np.percentile(g, 75):+.2f}")
+    # What was hit is beyond the lidar's sight (glass, an overhang) when nothing is near.
+    seen = [x for x in gaps if x[1] < SEEN_GAP]
+    near = np.array([x for _, x, _, _ in seen]) * 100
+    print(f"  on what the lidar sees (< {SEEN_GAP * 100:.0f} cm): n={len(near)} "
+          f"median {np.median(near):+.2f} mean {near.mean():+.2f} std {near.std():.2f} cm")
+    groups = {}
+    for name, x, deg, side in seen:
+        groups.setdefault(name, []).append(x * 100)
+        groups.setdefault(f"side {side}", []).append(x * 100)
+        lo = min(int(abs(deg) // 30), 2) * 30
+        groups.setdefault(f"|bearing| {lo}-{lo + 30} deg", []).append(x * 100)
+    for key, v in sorted(groups.items()):
+        print(f"  {key}: n={len(v)} median {np.median(v):+.2f} cm")
     bins = np.arange(-3, 8, 0.25)
     off = OPTICAL * 100
-    ax.hist(g - off, bins=bins, alpha=0.6, label=f"raw ranges: median {np.median(g) - off:+.2f} cm")
-    ax.hist(g, bins=bins, alpha=0.6,
-            label=f"+2.5 cm optical offset (dhruva-v8.toml): median {np.median(g):+.2f} cm")
+    m = np.median(near)
+    ax.hist(g, bins=bins, alpha=0.6, label=f"raw ranges: median {m:+.2f} cm")
+    ax.hist(g + off, bins=bins, alpha=0.6,
+            label=f"+2.5 cm optical offset (dhruva-v8.toml): median {m + off:+.2f} cm")
+    ax.plot([], [], " ", label=f"all {len(g)} presses; medians of the {len(near)} under "
+                               f"{SEEN_GAP * 100:.0f} cm raw")
     ax.axvline(0, color="k")
     ax.legend(fontsize=8)
     ax.set(xlabel="lidar's gap from shell to nearest return on the pressed side (cm)",
-           ylabel="presses", title="B. At a bumper press (0 = no bias)")
+           ylabel="presses", title="B. At a bumper press, motion compensated (0 = no bias)")
 
 
 def plot_range_bias(ax, rb):
@@ -275,7 +295,7 @@ def main():
             continue
         name = run.split("_")[1]
         st = static_noise(status, scans, kin)
-        g = bump_gaps(status, scans)
+        g = bump_gaps(status, scans, kin)
         traj = f"{cat}/{run}/traj_final.csv"
         rb = range_bias(status, scans, kin, traj) if os.path.exists(traj) else np.empty((0, 3))
         slope = (f", slope {np.polyfit(rb[:, 0] - rb[:, 1], rb[:, 2], 1)[0] * 1000:+.1f} mm/m"
@@ -284,7 +304,7 @@ def main():
               f"{len(rb)} surface points{slope}", flush=True)
         if len(st):
             static.append(st)
-        gaps += [(name, x, side) for x, side in g]
+        gaps += [(name, *x) for x in g]
         if len(rb):
             rbs.append(rb)
 

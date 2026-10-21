@@ -1,7 +1,7 @@
 web: 2150 scans, 306 still beams, 1 presses, 353 surface points, slope -7.6 mm/m
 sweep1: 12241 scans, 538 still beams, 17 presses, 1436 surface points, slope +130.1 mm/m
 sweep2: 1251 scans, 229 still beams, 0 presses, 1701 surface points, slope +135.5 mm/m
-sweep4: 1026 scans, 213 still beams, 5 presses, 151 surface points, slope +217.8 mm/m
+sweep4: 1026 scans, 213 still beams, 6 presses, 151 surface points, slope +217.8 mm/m
 sweep5: 1254 scans, 497 still beams, 11 presses, 1589 surface points, slope -21.6 mm/m
 sweep6: 1354 scans, 215 still beams, 13 presses, 0 surface points
 sweep7: 1425 scans, 0 still beams, 9 presses, 0 surface points
@@ -17,15 +17,21 @@ static std by range: mid, median std mm, p90 mm, beams
   3.50 m  4.85  15.04  134
   5.00 m  2.97  17.46  126
   7.00 m  4.71  13.24  35
-bump gaps: n=70 median 2.96 cm, IQR 2.29..3.57
-  on what the lidar sees (< 5.5 cm): n=60 median 2.86 mean 2.75 std 0.90 cm
-  web: n=1 median 2.71 cm
-  sweep1: n=17 median 3.34 cm
-  sweep4: n=5 median 2.80 cm
-  sweep5: n=11 median 2.96 cm
-  sweep6: n=7 median 2.09 cm
-  sweep7: n=5 median 2.68 cm
-  sweep8: n=14 median 2.89 cm
+bump gaps (raw ranges): n=71 median +0.91 cm, IQR +0.34..+1.38
+  on what the lidar sees (< 3 cm): n=60 median +0.79 mean +0.65 std 0.77 cm
+  side B: n=4 median +0.31 cm
+  side L: n=30 median +0.82 cm
+  side R: n=26 median +0.82 cm
+  sweep1: n=17 median +0.86 cm
+  sweep4: n=5 median +0.94 cm
+  sweep5: n=11 median +0.94 cm
+  sweep6: n=7 median +0.42 cm
+  sweep7: n=5 median +0.30 cm
+  sweep8: n=14 median +0.61 cm
+  web: n=1 median +0.39 cm
+  |bearing| 0-30 deg: n=33 median +0.94 cm
+  |bearing| 30-60 deg: n=17 median +0.41 cm
+  |bearing| 60-90 deg: n=10 median +0.32 cm
 range bias slope: -14.28 mm per m farther (n=5230), resid std 6.3 mm
   dr -0.25 m: median -0.2 mm (IQR -1.7..+1.8)
   dr +0.25 m: median +0.6 mm (IQR -0.9..+2.7)

@@ -22,24 +22,42 @@ is about right up close and generous beyond.
 
 ## B. Bias at a bumper press
 
-At each press (70 in 7 runs), the next scan's nearest return on the pressed side gives the
-gap from the shell (r 17.5 cm, lidar 10.5 cm behind the centre). The second-nearest return
-is used, against stray points. The gap is computed as dhruva-slam does it, with
-`optical_offset` 0.025 added to every range. On the 60 presses where the lidar sees what was
-hit (a gap under 5.5 cm):
+At each press (71 in 7 runs), take the first scan stamped after it, within 0.3 s. On the
+pressed side, the nearest raw return gives the gap from the resting shell (r 17.5 cm, lidar
+10.5 cm behind the centre). The second-nearest return is used, against stray points. After
+a press the robot turns on the spot and backs off at a few cm/s. Turning does not change a
+gap to a round shell centred on the pivot, so each beam is moved back by the wheels'
+forward distance since the press. The scan is not deskewed. On the 60 presses where the
+lidar sees what was hit (a raw gap under 3 cm):
 
-- **median +2.9 cm, std 0.9 cm** with the offset: walls look 2.9 cm farther than the shell
-  that is touching them;
-- so **about +0.4 cm on raw ranges**;
-- consistent across runs, per-run medians 2.1-3.3 cm. It is systematic, not noise.
+- **median +0.8 cm, std 0.8 cm on raw ranges**: the wall looks 0.8 cm beyond the resting
+  shell. All 71 presses give +0.9 cm, since the cut is on the outcome;
+- **+3.3 cm as dhruva-slam sees it**, since `dhruva-v8.toml` adds `optical_offset` 0.025 to
+  every range;
+- the same left and right (+0.82 / +0.82 cm), and +0.3 to +0.9 cm per run;
+- front contacts read more than side ones: +0.94 cm within 30° (n=33), +0.3-0.4 cm beyond
+  (n=27). A lidar 11 cm behind the centre instead of 10.5 would do that (`dhruva-onboard.toml`
+  has 11), and so would more bumper travel head-on or a shell that is not quite round.
+  These bands are small.
 
-Not accounted for yet:
+One-off checks in a scratch variant, not in the script:
+- The beam timing matters by ±0.2 cm. Taking the stamp as the start, middle or end of the
+  revolution gives +0.6 to +0.8 cm from the scan after the press, and +0.4 to +1.3 cm from
+  the scan before it.
+- The previous version of this script gave +0.36 cm on the same 60-press cut. It used a
+  scan ≥ 0.12 s after the press and no motion compensation, while the robot was already
+  backing off.
+
+Still not accounted for:
 - **Bumper travel.** The shell moves in a few mm before the switch closes, so at a press the
-  wall is that much inside the resting shell. The true bias is the measured gap plus the
-  travel, so ignoring it would make the follower rub.
-- **Motion.** The robot keeps moving or starts backing off between the press and the
-  scan (0.12-0.5 s later).
+  wall is that much inside the resting shell. The bias is the gap above plus the travel: with
+  5 mm of travel, raw ranges read about 1.3 cm long. Leaving it out would make a follower
+  calibrated on presses rub.
 - **What was hit.** A baseboard or a chair rail the lidar sees behind the contact reads long.
+
+Also tried once, in scratch: fitting the offset from how a straight wall bows (a radial
+error δ bends it by δ(1−cos θ)). The recordings have too few still scans beside long
+straight walls; most still time is at the dock. It needs a capture made for it.
 
 ## C. Range-dependent bias
 
@@ -60,13 +78,36 @@ range per spot is small (most within ±0.5 m).
 
 ## What it means
 
-- The error is a constant offset, not noise and not range-dependent. A once-per-robot
-  calibration fixes it, or an online estimate from bumps.
-- The bench's ±1 cm per seed is the right shape. But the real robot may sit near +2.9 cm with
-  today's config: walls look farther than they are, which makes it rub.
-- Before changing `optical_offset`: compensate the press for motion, put a number on the
-  bumper travel, and check against a tape measure. Two other routes are a straight wall's
-  curvature (a wrong radial offset bows it) and the vendor's own value.
+Measured:
+- The error near the shell is a constant offset: the same in every run and on both sides.
+  Within 1 m the noise is a millimetre.
+- On raw ranges, the wall at a press looks 0.8 cm beyond the resting shell. In dhruva-slam,
+  which adds 2.5 cm, it looks 3.3 cm beyond.
+
+Assumed:
+- The shell's radius is 17.5 cm and the lidar sits 10.5 cm behind the centre. All the presses
+  are at 0.2-0.3 m, so they cannot tell a range offset from an error in these. A 1 cm wrong
+  radius looks the same as a 1 cm range offset.
+- The bumper's travel, a few mm, is not measured. It adds to the offset.
+
+So, if the geometry is right:
+- Raw ranges read 1-1.3 cm long, and `optical_offset` 0.025 makes it worse instead of
+  correcting it. Walls would be 3.3-3.8 cm nearer than dhruva-slam believes.
+- `optical_offset` is CRL-200S reference geometry, marked unverified on the v8 in both
+  configs. It is not where the lidar sits; that is `mounting_x`. It is a correction added to
+  every range. These presses alone do not give its value.
+- Why it seems to work anyway:
+  - SLAM barely cares. A constant radial error keeps scans consistent with each other; it
+    moves walls out, so a room looks up to ~7 cm wider, and bends them very slightly.
+  - The sweeps lean on the bumper: 6-17 presses a sweep run.
+  - stock_follow undoes the offset and works on raw ranges.
+- The bench's ±1 cm per seed is the right shape, perhaps around the wrong centre.
+
+To check, a tape test with the robot still and the lidar on:
+- a flat board touching the front, then at 5 and 10 cm, then the same at the side;
+- the front gives `mounting_x` + radius + offset, and the side gives radius + offset;
+- with the radius taped, that pins the offset and `mounting_x`, at more than one range;
+- pushing the shell in by hand until it clicks gives the travel.
 
 ## Run it
 
@@ -76,3 +117,10 @@ uv run -q --with numpy --with scipy --with matplotlib --with protobuf --with mca
 ```
 
 from `VacuumTiger/`; `--root` is the project around it (`captures/`, `data/`, `tools/py/`).
+
+## History
+
+- a6a0ead: first version; a press read +2.9 cm with the offset (+0.36 cm raw), no motion
+  compensation.
+- b8a544a: the scan right after the press, moved back by the wheels' distance; raw
+  ranges; per side, bearing and run.
