@@ -42,7 +42,8 @@ this), so two settings compare on equal noise. Scoring uses the **true** path, n
 | Gyro | 0.0100 °/s per LSB, deadband ±1 °/s in the MCU (dhruva-slam assumes 0.01025: the 2.5% gap is real) | recordings |
 | Lidar | Delta-2D: 360 beams per revolution at 6.03 Hz, clockwise, each beam cast from where the robot is when it is taken (motion skew). Mount 11 cm behind centre, 2.5 cm optical offset, 15 cm–8 m. Noise 0.5 mm + 3 mm/m, 5% dropped beams | recordings |
 | Bumpers | left and right arcs of the shell; pressed when the arc 1 cm out touches anything; a thin leg presses it | shell geometry; zones not yet confirmed on the robot |
-| Glass, overhangs | in the map but not in the lidar mask: solid to the body, invisible to the lidar | — |
+| Glass | in the map but not in the lidar mask: solid to the body, invisible to the lidar | — |
+| Overhangs | too low for the body: the room ends at the lip (the edge scored); the band behind it is solid but clear to the lidar, which sees what holds it up. The floor under it is not scored | — |
 | Curtain | a band of folds the body drives through; a beam crossing it returns with a probability, 27% of those dim | sweep7 (partly, see §5) |
 | People | Poisson legs round the lidar each revolution (`legs = 2` in `people`) | not measured |
 
@@ -79,7 +80,7 @@ left of every edge), obstacles, and a start pose by a wall with the wall on the 
 | `fin_thin` | round the end of a 2 cm partition (a desk side): a half turn about one point |
 | `fin_thick` | round a 40 cm block: two outer quarter turns, a short side between |
 | `leg` | a 3 cm leg too near the wall to pass behind |
-| `cabinet` | a plinth whose top overhangs it by 4 cm: the lidar sees the plinth, the shell meets the top |
+| `cabinet` | a plinth whose top overhangs it by 4 cm: the lidar sees the plinth, the shell meets the top, whose lip is the edge to sweep |
 | `lone_chair` | a chair 14 cm off the wall (sweep8): round its legs as one thing |
 | `chair_bar` | the same chair with a stretcher below the lidar: seen open, bumped |
 | `two_chairs` | two chairs 22 cm apart, narrower than the body: round both as one |
@@ -115,9 +116,8 @@ One point of `cost` buys any one of:
 
 A lap not closed costs 10.
 
-Floor no position of the robot can reach still counts as missed today, e.g. under an overhang
-deeper than the brush reaches. That makes a scene's floor nonzero for any strategy. Scoring only
-reachable floor is an open item.
+Floor no brush can reach from a pose the body fits at is not scored as missed, and the floor
+under an overhang is not floor at all (the lip is the edge).
 
 ## 5. Sim2real: where the bench and the robot differ
 

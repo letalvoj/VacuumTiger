@@ -527,6 +527,7 @@ pub fn to_json(scene: &Scene, run: &Run, score: &Score) -> Value {
         "name": scene.name,
         "walls": scene.walls(),
         "glass": scene.glass,
+        "overhangs": scene.overhangs,
         "curtains": curtains,
         "edges": scene.edges(),
         "path": path,

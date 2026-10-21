@@ -71,6 +71,11 @@ pub struct Scene {
     pub legs: Vec<(Point, f32)>,
     /// Solid but not seen by the lidar: glass, or something below it.
     pub glass: Vec<Segment>,
+    /// Overhangs too low for the body (a cabinet's top over its plinth): a stretch of the
+    /// room's side that is the lip, and how far behind it (m) the lidar sees what holds it
+    /// up. The body stops at the lip, so the lip is the edge to sweep; under it is not floor.
+    /// Unlike glass, the lip bounds the room.
+    pub overhangs: Vec<(Segment, f32)>,
     pub curtains: Vec<Curtain>,
     /// Where the robot starts: x, y (m), heading (rad).
     pub start: (f32, f32, f32),
@@ -86,6 +91,7 @@ impl Scene {
             room: room.to_vec(),
             legs: Vec::new(),
             glass: Vec::new(),
+            overhangs: Vec::new(),
             curtains: Vec::new(),
             start,
             seconds,
@@ -97,7 +103,8 @@ impl Scene {
         polygon(&self.room)
     }
 
-    /// Everything the lidar sees, as segments: the room's sides and the legs' outlines.
+    /// Everything the lidar sees, as segments: the room's sides (an overhang's lip in place
+    /// of what holds it up) and the legs' outlines.
     pub fn walls(&self) -> Vec<Segment> {
         let legs = self.legs.iter().flat_map(|&((x, y), side)| {
             let h = side / 2.0;
@@ -112,7 +119,8 @@ impl Scene {
     }
 
     /// The scene as the mock's map: wall outside the room, in the legs and along the
-    /// glass; a lidar mask that is clear along the glass and gray in the curtains.
+    /// glass; a lidar mask that is clear along the glass and under the overhangs, and gray
+    /// in the curtains.
     pub fn map(&self) -> SimulationMap {
         let (xs, ys): (Vec<f32>, Vec<f32>) = self.room.iter().copied().unzip();
         let lo = |v: &[f32]| v.iter().copied().fold(f32::INFINITY, f32::min) - MARGIN;
@@ -132,7 +140,7 @@ impl Scene {
         });
         let mask = GrayImage::from_fn(w, h, |px, py| {
             let p = centre(px, py);
-            let gray = if self.glass_at(p) {
+            let gray = if self.glass_at(p) || self.overhung(p) {
                 255
             } else if self.solid(p) {
                 0
@@ -156,6 +164,19 @@ impl Scene {
     /// Glass is the map cells it crosses or touches: one or two thick.
     fn glass_at(&self, p: Point) -> bool {
         self.glass.iter().any(|&g| distance_to_segment(p, g) < RES)
+    }
+
+    /// Whether `p` is under an overhang: behind its lip (on its right, out of the room
+    /// wound anticlockwise), not as deep as it.
+    fn overhung(&self, p: Point) -> bool {
+        (self.overhangs.iter()).any(|&(((ax, ay), (bx, by)), depth)| {
+            let len = (bx - ax).hypot(by - ay);
+            let u = ((bx - ax) / len, (by - ay) / len);
+            let (dx, dy) = (p.0 - ax, p.1 - ay);
+            let along = dx * u.0 + dy * u.1;
+            let behind = dx * u.1 - dy * u.0;
+            (0.0..=len).contains(&along) && 0.0 < behind && behind < depth
+        })
     }
 }
 
@@ -260,20 +281,16 @@ pub fn primitives() -> Vec<Scene> {
     out.push(scene);
 
     // A cabinet whose top overhangs its plinth by 4 cm: the lidar sees the plinth, the
-    // shell meets the top. Bumps all along unless it is kept off.
-    let cabinet = [
-        (0.0, 0.0),
-        (0.5, 0.0),
-        (0.5, 0.4),
-        (1.1, 0.4),
-        (1.1, 0.0),
-        (1.6, 0.0),
-        (1.6, 1.0),
-        (0.0, 1.0),
-    ];
-    let mut scene = quiet("cabinet", &cabinet, (0.3, 0.8, 0.0), 120.0);
+    // shell meets the top. Bumps all along unless it is kept off. The floor ends at the
+    // top's lip: under it the body cannot go.
     let lid = [(0.46, 0.0), (0.46, 0.44), (1.14, 0.44), (1.14, 0.0)];
-    scene.glass.extend(lid.windows(2).map(|w| (w[0], w[1])));
+    let mut cabinet = vec![(0.0, 0.0)];
+    cabinet.extend(lid);
+    cabinet.extend([(1.6, 0.0), (1.6, 1.0), (0.0, 1.0)]);
+    let mut scene = quiet("cabinet", &cabinet, (0.3, 0.8, 0.0), 120.0);
+    scene
+        .overhangs
+        .extend(lid.windows(2).map(|w| ((w[0], w[1]), 0.04)));
     out.push(scene);
 
     // Chairs (39 x 37 cm outside, 2.5 cm legs) 14 cm off the bottom wall, as in sweep8:
@@ -495,6 +512,29 @@ mod tests {
         assert!(map.is_occupied(0.3, 1.2));
         assert_eq!(map.lidar_opacity(0.3, 1.2), 0.0, "glass is clear");
         assert_eq!(map.lidar_opacity(-0.1, 1.0), 1.0, "a wall is not");
+    }
+
+    #[test]
+    fn under_an_overhang_is_solid_and_clear_to_the_plinth() {
+        let cabinet = (primitives().into_iter())
+            .find(|s| s.name == "cabinet")
+            .unwrap();
+        let map = cabinet.map();
+        assert!(!map.is_occupied(0.455, 0.2), "floor up to the lip");
+        // Every cell of the 4 cm band, and the corner where two lips meet.
+        for p in [
+            (0.465, 0.2),
+            (0.495, 0.2),
+            (0.8, 0.435),
+            (0.8, 0.405),
+            (0.48, 0.42),
+        ] {
+            assert!(map.is_occupied(p.0, p.1), "under the top at {p:?}");
+            assert_eq!(map.lidar_opacity(p.0, p.1), 0.0, "seen through at {p:?}");
+        }
+        for p in [(0.505, 0.2), (0.8, 0.395)] {
+            assert_eq!(map.lidar_opacity(p.0, p.1), 1.0, "the plinth at {p:?}");
+        }
     }
 
     #[test]
