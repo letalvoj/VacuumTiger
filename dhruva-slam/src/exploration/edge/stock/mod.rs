@@ -188,8 +188,9 @@ impl Baseboard {
         *self = Self::new();
     }
 
-    /// One update with the line flags; whether to restart following.
-    fn update(&mut self, right: bool, left: bool, heading: f32) -> bool {
+    /// One update with the line flags (`updateState`); whether to restart following.
+    /// Loose, a left-only line counts while `following`; any other tick checks for a corner.
+    fn update(&mut self, right: bool, left: bool, heading: f32, following: bool) -> bool {
         if self.tight {
             if right && !left && self.bumps > LOOSE_BUMPS {
                 *self = Self {
@@ -201,12 +202,13 @@ impl Baseboard {
             }
             return false;
         }
-        self.left_only += u32::from(left && !right);
-        if self.left_only > LEFT_ONLY_UPDATES {
-            self.tighten();
-            return true;
-        }
-        if angle_diff(self.heading, heading).abs() > CORNER {
+        if left && !right && following {
+            self.left_only += 1;
+            if self.left_only > LEFT_ONLY_UPDATES {
+                self.tighten();
+                return true;
+            }
+        } else if angle_diff(self.heading, heading).abs() > CORNER {
             self.tighten();
         }
         false
@@ -355,10 +357,10 @@ impl StockFollower {
             // BackAlign is not failed through: it goes on to its turn either way.
             Action::BackAlign { .. } => return Action::rotation(self.recovery.step),
             Action::Follow { .. } => {
+                // A bump counts while tight; loose, it only tightens, which zeroes the bumps.
                 if !self.baseboard.tight {
                     self.baseboard.tighten();
-                }
-                if let Cause::Bumper(_) = cause {
+                } else if let Cause::Bumper(_) = cause {
                     self.baseboard.bumps += 1;
                 }
                 self.cmd = Command::default();
@@ -523,9 +525,8 @@ impl ExplorationStrategy for StockFollower {
         }
         let right = self.fan_has_line(&points, 90, 160);
         let left = self.fan_has_line(&points, 191, 249);
-        if self.baseboard.update(right, left, pose.theta)
-            && matches!(self.action, Action::Follow { .. })
-        {
+        let following = matches!(self.action, Action::Follow { .. });
+        if self.baseboard.update(right, left, pose.theta, following) {
             self.action = Action::follow();
         }
         if !self.started {
@@ -765,6 +766,25 @@ mod tests {
         assert!(!f.baseboard.tight, "within 45°");
         tick(&mut f, &Pose2D::new(0.0, 0.0, 0.9), &wall, None);
         assert!(f.baseboard.tight, "a corner");
+    }
+
+    #[test]
+    fn left_only_lines_tighten_it_only_while_following() {
+        let loose = Baseboard {
+            tight: false,
+            ..Baseboard::new()
+        };
+        let mut b = loose;
+        for _ in 0..=LEFT_ONLY_UPDATES {
+            assert!(!b.update(false, true, 0.0, false));
+        }
+        assert!(!b.tight && b.left_only == 0, "not following: not counted");
+        let mut b = loose;
+        for _ in 0..LEFT_ONLY_UPDATES {
+            assert!(!b.update(false, true, 0.0, true));
+        }
+        assert!(b.update(false, true, 0.0, true), "following: restart");
+        assert!(b.tight);
     }
 
     #[test]
