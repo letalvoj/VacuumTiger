@@ -122,5 +122,5 @@ from `VacuumTiger/`; `--root` is the project around it (`captures/`, `data/`, `t
 
 - a6a0ead: first version; a press read +2.9 cm with the offset (+0.36 cm raw), no motion
   compensation.
-- b8a544a: the scan right after the press, moved back by the wheels' distance; raw
+- dd442a6: the scan right after the press, moved back by the wheels' distance; raw
   ranges; per side, bearing and run.
