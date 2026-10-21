@@ -108,7 +108,8 @@ impl MockRobot {
     }
 
     /// Sets the drive command (m/s, rad/s), as SangamIO's `drive` Configure does. The
-    /// wheels follow it after the configured response delay.
+    /// wheels follow it after the configured response delay, except that a bumper press stops
+    /// them at once.
     pub fn drive(&mut self, linear: f32, angular: f32) {
         if (linear, angular) != self.command {
             self.command = (linear, angular);
@@ -144,8 +145,12 @@ impl MockRobot {
         let dt = STEP_DT;
         // SangamIO's heartbeat zeroes the command itself: it stays stopped until the
         // client sends a new one.
+        // The wheels stop at once, not after the drive's response: in the v8's recorded
+        // sweeps they turn 1-3 mm after a press.
         if bumper_stops(self.bumped, self.command.0) {
             self.drive(0.0, 0.0);
+            self.pending.clear();
+            (self.target, self.speed) = ((0.0, 0.0), (0.0, 0.0));
         }
         let (linear, angular) = self.wheels(dt);
         let from = self.pose();
@@ -359,6 +364,38 @@ mod tests {
         robot.drive(-0.1, 0.0);
         run(&mut robot, 110);
         assert!(robot.pose().0 < pressed.0 - 0.04);
+    }
+
+    /// The wheels' travel (m), both encoders averaged, from one status to another.
+    fn wheel_travel(from: &SensorGroupData, to: &SensorGroupData, m_per_tick: f32) -> f32 {
+        let ticks = |s: &SensorGroupData, key| match s.values.get(key) {
+            Some(SensorValue::U16(t)) => *t,
+            _ => panic!("no {key}"),
+        };
+        let moved = |key| f32::from(ticks(to, key).wrapping_sub(ticks(from, key)) as i16);
+        (moved("wheel_left") + moved("wheel_right")) / 2.0 * m_per_tick
+    }
+
+    #[test]
+    fn a_press_stops_the_wheels_within_millimetres() {
+        // The v8's recorded sweeps: at 8-15 cm/s the wheels turn 1-3 mm after the press.
+        let mut robot = robot_with(v8_drive());
+        robot.drive(0.15, 0.0);
+        while !robot.bumped {
+            robot.step(false);
+        }
+        let pressed = robot.status().clone();
+        let m_per_tick = robot.kinematics().wheel_m_per_tick;
+        // Half a second: well past the drive's 80 ms dead time and 120 ms lag.
+        run(&mut robot, 55);
+        let after = wheel_travel(&pressed, robot.status(), m_per_tick);
+        assert!(after < 0.003, "the wheels turned {:.1} mm", after * 1e3);
+        // Backing off still answers as any command does.
+        let stopped = robot.status().clone();
+        robot.drive(-0.1, 0.0);
+        run(&mut robot, 55);
+        let back = wheel_travel(&stopped, robot.status(), m_per_tick);
+        assert!(back < -0.02, "it backed off {:.1} mm", back * 1e3);
     }
 
     #[test]
