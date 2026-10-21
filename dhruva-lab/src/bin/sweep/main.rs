@@ -106,7 +106,8 @@ pub fn evaluate(
 
 /// One number per run to minimise. A point is a centimetre of mean unswept depth along
 /// the edges (the main term), or 100 cm² of pockets, or 3.3 cm of a corner missed beyond
-/// 5 cm, or 2 bumps, or 30 s, or 10 s of loitering beyond 30 s; a lap not closed costs 10.
+/// 5 cm, or 2 bumps, or 30 s, or 10 s of loitering (sweeping nothing new) beyond 30 s; a lap
+/// not closed costs 10.
 pub fn cost(s: &Score) -> f32 {
     let corners: f32 = s.corners.iter().map(|c| (c - 0.05).max(0.0) * 100.0).sum();
     let mut c = s.missed_depth * 100.0 + s.pockets_m2 * 100.0 + 0.3 * corners;

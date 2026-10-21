@@ -103,7 +103,7 @@ Every 1 cm cell they pass over counts as swept.
 | `miss cm` | **the main metric.** Each edge (walls and obstacles) is sampled every 1 cm. A sample measures how far in from the edge the swept floor starts, capped at 30 cm. This is the mean depth: the area between the sweep and the edge, per metre of edge | < 1 cm |
 | `corner` | the worst inner corner: distance from the corner to the nearest swept floor | ≤ 5 cm. The round side brush can do no better in a right angle |
 | `pkt cm²` | pockets: unswept floor the path closed a loop round, too small for the body (inside a loop round a leg). Each needs a trip back | 0 |
-| `loiter` | the longest time the path stayed inside a 1 m circle | low |
+| `loiter` | the longest time the brushes swept no floor they had not swept before (stuck, circling, driving over swept floor) | low |
 | `cost` | the single number the climb minimises (below) | low |
 
 One point of `cost` buys any one of:

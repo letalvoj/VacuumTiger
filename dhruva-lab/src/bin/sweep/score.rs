@@ -41,8 +41,6 @@ const CORNER_INSET: f32 = 0.005;
 const GAP: usize = 3;
 /// …and an enclosed patch with less area than the body's (radius, m) is one.
 const BODY_RADIUS: f32 = 0.175;
-/// A path that does not leave a circle this big (m) for long loiters.
-const LOITER_RADIUS: f32 = 1.0;
 /// An edge sample is reached when the swept floor starts this near it (m), past what no
 /// brush reaches: the corners' allowance.
 const REACHED: f32 = 0.05;
@@ -67,7 +65,7 @@ pub struct Score {
     pub pockets_m2: f32,
     /// The swept cells (centres), for the render.
     pub swept: Vec<Point>,
-    /// The longest time the path stayed within `LOITER_RADIUS` of a point (s).
+    /// The longest time the brushes swept no floor they had not swept before (s).
     pub loiter: f32,
     /// Every edge sample scored: where it is, the inward normal, and how deep the miss is (m).
     pub misses: Vec<(Point, Point, f32)>,
@@ -128,6 +126,9 @@ struct Swept {
     /// path went, at any yaw.
     reach: Vec<bool>,
     cells: Vec<bool>,
+    /// How many of them are swept, and the most poses in a row that swept none.
+    count: usize,
+    idle: usize,
 }
 
 impl Swept {
@@ -147,11 +148,15 @@ impl Swept {
             floor: Vec::new(),
             reach: Vec::new(),
             cells: vec![false; width * height],
+            count: 0,
+            idle: 0,
         };
         let centres: Vec<Point> = (0..width * height).map(|k| swept.centre(k)).collect();
         swept.room = centres.iter().map(|&p| inside(&scene.room, p)).collect();
         swept.floor = centres.iter().map(|&p| !scene.solid(p)).collect();
+        let mut idle = 0;
         for &(x, y, theta) in &run.path {
+            let before = swept.count;
             let (s, c) = theta.sin_cos();
             let brush = (
                 x + SIDE_BRUSH.0 * c - SIDE_BRUSH.1 * s,
@@ -163,6 +168,8 @@ impl Swept {
                 swept.mark((x - across * s, y + across * c));
                 across += CELL;
             }
+            idle = if swept.count > before { 0 } else { idle + 1 };
+            swept.idle = swept.idle.max(idle);
         }
         swept.reach = if run.path.is_empty() {
             swept.floor.clone()
@@ -369,7 +376,10 @@ impl Swept {
 
     fn mark(&mut self, p: Point) {
         if let Some(i) = self.index(p) {
-            self.cells[i] |= self.floor[i];
+            if self.floor[i] && !self.cells[i] {
+                self.cells[i] = true;
+                self.count += 1;
+            }
         }
     }
 
@@ -432,21 +442,6 @@ fn brush_reach() -> f32 {
     SIDE_BRUSH.0.hypot(SIDE_BRUSH.1) + SIDE_BRUSH_RADIUS
 }
 
-/// The longest time (s) the path stayed within `LOITER_RADIUS` of where it was: a stay
-/// starts when the path last got that far from the previous start.
-fn loiter(run: &Run) -> f32 {
-    let path = &run.path;
-    let (mut longest, mut anchor) = (0, 0);
-    for (i, p) in path.iter().enumerate() {
-        let a = path[anchor];
-        if (p.0 - a.0).hypot(p.1 - a.1) > LOITER_RADIUS {
-            anchor = i;
-        }
-        longest = longest.max(i - anchor);
-    }
-    longest as f32 * run.dt
-}
-
 /// Scores `run` in `scene`.
 pub fn score(scene: &Scene, run: &Run) -> Score {
     let swept = Swept::new(scene, run);
@@ -507,7 +502,7 @@ pub fn score(scene: &Scene, run: &Run) -> Score {
         missed_m2: missed,
         missed_depth: if length > 0.0 { missed / length } else { 0.0 },
         corners,
-        loiter: loiter(run),
+        loiter: swept.idle as f32 * run.dt,
         misses,
         edge_m: length,
         reached_m: reached,
@@ -756,10 +751,19 @@ mod tests {
     }
 
     #[test]
-    fn loitering_is_the_longest_stay_within_a_metre() {
-        let mut path = vec![(0.0, 0.0, 0.0); 500];
-        path.extend(vec![(5.0, 0.0, 0.0); 200]);
-        let (_, run) = square(path);
-        assert!((loiter(&run) - 4.99).abs() < 1e-3, "{}", loiter(&run));
+    fn loitering_is_the_longest_time_sweeping_nothing_new() {
+        // Standing 5 s, then on across new floor (a new cell every few poses).
+        let mut path = vec![(0.3, 1.0, 0.0); 500];
+        path.extend(along(1.0));
+        let (scene, run) = square(path);
+        let s = score(&scene, &run);
+        assert!((s.loiter - 5.0).abs() < 0.2, "standing: {}", s.loiter);
+        // The same 1.4 m twice: the second pass sweeps nothing new.
+        let (scene, run) = square(along(1.0).into_iter().chain(along(1.0)).collect());
+        let s = score(&scene, &run);
+        assert!((s.loiter - 14.0).abs() < 0.2, "back over it: {}", s.loiter);
+        // Into a wall: what the brushes reach past it is not floor.
+        let (scene, run) = square(vec![(1.0, 0.1, -FRAC_PI_2); 3000]);
+        assert!(score(&scene, &run).loiter > 29.9, "pushing a wall");
     }
 }
