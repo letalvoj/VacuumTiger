@@ -14,7 +14,8 @@
 //! - no rush (it needs a front sensor other than the lidar), no virtual walls or magnetic
 //!   strip;
 //! - a wall on the left mirrors the right follower;
-//! - the lap is our [`Lap`], not the stock's chain of cells;
+//! - the lap is our [`Lap`], not the stock's chain of cells, and it starts along the wall,
+//!   not facing it;
 //! - a cliff always turns 63° (the stock turns 0 in a cliff state not mapped to our
 //!   sensors);
 //! - Line's heading gain is ours, and the line flags are a least-squares fit;
@@ -85,6 +86,10 @@ const LEFT_ONLY_UPDATES: u32 = 4;
 const CORNER: f32 = FRAC_PI_4;
 /// The arcs of `ARC_ANGLE_AFTER_LINE` in a row that stop it (`processArcInCircle`).
 const QUARTER_ARCS: u32 = 2;
+/// The lap starts only while following with nothing nearer than this ahead (m), in the
+/// virtual bumper's fan: still facing the wall it just found, the lap's heading would point
+/// into it and the spin alongside would count as going round.
+const LAP_FRONT_GAP: f32 = 0.1;
 /// The most actions handed over in one tick.
 const HAND_OVERS: usize = 4;
 
@@ -589,6 +594,7 @@ impl ExplorationStrategy for StockFollower {
             sector: Some(0 | 1),
             ..
         } = self.action
+            && !gaps.bumper(160, 195, LAP_FRONT_GAP)
         {
             self.lap.start(pose);
             self.lap.along(pose.theta);
@@ -783,6 +789,37 @@ mod tests {
         tick(&mut f, &Pose2D::new(0.0, 0.0, heading), &blocked, None);
         // Given up: following, which the wall in front fails at once.
         assert_eq!(f.recovery.tries, 0, "a fresh recovery");
+    }
+
+    #[test]
+    fn the_lap_starts_along_the_wall_not_facing_it() {
+        let mut f = follower(WallSide::Right);
+        f.started = true;
+        let mut facing = right_wall(LIDAR_X, R, -0.011);
+        facing.extend(wall_ahead(0.06));
+        tick(&mut f, &Pose2D::identity(), &facing, None);
+        assert!(
+            matches!(
+                f.action,
+                Action::Follow {
+                    sector: Some(0 | 1),
+                    ..
+                }
+            ),
+            "{:?}",
+            f.action
+        );
+        assert!(f.lap.start.is_none() && !f.lap.aligned());
+        // Turned alongside: the wall ahead gone, and out of the obstacle memory too (it would
+        // take `OBSTACLE_MEMORY` of ticks).
+        f.remembered.clear();
+        tick(
+            &mut f,
+            &Pose2D::identity(),
+            &right_wall(LIDAR_X, R, -0.011),
+            None,
+        );
+        assert_eq!(f.lap.heading, Some(0.0), "along the wall");
     }
 
     #[test]
