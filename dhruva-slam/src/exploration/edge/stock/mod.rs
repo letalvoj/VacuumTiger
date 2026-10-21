@@ -8,8 +8,9 @@
 //!   recipes, the tight/loose baseboard mode, the motion watchdogs and the lap.
 //!
 //! Where it differs from the stock, on purpose:
-//! - `getBumper` reads one scan (the stock debounces it over three layers), and
-//!   `getFollowWallIR` has no obstacle-map layer under it;
+//! - the last [`OBSTACLE_MEMORY`] of scans stands in for the obstacle map under the gaps (its
+//!   units are not decoded; SLAM's 5 cm grid is too coarse for 1 cm setpoints), and every gap
+//!   query reads it; `getBumper` does not debounce over three layers;
 //! - no rush (it needs a front sensor other than the lidar), no virtual walls or magnetic
 //!   strip;
 //! - a wall on the left mirrors the right follower;
@@ -33,6 +34,7 @@
 mod actions;
 mod gaps;
 
+use std::collections::VecDeque;
 use std::f32::consts::{FRAC_PI_4, PI};
 
 use serde::Deserialize;
@@ -93,6 +95,13 @@ const STUCK_TURN: f32 = 0.05;
 // Circling: turned this much (rad) before getting this far from where it started (m).
 const CIRCLE_TURN: f32 = 3.0 * PI;
 const CIRCLE_LEAVE: f32 = 0.5;
+/// The scans remembered under the gaps (s). On the sweep bench (16 seeds) it halves the bumps
+/// a room and misses less wall; a constant 1 cm off every gap halves them too, but misses
+/// more. Mixed below 0.6 s.
+const OBSTACLE_MEMORY: f32 = 2.0;
+/// A pose moved this far in one tick (m) jumped (a loop closure): what was remembered is
+/// dropped, not smeared. Driving covers at most 4 cm a tick.
+const POSE_JUMP: f32 = 0.1;
 
 /// The stock edge pass's configuration (`[exploration.stock_follow]`).
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -273,6 +282,10 @@ pub struct StockFollower {
     lap: Lap,
     started: bool,
     done: bool,
+    /// The last `OBSTACLE_MEMORY` of scans (world frame, newest first) and the pose of the
+    /// newest.
+    remembered: VecDeque<PointCloud2D>,
+    remembered_at: Option<Pose2D>,
 }
 
 impl StockFollower {
@@ -292,7 +305,32 @@ impl StockFollower {
             lap: Lap::new(config.lap_radius, config.lap_overlap),
             started: false,
             done: false,
+            remembered: VecDeque::new(),
+            remembered_at: None,
         }
+    }
+
+    /// Remembers `scan`, taken at `pose`, for `OBSTACLE_MEMORY` past this tick.
+    fn remember(&mut self, scan: &PointCloud2D, pose: &Pose2D) {
+        if self
+            .remembered_at
+            .is_some_and(|at| (pose.x - at.x).hypot(pose.y - at.y) > POSE_JUMP)
+        {
+            self.remembered.clear();
+        }
+        self.remembered.push_front(scan.transform(pose));
+        let ticks = (OBSTACLE_MEMORY / self.config.tick).round() as usize;
+        self.remembered.truncate(ticks + 1);
+        self.remembered_at = Some(*pose);
+    }
+
+    /// The remembered scans seen from `pose`, mirrored: what the gaps take the least of
+    /// (`getFollowWallIR` with the obstacle map under it).
+    fn remembered_from(&self, pose: &Pose2D) -> Vec<Point2D> {
+        let here = pose.inverse();
+        (self.remembered.iter())
+            .flat_map(|world| self.mirrored(&world.transform(&here)))
+            .collect()
     }
 
     /// The scan in the mirrored robot frame: the wall on the right.
@@ -514,7 +552,8 @@ impl ExplorationStrategy for StockFollower {
         }
 
         let points = self.mirrored(scan);
-        let gaps = Gaps::new(&self.shell, &points);
+        self.remember(scan, pose);
+        let gaps = Gaps::new(&self.shell, &self.remembered_from(pose));
         // The actions' pose, mirrored with the scan; the lap and watchdogs keep the real one.
         let mirrored = Pose2D::new(pose.x, m * pose.y, m * pose.theta);
 
@@ -785,6 +824,33 @@ mod tests {
         }
         assert!(b.update(false, true, 0.0, true), "following: restart");
         assert!(b.tight);
+    }
+
+    #[test]
+    fn remembered_returns_stay_where_they_were_for_the_memory_then_go() {
+        let mut f = follower(WallSide::Right);
+        let leg = PointCloud2D::from_points(&[Point2D::new(0.3, -0.2)]);
+        f.remember(&leg, &Pose2D::identity());
+        // 5 cm on: still there, 5 cm nearer in the robot frame.
+        let moved = Pose2D::new(0.05, 0.0, 0.0);
+        let ticks = (OBSTACLE_MEMORY / DT).round() as usize;
+        for _ in 0..ticks {
+            f.remember(&PointCloud2D::new(), &moved);
+        }
+        let seen = f.remembered_from(&moved);
+        assert_eq!(seen.len(), 1);
+        assert!((seen[0].x - 0.25).abs() < 1e-5 && (seen[0].y + 0.2).abs() < 1e-5);
+        f.remember(&PointCloud2D::new(), &moved);
+        assert!(f.remembered_from(&moved).is_empty(), "forgotten");
+    }
+
+    #[test]
+    fn a_pose_jump_forgets_what_was_remembered() {
+        let mut f = follower(WallSide::Right);
+        let leg = PointCloud2D::from_points(&[Point2D::new(0.3, -0.2)]);
+        f.remember(&leg, &Pose2D::identity());
+        f.remember(&PointCloud2D::new(), &Pose2D::new(0.2, 0.0, 0.0));
+        assert!(f.remembered_from(&Pose2D::identity()).is_empty());
     }
 
     #[test]
