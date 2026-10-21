@@ -85,6 +85,14 @@ impl Gaps {
         Self(gaps)
     }
 
+    /// Beams `a..=b` with a return read it `by` (m) nearer, below 0 if need be: something the
+    /// lidar does not see stands that far in front of what it does.
+    pub fn nearer(&mut self, a: usize, b: usize, by: f32) {
+        for g in self.0[a..=b].iter_mut().flatten() {
+            *g -= by;
+        }
+    }
+
     fn sector(&self, a: usize, b: usize) -> impl Iterator<Item = (usize, f32)> + '_ {
         (a..=b).filter_map(|i| self.0[i % BEAMS].map(|g| (i % BEAMS, g)))
     }

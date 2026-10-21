@@ -447,6 +447,9 @@ pub enum StrategyKind {
     WallFollow,
     /// The stock firmware's edge pass, ported (`[exploration.stock_follow]`).
     StockFollow,
+    /// The same, but a bump on the wall side moves the wall to where the bumper found it
+    /// (an overhang the lidar does not see).
+    StockFollowFix,
 }
 
 impl StrategyKind {
@@ -455,7 +458,9 @@ impl StrategyKind {
     pub fn runs_on_simulated_clock(self) -> bool {
         match self {
             StrategyKind::Frontier => false,
-            StrategyKind::WallFollow | StrategyKind::StockFollow => true,
+            StrategyKind::WallFollow
+            | StrategyKind::StockFollow
+            | StrategyKind::StockFollowFix => true,
         }
     }
 }
@@ -808,12 +813,15 @@ pub fn build_exploration(config: &Config) -> (ExplorationConfig, Box<dyn Explora
             robot_radius: config.navigation.robot_radius,
             ..exploration.wall_follow
         })),
-        StrategyKind::StockFollow => Box::new(StockFollower::new(StockFollowConfig {
-            lidar_x: config.lidar.mounting_x,
-            optical_offset: config.lidar.optical_offset,
-            tick: 1.0 / exploration.loop_rate_hz,
-            ..exploration.stock_follow
-        })),
+        StrategyKind::StockFollow | StrategyKind::StockFollowFix => {
+            Box::new(StockFollower::new(StockFollowConfig {
+                lidar_x: config.lidar.mounting_x,
+                optical_offset: config.lidar.optical_offset,
+                tick: 1.0 / exploration.loop_rate_hz,
+                overhangs: exploration.strategy == StrategyKind::StockFollowFix,
+                ..exploration.stock_follow
+            }))
+        }
     };
     (thread, strategy)
 }

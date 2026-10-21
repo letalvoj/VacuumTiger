@@ -4,7 +4,7 @@
 //! a total cost; `--climb` hill-climbs the sweep's settings on that cost.
 //!
 //!     cargo run --release --bin sweep -- [--kit rooms|primitives] [--seeds N] [--only NAME]
-//!         [--strategy wall_follow|stock_follow] [--set K=V,...]
+//!         [--strategy wall_follow|stock_follow|stock_follow_fix] [--set K=V,...]
 //!         [--climb TRIALS] [--dump DIR] [--reasons]
 //!
 //! - The robot is `--sim` (default `sangamio/mock_bench.toml`, the v8 as measured), the
@@ -50,7 +50,7 @@ struct Args {
     /// Only this scene of the kit.
     #[arg(long)]
     only: Option<String>,
-    /// The strategy to run instead of `--config`'s: wall_follow or stock_follow.
+    /// The strategy to run instead of `--config`'s: wall_follow, stock_follow or stock_follow_fix.
     #[arg(long, value_parser = strategy)]
     strategy: Option<StrategyKind>,
     /// Settings to change first: KEY=VALUE[,KEY=VALUE...].

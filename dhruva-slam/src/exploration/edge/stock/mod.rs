@@ -31,6 +31,11 @@
 //!   contacts itself);
 //! - the decode shows no reset of the two baseboard counters but the mode change: the bumps
 //!   add up while tight, the left-only updates while loose.
+//!
+//! `stock_follow_fix` is the same but for a wall the lidar sees short of where it is (an
+//! overhang, a kick board): a bump on the wall side moves the wall-side gaps in by what they
+//! still read, for [`BUMPED_REACH`] past the last such bump, and it follows loose meanwhile,
+//! since rubbing that wall is a bump each time.
 
 mod actions;
 mod gaps;
@@ -107,6 +112,13 @@ const OBSTACLE_MEMORY: f32 = 2.0;
 /// A pose moved this far in one tick (m) jumped (a loop closure): what was remembered is
 /// dropped, not smeared. Driving covers at most 4 cm a tick.
 const POSE_JUMP: f32 = 0.1;
+/// `stock_follow_fix`: the wall-side beams a bump moves the wall in, and the most it moves
+/// it (m): an overhang or a kick board, not glass the lidar sees nothing behind.
+const BUMPED_FROM: usize = 90;
+const BUMPED_TO: usize = 160;
+const MAX_BUMPED: f32 = 0.1;
+/// …and how far it holds past the last bump on it (m).
+const BUMPED_REACH: f32 = 0.5;
 
 /// The stock edge pass's configuration (`[exploration.stock_follow]`).
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -128,6 +140,11 @@ pub struct StockFollowConfig {
     /// The tick (s); from `[exploration] loop_rate_hz`.
     #[serde(skip)]
     pub tick: f32,
+    /// `stock_follow_fix`: walls may stand in front of what the lidar sees (overhangs), so a
+    /// bump on the wall side moves the wall to where the bumper found it (set by
+    /// `build_exploration` from the strategy).
+    #[serde(skip)]
+    pub overhangs: bool,
 }
 
 impl Default for StockFollowConfig {
@@ -140,6 +157,7 @@ impl Default for StockFollowConfig {
             lidar_x: -0.105,
             optical_offset: 0.0,
             tick: 0.1,
+            overhangs: false,
         }
     }
 }
@@ -291,6 +309,16 @@ pub struct StockFollower {
     /// newest.
     remembered: VecDeque<PointCloud2D>,
     remembered_at: Option<Pose2D>,
+    /// `stock_follow_fix`: the wall the bumper found in front of what the lidar sees.
+    bumped: Option<Bumped>,
+}
+
+/// How far in front of what the lidar sees the bumper found the wall (m), and the distance
+/// travelled at the last such bump (m).
+#[derive(Debug, Clone, Copy)]
+struct Bumped {
+    by: f32,
+    at: f32,
 }
 
 impl StockFollower {
@@ -312,6 +340,7 @@ impl StockFollower {
             done: false,
             remembered: VecDeque::new(),
             remembered_at: None,
+            bumped: None,
         }
     }
 
@@ -418,6 +447,16 @@ impl StockFollower {
                 Action::back_align(CLIFF_BACK)
             }
             Cause::Bumper(HazardType::BumperRight) => {
+                // The wall is where the bumper is, this far in front of the side fan's gap.
+                // More than `MAX_BUMPED` (or no return, `CLEAR`) is not a wall in front.
+                let unseen = gaps.follow_ir(120, 143).0.max(0.0);
+                let by = self.bumped.map_or(0.0, |b| b.by) + unseen;
+                if self.config.overhangs && unseen <= MAX_BUMPED && by > 0.0 {
+                    self.bumped = Some(Bumped {
+                        by: by.min(MAX_BUMPED),
+                        at: self.travel.distance,
+                    });
+                }
                 // A graze: the side close and the front open turns once, a little more.
                 let graze = gaps.follow_ir(123, 143).0 < 0.03 && gaps.follow_ir(144, 156).0 > 0.1;
                 self.recovery = if graze {
@@ -532,7 +571,11 @@ fn virtual_bumper_turn(gaps: &Gaps) -> f32 {
 
 impl ExplorationStrategy for StockFollower {
     fn name(&self) -> &'static str {
-        "stock_follow"
+        if self.config.overhangs {
+            "stock_follow_fix"
+        } else {
+            "stock_follow"
+        }
     }
 
     fn next_action(
@@ -558,14 +601,21 @@ impl ExplorationStrategy for StockFollower {
 
         let points = self.mirrored(scan);
         self.remember(scan, pose);
-        let gaps = Gaps::new(&self.shell, &self.remembered_from(pose));
+        let mut gaps = Gaps::new(&self.shell, &self.remembered_from(pose));
         // The actions' pose, mirrored with the scan; the lap and watchdogs keep the real one.
         let mirrored = Pose2D::new(pose.x, m * pose.y, m * pose.theta);
+        // A wall the bumper found holds for `BUMPED_REACH` past the last bump on it.
+        let travelled = self.travel.distance;
+        self.bumped = self.bumped.filter(|b| travelled - b.at <= BUMPED_REACH);
+        if let Some(b) = self.bumped {
+            gaps.nearer(BUMPED_FROM, BUMPED_TO, b.by);
+        }
 
         if let Some(why) = self.watchdogs.update(pose, turn, self.config.tick) {
-            log::debug!("stock_follow at {pose:?}: {why}, finding a wall");
+            log::debug!("{} at {pose:?}: {why}, finding a wall", self.name());
             self.cmd = Command::default();
             self.action = self.find_wall(&gaps, &mirrored);
+            self.bumped = None;
         }
         let right = self.fan_has_line(&points, 90, 160);
         let left = self.fan_has_line(&points, 191, 249);
@@ -585,7 +635,8 @@ impl ExplorationStrategy for StockFollower {
             bumper: bumper.map(|k| self.mirror_kind(k)),
             cliff: contacts().any(|k| k.is_cliff()),
             pose: &mirrored,
-            tight: self.baseboard.tight,
+            // Rubbing a wall the bumper found bumps it each time: loose off it.
+            tight: self.baseboard.tight && self.bumped.is_none(),
             dt: self.config.tick,
         };
         self.transfer(&sensed);
@@ -820,6 +871,61 @@ mod tests {
             None,
         );
         assert_eq!(f.lap.heading, Some(0.0), "along the wall");
+    }
+
+    #[test]
+    fn the_fix_moves_the_wall_to_where_the_bumper_found_it_for_a_stretch() {
+        // The lidar sees the wall 4 cm off; the bumper finds it at the body.
+        let seen = right_wall(LIDAR_X, R, 0.04);
+        let bump_at = |f: &mut StockFollower, wall: &[Point2D]| {
+            f.action = Action::follow();
+            f.remembered.clear();
+            tick(f, &Pose2D::identity(), wall, Some(HazardType::BumperRight));
+            f.bumped.map(|b| b.by)
+        };
+        let bump = |f: &mut StockFollower| bump_at(f, &seen);
+        let fix = || {
+            let mut f = StockFollower::new(StockFollowConfig {
+                overhangs: true,
+                ..StockFollowConfig::default()
+            });
+            tick(&mut f, &Pose2D::identity(), &seen, None);
+            f
+        };
+        let mut stock = follower(WallSide::Right);
+        tick(&mut stock, &Pose2D::identity(), &seen, None);
+        assert_eq!(bump(&mut stock), None, "stock_follow ignores it");
+
+        let mut f = fix();
+        let unseen = Gaps::new(&f.shell, &seen).follow_ir(120, 143).0;
+        let by = bump(&mut f).expect("the bumper found the wall");
+        assert!((by - unseen).abs() < 1e-4, "{by} vs {unseen}");
+        // Held on the next tick, then forgotten `BUMPED_REACH` further on.
+        tick(&mut f, &Pose2D::identity(), &seen, None);
+        assert!(f.bumped.is_some());
+        f.travel.distance += BUMPED_REACH + 0.01;
+        tick(&mut f, &Pose2D::identity(), &seen, None);
+        assert!(f.bumped.is_none());
+
+        // Bumped again at the same wall it reads no gap, and the wall stays put…
+        let mut f = fix();
+        bump(&mut f);
+        assert_eq!(bump(&mut f), Some(by));
+        // …but where it still reads one, it adds that, up to `MAX_BUMPED`.
+        assert_eq!(
+            bump_at(&mut f, &right_wall(LIDAR_X, R, 0.1)),
+            Some(MAX_BUMPED)
+        );
+        // A bump on the far side moves nothing.
+        let mut f = fix();
+        f.action = Action::follow();
+        tick(
+            &mut f,
+            &Pose2D::identity(),
+            &seen,
+            Some(HazardType::BumperLeft),
+        );
+        assert!(f.bumped.is_none());
     }
 
     #[test]
