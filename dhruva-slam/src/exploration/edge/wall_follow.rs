@@ -25,7 +25,7 @@
 //! robot-frame inputs (y → -y) and the turn direction.
 
 use std::collections::{HashMap, VecDeque};
-use std::f32::consts::FRAC_PI_2;
+use std::f32::consts::{FRAC_PI_2, PI};
 
 use serde::Deserialize;
 
@@ -254,9 +254,10 @@ enum Phase {
         turn: f32,
         ticks: u32,
     },
-    /// Turn in place to `heading`, then follow the edge.
+    /// Turn in place to `heading` the `way` it started (±1, mirrored), then follow the edge.
     Turn {
         heading: f32,
+        way: f32,
         ticks: u32,
     },
     /// The edge followed ended at `vertex` (world frame), an outer corner: straight on along
@@ -635,9 +636,15 @@ impl WallFollower {
         slow + (cfg.speed - slow) * clear
     }
 
-    /// Turns on the spot to `heading`; `None` once there.
-    fn turn_to(&self, pose: &Pose2D, heading: f32) -> Option<(f32, f32, &'static str)> {
-        let remaining = self.mirror() * angle_diff(pose.theta, heading);
+    /// Turns on the spot to `heading` the `way` it started (±1, mirrored); `None` once there.
+    /// Near 180° the shortest way flips with every small turn, and the drive's dead time makes
+    /// each tick's command undo the last; past 180° it would go back to the old wall. Only an
+    /// overshoot (under a quarter turn) is turned back.
+    fn turn_to(&self, pose: &Pose2D, heading: f32, way: f32) -> Option<(f32, f32, &'static str)> {
+        let mut remaining = self.mirror() * angle_diff(pose.theta, heading);
+        if remaining * way < -FRAC_PI_2 {
+            remaining += way * 2.0 * PI;
+        }
         (remaining.abs() >= TURN_TOLERANCE)
             .then(|| (0.0, self.spin(remaining), "turning on the spot"))
     }
@@ -797,7 +804,11 @@ impl WallFollower {
                         // In the way (a corner, a leg): one turn on the spot that puts it
                         // alongside, committed so it does not flip back to the old wall.
                         let heading = pose.theta + self.mirror() * error;
-                        self.phase = Phase::Turn { heading, ticks: 0 };
+                        self.phase = Phase::Turn {
+                            heading,
+                            way: error.signum(),
+                            ticks: 0,
+                        };
                         continue;
                     }
                     if gap < ON_EDGE
@@ -827,7 +838,11 @@ impl WallFollower {
                     let backed = (pose.x - from.x).hypot(pose.y - from.y);
                     if backed >= distance || ticks >= MAX_BACKOFF_TICKS {
                         let heading = from.theta + self.mirror() * turn;
-                        self.phase = Phase::Turn { heading, ticks: 0 };
+                        self.phase = Phase::Turn {
+                            heading,
+                            way: turn.signum(),
+                            ticks: 0,
+                        };
                         continue;
                     }
                     self.phase = Phase::BackOff {
@@ -838,10 +853,15 @@ impl WallFollower {
                     };
                     return (-BACKOFF_SPEED, 0.0, "backing off a bump");
                 }
-                Phase::Turn { heading, ticks } => match self.turn_to(pose, heading) {
+                Phase::Turn {
+                    heading,
+                    way,
+                    ticks,
+                } => match self.turn_to(pose, heading, way) {
                     Some(command) if ticks < MAX_TURN_TICKS => {
                         self.phase = Phase::Turn {
                             heading,
+                            way,
                             ticks: ticks + 1,
                         };
                         return command;
@@ -862,7 +882,8 @@ impl WallFollower {
                             heading: heading - self.mirror() * FRAC_PI_2,
                             leg: Leg::Turn,
                         }),
-                        Leg::Turn => match self.turn_to(pose, heading) {
+                        // The quarter turn towards the face (mirrored: -π/2).
+                        Leg::Turn => match self.turn_to(pose, heading, -1.0) {
                             Some(command) => return command,
                             None => Some(Phase::Past {
                                 vertex,
@@ -952,7 +973,6 @@ impl ExplorationStrategy for WallFollower {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::f32::consts::PI;
 
     fn no_map() -> CurrentMapData {
         CurrentMapData {
@@ -1295,12 +1315,44 @@ mod tests {
         let mut f = following(WallSide::Right);
         f.phase = Phase::Turn {
             heading: 1.0,
+            way: 1.0,
             ticks: 0,
         };
         let held = Some(HazardType::BumperRight);
         let scan = PointCloud2D::new();
         let (v, w) = drive(f.next_action(&no_map(), &Pose2D::identity(), &scan, None, held));
         assert!(v == 0.0 && w > 0.0, "turning is not refused: {v} {w}");
+    }
+
+    #[test]
+    fn a_turn_goes_on_the_way_it_started() {
+        let scan = PointCloud2D::new();
+        for side in [WallSide::Right, WallSide::Left] {
+            let mut f = following(side);
+            let m = f.mirror();
+            // The turn rate, mirrored: + is the way the turn started.
+            let mut spin = |f: &mut WallFollower, heading: f32, theta: f32| {
+                f.phase = Phase::Turn {
+                    heading: m * heading,
+                    way: 1.0,
+                    ticks: 0,
+                };
+                let pose = Pose2D::new(0.0, 0.0, m * theta);
+                m * drive(f.next_action(&no_map(), &pose, &scan, None, None)).1
+            };
+            // About behind: the shortest way flips with each hundredth of a radian.
+            for theta in [-0.01, 0.0, 0.01, 0.0, -0.01] {
+                assert!(spin(&mut f, PI, theta) > 0.0, "{side:?}: on at {theta}");
+            }
+            assert!(
+                spin(&mut f, 1.2 * PI, 0.0) > 0.0,
+                "{side:?}: on past behind"
+            );
+            assert!(
+                spin(&mut f, 1.0, 1.2) < 0.0,
+                "{side:?}: an overshoot turned back"
+            );
+        }
     }
 
     #[test]
