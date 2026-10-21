@@ -9,8 +9,9 @@
 //! next command, commands are limited as the motion controller limits them. Navigation is
 //! not simulated: a strategy asking for it ends the run.
 //!
-//! What the robot has and the bench does not: SLAM takes no time here (on the R16 a scan
-//! takes tens of ms, and the pose a tick reads is older); ticks fall on the mock's steps;
+//! What the robot has and the bench does not: SLAM takes no time here (R16: 6 ms a scan,
+//! 28 ms p95, SLAM_BENCH.md §2.0; holding scans back 9–27 ms stayed inside the bench's seed
+//! noise, SWEEP_BENCH.md §5); ticks fall on the mock's steps;
 //! the command reaches the wheels after the mock's response delay but not over TCP; the
 //! lidar spins from the start instead of booting for ~30 s; nothing else (STOP, teleop)
 //! writes the shared state.
